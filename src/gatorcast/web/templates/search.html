@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{#
+  Search page: a GET filter form (HTMX-driven) plus a results region.
+
+  The form submits via hx-get to /search, swapping only #results so the page does
+  not reload. The same route, when hit with HX-Request, returns _results.html alone.
+  All inputs are repopulated from the parsed filters so the form is sticky.
+
+  Results never include recording content — only metadata + finding label/severity/
+  offset (CLAUDE.md rules 5/6). A CSV export link mirrors the active filters.
+#}
+{% block title %}Search · Gatorcast{% endblock %}
+
+{% block content %}
+  <h1>Search sessions</h1>
+
+  <form
+    class="search-form"
+    method="get"
+    action="/search"
+    hx-get="/search"
+    hx-target="#results"
+    hx-push-url="true"
+  >
+    {# Exact highest-severity filter, set by the dashboard drill-down. Carried as a
+       hidden field so it survives form re-submits; "Min severity" below is the
+       separate at-or-above filter. #}
+    <input type="hidden" name="max_severity" value="{{ filters.max_severity or '' }}" />
+    <div class="field-grid">
+      <label>
+        User
+        <input type="text" name="username" value="{{ filters.username or '' }}" />
+      </label>
+      <label>
+        System (resource address)
+        <input type="text" name="resource_address" value="{{ filters.resource_address or '' }}" />
+      </label>
+      <label>
+        Status
+        <select name="status">
+          {% set statuses = ["", "complete", "provisional", "error"] %}
+          {% for st in statuses %}
+            <option value="{{ st }}" {{ "selected" if (filters.status or "") == st else "" }}>
+              {{ st or "any" }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Started after
+        <input type="text" name="started_after" placeholder="2026-01-01T00:00:00Z"
+               value="{{ filters.started_after or '' }}" />
+      </label>
+      <label>
+        Started before
+        <input type="text" name="started_before" placeholder="2026-12-31T23:59:59Z"
+               value="{{ filters.started_before or '' }}" />
+      </label>
+
+      <label>
+        Min duration (s)
+        <input type="text" name="min_duration"
+               value="{{ filters.min_duration if filters.min_duration is not none else '' }}" />
+      </label>
+      <label>
+        Max duration (s)
+        <input type="text" name="max_duration"
+               value="{{ filters.max_duration if filters.max_duration is not none else '' }}" />
+      </label>
+
+      <label>
+        Min severity
+        <select name="severity">
+          <option value="" {{ "selected" if not filters.severity else "" }}>any</option>
+          {% for sev in severity_options %}
+            <option value="{{ sev }}" {{ "selected" if filters.severity == sev else "" }}>
+              {{ sev }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Category
+        <select name="category">
+          {% set cats = ["", "dangerous-command", "secret-exposure"] %}
+          {% for cat in cats %}
+            <option value="{{ cat }}" {{ "selected" if (filters.category or "") == cat else "" }}>
+              {{ cat or "any" }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Has findings
+        <select name="has_findings">
+          <option value="" {{ "selected" if filters.has_findings is none else "" }}>any</option>
+          <option value="true" {{ "selected" if filters.has_findings is true else "" }}>yes</option>
+          <option value="false" {{ "selected" if filters.has_findings is false else "" }}>no</option>
+        </select>
+      </label>
+
+      <label class="field-wide">
+        Dangerous-command rules
+        <select name="rule_ids" multiple size="5">
+          {% for rule in rules %}
+            <option value="{{ rule.id }}" {{ "selected" if rule.id in filters.rule_ids else "" }}>
+              {{ rule.label }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Keyword (content)
+        <input type="text" name="keyword" value="{{ filters.keyword or '' }}" />
+      </label>
+      <label>
+        Regex (content)
+        <input type="text" name="regex" value="{{ filters.regex or '' }}" />
+      </label>
+
+      <label>
+        Sort
+        <select name="sort">
+          {% for value, label in sort_options %}
+            <option value="{{ value }}" {{ "selected" if filters.sort == value else "" }}>
+              {{ label }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit">Search</button>
+      <a class="export-link" href="/search/export.csv?{{ query_string }}">Export CSV</a>
+    </div>
+  </form>
+
+  <div id="results">
+    {% include "_results.html" %}
+  </div>
+{% endblock %}

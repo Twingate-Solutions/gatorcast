@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{#
+  Session detail + replay.
+
+  The recording is loaded ONLY through the vendored asciinema player, pointed at
+  the auth-gated cast URL. Recording content is never rendered as HTML text
+  (CLAUDE.md rule 6) — it is full of attacker-influenced ANSI/escape sequences.
+  Only safe metadata (all autoescaped) is shown above the player.
+
+  The player JS/CSS are vendored under /static; no CDN is referenced
+  (CLAUDE.md rule 8).
+#}
+{% block title %}Session {{ session.conn_id }} · Gatorcast{% endblock %}
+
+{% block head %}
+  <link rel="stylesheet" href="/static/asciinema-player.css" />
+{% endblock %}
+
+{% block content %}
+  <div class="breadcrumb">
+    <a href="/systems">Systems</a> /
+    <a class="mono" href="/systems/{{ system_slug }}">{{ system_label }}</a> /
+    <span class="mono">{{ session.conn_id }}</span>
+  </div>
+
+  <h1>Session replay</h1>
+
+  <dl class="meta-grid">
+    <dt>User</dt>
+    <dd>{{ session.username or "(unknown user)" }}</dd>
+
+    <dt>System</dt>
+    <dd class="mono">{{ system_label }}</dd>
+
+    <dt>Shell user</dt>
+    <dd class="mono">{{ session.shell_user or "—" }}</dd>
+
+    <dt>Status</dt>
+    <dd><span class="pill pill-{{ session.status }}">{{ session.status }}</span></dd>
+
+    <dt>Started</dt>
+    <dd class="dim">{{ session.started_at or "—" }}</dd>
+
+    <dt>Ended</dt>
+    <dd class="dim">{{ session.ended_at or "—" }}</dd>
+
+    <dt>Duration</dt>
+    <dd class="dim">{{ session.duration_display }}</dd>
+
+    <dt>Terminal</dt>
+    <dd class="dim">
+      {% if session.width and session.height %}
+        {{ session.width }}×{{ session.height }}
+      {% else %}
+        —
+      {% endif %}
+    </dd>
+
+    <dt>Connection id</dt>
+    <dd class="mono dim">{{ session.conn_id }}</dd>
+  </dl>
+
+  {% if has_cast %}
+    <div id="player"></div>
+  {% else %}
+    <p class="empty">No recording file is available for this session yet.</p>
+  {% endif %}
+
+  {% if findings %}
+    <section class="findings-panel">
+      <h2>Findings</h2>
+      <ul class="finding-list">
+        {% for f in findings %}
+          <li class="finding-row" data-offset="{{ f.offset_seconds if f.offset_seconds is not none else '' }}">
+            <span class="sev sev-{{ f.severity }}">{{ f.severity }}</span>
+            <span class="finding-label">{{ f.label }}</span>
+            {% if f.offset_seconds is not none %}
+              <a class="jump" href="#t={{ f.offset_seconds }}" data-offset="{{ f.offset_seconds }}">
+                ▶ {{ f.offset_seconds }}s
+              </a>
+            {% else %}
+              <span class="dim">—</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {% if has_cast %}
+    <script src="/static/asciinema-player.min.js"></script>
+    <script>
+      // Page-local glue only (no recording content touched here — rule 6). The
+      // player loads the .cast solely via the auth-gated /cast route.
+      (function () {
+        // A "jump to finding" link arrives with the offset in the URL (?t=<sec>,
+        // and we also accept #t=<sec>). On a fresh page load the player is not yet
+        // created, so an immediate seek() would race the cast download — instead we
+        // pass the offset to create() as startAt/poster so the player opens already
+        // positioned at that moment. In-page clicks below seek the live player.
+        function startOffsetFromUrl() {
+          var params = new URLSearchParams(window.location.search);
+          var raw = params.get("t");
+          if (raw === null && window.location.hash) {
+            var m = window.location.hash.match(/(?:^#|[?&])t=([0-9.]+)/);
+            if (m) {
+              raw = m[1];
+            }
+          }
+          if (raw === null) {
+            return null;
+          }
+          var val = parseFloat(raw);
+          return isNaN(val) || val < 0 ? null : val;
+        }
+
+        var startAt = startOffsetFromUrl();
+        var opts = {};
+        if (startAt !== null) {
+          // startAt positions playback; poster renders the terminal frame at that
+          // time even while paused; autoPlay makes the jump obvious. If the browser
+          // blocks autoplay, the poster still shows the right frame.
+          opts.startAt = startAt;
+          opts.poster = "npt:" + startAt;
+          opts.autoPlay = true;
+        }
+
+        var player = AsciinemaPlayer.create(
+          "/sessions/{{ session.conn_id }}/cast",
+          document.getElementById("player"),
+          opts
+        );
+
+        document.querySelectorAll(".finding-row .jump").forEach(function (link) {
+          link.addEventListener("click", function (event) {
+            var offset = parseFloat(link.getAttribute("data-offset"));
+            if (player && typeof player.seek === "function" && !isNaN(offset)) {
+              event.preventDefault();
+              player.seek(offset);
+            }
+          });
+        });
+      })();
+    </script>
+  {% endif %}
+{% endblock %}

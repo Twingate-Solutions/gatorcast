@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{#
+  Dashboard: time-windowed aggregate counts and risk breakdowns.
+
+  Every figure is rule-derived metadata (session/finding counts, severities,
+  categories, top users/systems) computed by SearchStore.dashboard_stats for the
+  selected window — no recording content is ever read or rendered (CLAUDE.md
+  rules 5/6). Bars are server-rendered with plain CSS widths; there is NO charting
+  JS (rule 8). Each breakdown row links into search (or the systems page); the
+  link URLs are built server-side in the route so the window stays consistent.
+#}
+{% block title %}Dashboard · Gatorcast{% endblock %}
+
+{% macro badge_links(rows, sev_by_label) %}
+  {% if rows %}
+    <ul class="badge-list">
+      {% for row in rows %}
+        <li>
+          <a class="badge-link" href="{{ row.url }}">
+            <span class="sev {{ ('sev-' ~ row.label) if sev_by_label else 'sev-medium' }}">{{ row.label }}</span>
+            <span class="badge-count">{{ row.count }}</span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">None in this window.</p>
+  {% endif %}
+{% endmacro %}
+
+{% macro linked_bar_list(rows) %}
+  {% set max_count = (rows | map(attribute="count") | max) if rows else 0 %}
+  {% if rows %}
+    <ul class="bar-list">
+      {% for row in rows %}
+        <li class="bar-row">
+          <a class="bar-label mono" href="{{ row.url }}">{{ row.label }}</a>
+          <span class="bar-track">
+            <span
+              class="bar-fill"
+              style="width: {{ ((row.count / max_count) * 100) | round(1) if max_count else 0 }}%;"
+            ></span>
+          </span>
+          <span class="bar-count">{{ row.count }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">No data in this window.</p>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+  <div class="page-head">
+    <h1>Dashboard</h1>
+    <nav class="window-toggle" aria-label="Time window">
+      {% for value, label in window_options %}
+        <a
+          href="/dashboard?window={{ value }}"
+          class="window-opt {{ 'active' if window == value else '' }}"
+        >{{ label }}</a>
+      {% endfor %}
+    </nav>
+  </div>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-value">{{ stats.total_sessions }}</div>
+      <div class="card-label">Total sessions</div>
+    </div>
+    <div class="card">
+      <div class="card-value">{{ stats.flagged_sessions }}</div>
+      <div class="card-label">Flagged sessions</div>
+    </div>
+  </div>
+
+  <div class="panel-grid">
+    <section class="panel">
+      <h2>Sessions by highest severity</h2>
+      {{ badge_links(severity_rows, sev_by_label=true) }}
+    </section>
+
+    <section class="panel">
+      <h2>Findings by category</h2>
+      {{ badge_links(category_rows, sev_by_label=false) }}
+    </section>
+  </div>
+
+  <div class="panel-grid">
+    <section class="panel">
+      <h2>Top users</h2>
+      {{ linked_bar_list(user_rows) }}
+    </section>
+
+    <section class="panel">
+      <h2>Top systems</h2>
+      {{ linked_bar_list(system_rows) }}
+    </section>
+  </div>
+{% endblock %}

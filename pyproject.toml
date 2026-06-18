@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gatorcast"
+version = "0.3.0"
+description = "Self-hosted ingest, reassembly, and replay UI for Twingate Identity Firewall Gateway session recordings (asciicast v2)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "APL2.0" }
+authors = [{ name = "Ben Cameron" }]
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "aiosqlite>=0.20",
+    "structlog>=24.1",
+    "apscheduler>=3.10",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "cryptography>=43.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gatorcast"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+{#
+  Base layout for the Gatorcast UI.
+
+  All assets are vendored under /static and served locally — there are no CDN,
+  font, or external JS references anywhere (CLAUDE.md rule 8). Jinja autoescaping
+  is on, so every interpolated value (usernames, resource_address, shell_user) is
+  HTML-escaped. Recording content is NEVER rendered as text — only the asciinema
+  player (loaded on the session page) ever touches a .cast file (CLAUDE.md rule 6).
+#}
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Gatorcast{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/dashboard">Gatorcast</a>
+      <nav class="site-nav">
+        <a href="/dashboard">Dashboard</a>
+        <a href="/systems">Systems</a>
+        <a href="/search">Search</a>
+      </nav>
+    </header>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+    <script src="/static/htmx.min.js" defer></script>
+    <script src="/static/alpine.min.js" defer></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

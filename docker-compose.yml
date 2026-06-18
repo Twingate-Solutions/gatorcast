@@ -1,0 +1,34 @@
+services:
+  gatorcast:
+    image: ghcr.io/twingate-solutions/gatorcast:latest
+    container_name: gatorcast
+    restart: unless-stopped
+    ports:
+      - "8080:8080"     # UI + /ingest (front this with NPMplus)
+      # Syslog TCP carries no per-message auth — never publish it on 0.0.0.0.
+      # Bound to loopback by default; change 127.0.0.1 to your actual internal
+      # interface IP (e.g. the host's private/VPN address) so only the shipper
+      # on that network can reach it.
+      - "127.0.0.1:6514:6514"   # syslog TCP (internal interface only)
+    environment:
+      HTTP_PORT: "8080"
+      SYSLOG_TCP_PORT: "6514"
+      DATA_DIR: "/data"
+      IDLE_TIMEOUT_SECONDS: "120"
+      RETENTION_DAYS: "90"
+      RETENTION_MAX_GB: "0"
+      LOG_LEVEL: "info"
+      # Encryption at rest for .cast recordings (AES-256-GCM). Off by default.
+      # Set to "true" AND provide GATORCAST_MASTER_KEY (in .env or from a vault)
+      # or the container refuses to boot. Fresh-start only; metadata DB stays
+      # plaintext. Losing the key = losing the recordings.
+      ENCRYPTION_ENABLED: "false"
+    env_file:
+      # INGEST_TOKEN, UI_AUTH_USERNAME, UI_AUTH_PASSWORD, and (if encryption is
+      # enabled) GATORCAST_MASTER_KEY=<openssl rand -base64 32>.
+      - .env
+    volumes:
+      - gatorcast-data:/data
+
+volumes:
+  gatorcast-data:

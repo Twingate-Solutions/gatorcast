@@ -1,0 +1,115 @@
+{#
+  Search results partial.
+
+  Returned ALONE for HTMX requests (HX-Request header) and included inside
+  search.html for full-page loads. Each row shows session metadata, a risk badge
+  (derived from max_severity + finding_count), and per-finding badges with a
+  "jump" link to the player at the finding offset. NO recording content is shown —
+  only the rule label, severity, and time offset (CLAUDE.md rules 5/6).
+
+  Pagination links preserve the active query string (query_string) and only swap
+  the page number.
+#}
+{% set result = result %}
+{% set page = result.page %}
+{% set page_size = result.page_size %}
+{% set total = result.total %}
+{% set last_page = ((total + page_size - 1) // page_size) if total else 1 %}
+
+<div class="results-meta">
+  <span>{{ total }} result{{ "" if total == 1 else "s" }}</span>
+  <span class="dim">· page {{ page }} of {{ last_page }}</span>
+  {% if result.truncated %}
+    <span class="truncated-notice">
+      Content scan truncated — narrow your filters for complete results.
+    </span>
+  {% endif %}
+</div>
+
+{% if result.items %}
+  <table>
+    <thead>
+      <tr>
+        <th>Session</th>
+        <th>System</th>
+        <th>User</th>
+        <th>Started</th>
+        <th>Duration</th>
+        <th>Status</th>
+        <th>Risk</th>
+        <th>Findings</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in result.items %}
+        {% set s = item.session %}
+        <tr>
+          <td class="mono">
+            <a href="/sessions/{{ s.conn_id }}">{{ s.conn_id }}</a>
+          </td>
+          <td class="mono">{{ s.resource_address or "(unknown)" }}</td>
+          <td>{{ s.username or "(unknown user)" }}</td>
+          <td class="dim">{{ s.started_at or "—" }}</td>
+          <td class="dim">
+            {% if s.duration_seconds is not none %}{{ s.duration_seconds | round(0) | int }}s{% else %}—{% endif %}
+          </td>
+          <td>
+            <span class="pill pill-{{ s.status }}">{{ s.status }}</span>
+          </td>
+          <td>
+            {% if s.finding_count and s.max_severity %}
+              <span class="sev sev-{{ s.max_severity }}">
+                {{ s.max_severity }} · {{ s.finding_count }}
+              </span>
+            {% else %}
+              <span class="dim">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if item.findings %}
+              <ul class="finding-badges">
+                {% for f in item.findings %}
+                  <li>
+                    <span class="sev sev-{{ f.severity }}">{{ f.label }}</span>
+                    {% if f.offset_seconds is not none %}
+                      <a
+                        class="jump"
+                        href="/sessions/{{ s.conn_id }}?t={{ f.offset_seconds }}"
+                        data-offset="{{ f.offset_seconds }}"
+                      >▶ jump</a>
+                    {% endif %}
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <span class="dim">—</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="pagination">
+    {% if page > 1 %}
+      <a
+        class="page-link"
+        href="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page - 1)) }}"
+        hx-get="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page - 1)) }}"
+        hx-target="#results"
+        hx-push-url="true"
+      >‹ Prev</a>
+    {% endif %}
+    {% if page < last_page %}
+      <a
+        class="page-link"
+        href="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page + 1)) }}"
+        hx-get="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page + 1)) }}"
+        hx-target="#results"
+        hx-push-url="true"
+      >Next ›</a>
+    {% endif %}
+  </div>
+{% else %}
+  <p class="empty">No sessions match these filters.</p>
+{% endif %}

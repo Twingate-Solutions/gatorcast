@@ -1,0 +1,601 @@
+"""Search + findings store: metadata/finding filtering plus scan-on-demand content.
+
+This module owns the ``findings`` table (delete-then-insert reconciliation, ordered
+reads) and the composite **search** that powers the UI. Search runs cheapest-first:
+a parameterized WHERE over ``sessions`` (plus EXISTS subqueries over ``findings``)
+narrows the candidate set, and only then — when a keyword or regex is supplied — are
+the encrypted plaintext sidecars read and scanned in Python.
+
+There is deliberately no FTS5 index: recordings are secret-grade (CLAUDE.md rule 5),
+so their text is never indexed in SQLite. Content search decrypts sidecars on demand
+over a metadata-narrowed set, bounded by ``regex_max_candidates`` (a ReDoS / resource
+guard). The Python scan runs off the event loop via ``asyncio.to_thread``.
+
+Security:
+  * All SQL is parameterized; filter values are never string-interpolated.
+  * Sidecar CONTENT is never logged (CLAUDE.md rule 5). The only counter logged on a
+    truncated scan is the number of dropped candidates — never any text.
+  * A :class:`FindingRow` carries rule metadata + offset only, never matched text
+    (CLAUDE.md rule 6).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+
+import aiosqlite
+from pydantic import BaseModel
+
+from gatorcast.logging import get_logger
+from gatorcast.models import Session
+from gatorcast.pipeline.detect import SEVERITY_RANK, Finding
+from gatorcast.store.casts import CastStore
+from gatorcast.store.sessions import _SESSION_COLUMNS, _row_to_session
+
+log = get_logger(__name__)
+
+
+class SearchFilters(BaseModel):
+    """User-supplied search criteria. All fields optional except paging defaults."""
+
+    username: str | None = None
+    resource_address: str | None = None
+    status: str | None = None
+    started_after: str | None = None
+    started_before: str | None = None
+    min_duration: float | None = None
+    max_duration: float | None = None
+    category: str | None = None
+    severity: str | None = None
+    max_severity: str | None = None
+    rule_ids: list[str] = []
+    has_findings: bool | None = None
+    keyword: str | None = None
+    regex: str | None = None
+    sort: str = "newest"
+    page: int = 1
+    page_size: int = 50
+
+
+class FindingRow(BaseModel):
+    """One persisted finding row (rule metadata + offset only, never matched text)."""
+
+    id: int
+    conn_id: str
+    rule_id: str
+    category: str
+    severity: str
+    label: str
+    offset_seconds: float | None = None
+    created_at: str | None = None
+
+
+class SessionWithFindings(BaseModel):
+    """A session paired with its findings for a search result item."""
+
+    session: Session
+    findings: list[FindingRow] = []
+
+
+class LabeledCount(BaseModel):
+    """A label/count pair for dashboard top-N breakdowns."""
+
+    label: str
+    count: int
+
+
+class SearchResult(BaseModel):
+    """A page of search results plus paging metadata."""
+
+    items: list[SessionWithFindings]
+    total: int
+    page: int
+    page_size: int
+    truncated: bool = False
+
+
+class DashboardStats(BaseModel):
+    """Aggregate counts for the dashboard view."""
+
+    total_sessions: int
+    flagged_sessions: int
+    by_severity: dict[str, int]
+    by_category: dict[str, int]
+    top_users: list[LabeledCount]
+    top_systems: list[LabeledCount]
+
+
+# Columns for a FindingRow, in model field order.
+_FINDING_COLUMNS = "id, conn_id, rule_id, category, severity, label, offset_seconds, created_at"
+
+
+def _row_to_finding(row: aiosqlite.Row) -> FindingRow:
+    """Map a ``findings`` table row to a :class:`FindingRow`."""
+    return FindingRow(
+        id=row["id"],
+        conn_id=row["conn_id"],
+        rule_id=row["rule_id"],
+        category=row["category"],
+        severity=row["severity"],
+        label=row["label"],
+        offset_seconds=row["offset_seconds"],
+        created_at=row["created_at"],
+    )
+
+
+def _severities_at_or_above(severity: str) -> list[str]:
+    """Return the severity strings whose rank is >= the requested severity's rank.
+
+    An unknown severity string yields an empty list (so the caller matches nothing).
+
+    Args:
+        severity: The requested severity (e.g. ``"medium"``).
+
+    Returns:
+        The list of severities with rank >= the requested rank, or ``[]`` if the
+        requested severity is not a known rank.
+    """
+    floor = SEVERITY_RANK.get(severity)
+    if floor is None:
+        return []
+    return [name for name, rank in SEVERITY_RANK.items() if rank >= floor]
+
+
+# Static fragment used only for the risk sort; no user input is interpolated.
+_RISK_CASE = (
+    "CASE max_severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
+    "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
+)
+
+
+class SearchStore:
+    """Findings persistence plus composite metadata/finding/content search."""
+
+    def __init__(self, db: aiosqlite.Connection, casts: CastStore) -> None:
+        """Initialize the search store.
+
+        Args:
+            db: An open aiosqlite connection (WAL, ``aiosqlite.Row`` factory).
+            casts: The cast store used to read plaintext sidecars on demand.
+        """
+        self._db = db
+        self._casts = casts
+
+    # --- findings persistence --------------------------------------------------
+
+    async def replace_findings(self, conn_id: str, findings: list[Finding]) -> None:
+        """Replace all findings for a session (delete-then-insert; idempotent).
+
+        Re-running with the same findings yields the same rows with no duplicates.
+        Matched text is never persisted (CLAUDE.md rule 6).
+
+        Args:
+            conn_id: The connection id whose findings to replace.
+            findings: The findings to store (may be empty to clear).
+        """
+        await self._db.execute("DELETE FROM findings WHERE conn_id = ?", (conn_id,))
+        if findings:
+            await self._db.executemany(
+                """
+                INSERT INTO findings (conn_id, rule_id, category, severity, label, offset_seconds)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        conn_id,
+                        f.rule_id,
+                        f.category,
+                        f.severity,
+                        f.label,
+                        f.offset_seconds,
+                    )
+                    for f in findings
+                ],
+            )
+        await self._db.commit()
+
+    async def list_findings(self, conn_id: str) -> list[FindingRow]:
+        """List a session's findings, earliest offset first (NULL offsets last).
+
+        Args:
+            conn_id: The connection id whose findings to list.
+
+        Returns:
+            The findings ordered by ``offset_seconds`` (NULLs last), then ``id``.
+        """
+        cursor = await self._db.execute(
+            f"""
+            SELECT {_FINDING_COLUMNS}
+            FROM findings
+            WHERE conn_id = ?
+            ORDER BY offset_seconds IS NULL, offset_seconds, id
+            """,
+            (conn_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [_row_to_finding(row) for row in rows]
+
+    async def delete_findings(self, conn_id: str) -> None:
+        """Delete all findings for a session.
+
+        Args:
+            conn_id: The connection id whose findings to delete.
+        """
+        await self._db.execute("DELETE FROM findings WHERE conn_id = ?", (conn_id,))
+        await self._db.commit()
+
+    # --- search ----------------------------------------------------------------
+
+    def _build_where(self, filters: SearchFilters) -> tuple[str, list[object]]:
+        """Build the parameterized WHERE clause + params for metadata/finding filters.
+
+        Only clauses for non-None (or non-empty) filters are emitted. Severity is
+        expanded to an at-or-above set via :func:`_severities_at_or_above`; an unknown
+        severity contributes a clause that matches nothing.
+
+        Args:
+            filters: The active search filters.
+
+        Returns:
+            A ``(where_sql, params)`` tuple. ``where_sql`` is empty (no leading
+            ``WHERE``) when there are no constraints; otherwise it is the conjunction
+            of clauses (no leading ``WHERE`` keyword).
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+
+        # 1. Metadata filters on the sessions table.
+        if filters.username is not None:
+            clauses.append("username = ?")
+            params.append(filters.username)
+        if filters.resource_address is not None:
+            clauses.append("resource_address = ?")
+            params.append(filters.resource_address)
+        if filters.status is not None:
+            clauses.append("status = ?")
+            params.append(filters.status)
+        if filters.started_after is not None:
+            clauses.append("started_at >= ?")
+            params.append(filters.started_after)
+        if filters.started_before is not None:
+            clauses.append("started_at <= ?")
+            params.append(filters.started_before)
+        if filters.min_duration is not None:
+            clauses.append("duration_seconds >= ?")
+            params.append(filters.min_duration)
+        if filters.max_duration is not None:
+            clauses.append("duration_seconds <= ?")
+            params.append(filters.max_duration)
+
+        # 2. Finding filters (session column or EXISTS subqueries over findings).
+        if filters.has_findings is True:
+            clauses.append("finding_count > 0")
+        elif filters.has_findings is False:
+            clauses.append("finding_count = 0")
+
+        # Exact highest-severity match (drives the dashboard's per-severity drill-down,
+        # which counts sessions by their single highest severity). Distinct from the
+        # `severity` filter above, which is an at-or-above match over findings.
+        if filters.max_severity is not None:
+            clauses.append("max_severity = ?")
+            params.append(filters.max_severity)
+
+        if filters.category is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM findings f WHERE f.conn_id = sessions.conn_id AND f.category = ?)"
+            )
+            params.append(filters.category)
+
+        if filters.rule_ids:
+            placeholders = ", ".join("?" for _ in filters.rule_ids)
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM findings f WHERE f.conn_id = sessions.conn_id AND f.rule_id IN ({placeholders}))"
+            )
+            params.extend(filters.rule_ids)
+
+        if filters.severity is not None:
+            allowed = _severities_at_or_above(filters.severity)
+            if not allowed:
+                # Unknown severity → match nothing.
+                clauses.append("1 = 0")
+            else:
+                placeholders = ", ".join("?" for _ in allowed)
+                clauses.append(
+                    f"EXISTS (SELECT 1 FROM findings f WHERE f.conn_id = sessions.conn_id AND f.severity IN ({placeholders}))"
+                )
+                params.extend(allowed)
+
+        where_sql = " AND ".join(clauses)
+        return where_sql, params
+
+    @staticmethod
+    def _order_by(sort: str) -> str:
+        """Return the ORDER BY fragment for a sort mode (static; no user values).
+
+        Args:
+            sort: One of ``"newest"``, ``"duration"``, ``"risk"`` (any other value
+                falls back to newest).
+
+        Returns:
+            The ORDER BY clause text (without the ``ORDER BY`` keyword).
+        """
+        match sort:
+            case "duration":
+                # NULLS LAST emulation, then longest first.
+                return "duration_seconds IS NULL, duration_seconds DESC"
+            case "risk":
+                return f"{_RISK_CASE} DESC, COALESCE(started_at, created_at) DESC"
+            case _:
+                return "COALESCE(started_at, created_at) DESC"
+
+    async def _candidate_conn_ids(
+        self, where_sql: str, params: list[object], order_by: str
+    ) -> list[str]:
+        """Return ALL matching conn_ids in sort order (no LIMIT). For content scans."""
+        where = f"WHERE {where_sql}" if where_sql else ""
+        cursor = await self._db.execute(
+            f"SELECT conn_id FROM sessions {where} ORDER BY {order_by}",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [row["conn_id"] for row in rows]
+
+    async def _count(self, where_sql: str, params: list[object]) -> int:
+        """Return COUNT(*) of sessions matching the WHERE clause."""
+        where = f"WHERE {where_sql}" if where_sql else ""
+        cursor = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM sessions {where}", tuple(params)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row["n"]) if row is not None else 0
+
+    async def _page_conn_ids(
+        self,
+        where_sql: str,
+        params: list[object],
+        order_by: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> list[str]:
+        """Return one page of matching conn_ids in sort order (LIMIT/OFFSET)."""
+        where = f"WHERE {where_sql}" if where_sql else ""
+        cursor = await self._db.execute(
+            f"SELECT conn_id FROM sessions {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [row["conn_id"] for row in rows]
+
+    async def _load_items(self, conn_ids: list[str]) -> list[SessionWithFindings]:
+        """Load sessions + findings for an ordered conn_id list, preserving order."""
+        items: list[SessionWithFindings] = []
+        for conn_id in conn_ids:
+            cursor = await self._db.execute(
+                f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE conn_id = ?",
+                (conn_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                continue
+            session = _row_to_session(row)
+            findings = await self.list_findings(conn_id)
+            items.append(SessionWithFindings(session=session, findings=findings))
+        return items
+
+    @staticmethod
+    def _scan_matches(
+        texts: list[tuple[str, str]],
+        keyword: str | None,
+        compiled: re.Pattern[str] | None,
+    ) -> list[str]:
+        """Filter (conn_id, text) pairs by keyword AND/OR regex (runs off-loop).
+
+        A candidate passes only if it satisfies ALL provided content filters. This is
+        pure CPU work intended for ``asyncio.to_thread``; it never logs text.
+
+        Args:
+            texts: ``(conn_id, sidecar_text)`` pairs to scan, in candidate order.
+            keyword: Case-insensitive substring to require, or ``None``.
+            compiled: Pre-compiled regex to require, or ``None``.
+
+        Returns:
+            The conn_ids that matched, preserving the input order.
+        """
+        kw = keyword.lower() if keyword is not None else None
+        matched: list[str] = []
+        for conn_id, text in texts:
+            if kw is not None and kw not in text.lower():
+                continue
+            if compiled is not None and compiled.search(text) is None:
+                continue
+            matched.append(conn_id)
+        return matched
+
+    async def search(
+        self, filters: SearchFilters, *, regex_max_candidates: int = 2000
+    ) -> SearchResult:
+        """Run a composite metadata/finding/content search.
+
+        Execution is cheapest-first: a parameterized WHERE over ``sessions`` (with
+        EXISTS subqueries over ``findings``) narrows candidates, then — only when a
+        keyword or regex is supplied — the encrypted sidecars for the narrowed set are
+        decrypted and scanned in Python (off the event loop). The content scan is
+        bounded by ``regex_max_candidates``; exceeding it sets ``truncated`` and logs a
+        counter of dropped candidates (never any text, CLAUDE.md rule 5).
+
+        An invalid user regex is treated as a no-match (returns an empty result), never
+        a raised error.
+
+        Args:
+            filters: The active search filters (including paging and sort).
+            regex_max_candidates: Cap on sidecars scanned for a content search.
+
+        Returns:
+            A :class:`SearchResult` page with total match count and paging metadata.
+        """
+        where_sql, params = self._build_where(filters)
+        order_by = self._order_by(filters.sort)
+        page = max(1, filters.page)
+        page_size = max(1, filters.page_size)
+
+        has_content = filters.keyword is not None or filters.regex is not None
+
+        # --- Metadata-only branch: page directly in SQL. --------------------------
+        if not has_content:
+            total = await self._count(where_sql, params)
+            conn_ids = await self._page_conn_ids(
+                where_sql,
+                params,
+                order_by,
+                limit=page_size,
+                offset=(page - 1) * page_size,
+            )
+            items = await self._load_items(conn_ids)
+            return SearchResult(
+                items=items,
+                total=total,
+                page=page,
+                page_size=page_size,
+                truncated=False,
+            )
+
+        # --- Content-scan branch. -------------------------------------------------
+        # Compile the user regex once, guarded; an invalid pattern => empty result.
+        compiled: re.Pattern[str] | None = None
+        if filters.regex is not None:
+            try:
+                compiled = re.compile(filters.regex)
+            except re.error:
+                return SearchResult(
+                    items=[], total=0, page=page, page_size=page_size, truncated=False
+                )
+
+        candidates = await self._candidate_conn_ids(where_sql, params, order_by)
+        truncated = len(candidates) > regex_max_candidates
+        if truncated:
+            dropped = len(candidates) - regex_max_candidates
+            candidates = candidates[:regex_max_candidates]
+            # Counter only — never log sidecar content (CLAUDE.md rule 5).
+            log.info("search.truncated", dropped=dropped, scanned=len(candidates))
+
+        # Read sidecars (already off-loop in CastStore); skip missing ones silently.
+        texts: list[tuple[str, str]] = []
+        for conn_id in candidates:
+            try:
+                text = await self._casts.read_sidecar(conn_id)
+            except FileNotFoundError:
+                continue
+            texts.append((conn_id, text))
+
+        # Run the pure CPU matching off the event loop.
+        matched = await asyncio.to_thread(
+            self._scan_matches, texts, filters.keyword, compiled
+        )
+
+        total = len(matched)
+        start = (page - 1) * page_size
+        page_ids = matched[start : start + page_size]
+        items = await self._load_items(page_ids)
+        return SearchResult(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            truncated=truncated,
+        )
+
+    # --- dashboard -------------------------------------------------------------
+
+    async def dashboard_stats(self, *, started_after: str | None = None) -> DashboardStats:
+        """Compute aggregate counts for the dashboard, optionally time-windowed.
+
+        Args:
+            started_after: An ISO8601 cutoff; when supplied, every aggregate counts
+                only sessions whose ``started_at`` is at or after it (and findings on
+                those sessions). ``None`` means all time. The caller (the dashboard
+                route) computes the cutoff from the selected window so the figures and
+                the drill-down search links stay consistent.
+
+        Returns:
+            A :class:`DashboardStats` with total/flagged session counts, a per-session
+            highest-severity breakdown, a per-category finding breakdown, and the top
+            10 users and systems by session count — all within the window.
+        """
+        # Optional time window on the session's started_at. SQLite compares the ISO8601
+        # strings lexicographically, which is correct for the fixed "...Z" format.
+        win = "started_at >= ?"
+        p: tuple[object, ...] = (started_after,) if started_after else ()
+
+        def s_and() -> str:
+            return f" AND {win}" if started_after else ""
+
+        def s_where() -> str:
+            return f" WHERE {win}" if started_after else ""
+
+        # total / flagged sessions
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN finding_count > 0 THEN 1 ELSE 0 END) AS flagged "
+            f"FROM sessions{s_where()}",
+            p,
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        total_sessions = int(row["total"]) if row is not None else 0
+        flagged_sessions = int(row["flagged"] or 0) if row is not None else 0
+
+        # by severity (per-session highest severity; non-null only)
+        cursor = await self._db.execute(
+            "SELECT max_severity AS sev, COUNT(*) AS n FROM sessions "
+            f"WHERE max_severity IS NOT NULL{s_and()} GROUP BY max_severity",
+            p,
+        )
+        sev_rows = await cursor.fetchall()
+        await cursor.close()
+        by_severity = {r["sev"]: int(r["n"]) for r in sev_rows}
+
+        # by category (per-finding; joined to the session for the time window)
+        cursor = await self._db.execute(
+            "SELECT f.category AS cat, COUNT(*) AS n FROM findings f "
+            "JOIN sessions s ON s.conn_id = f.conn_id"
+            f"{(' WHERE s.' + win) if started_after else ''} GROUP BY f.category",
+            p,
+        )
+        cat_rows = await cursor.fetchall()
+        await cursor.close()
+        by_category = {r["cat"]: int(r["n"]) for r in cat_rows}
+
+        # top users / systems by session count (non-null), desc, top 10
+        cursor = await self._db.execute(
+            "SELECT username AS label, COUNT(*) AS n FROM sessions "
+            f"WHERE username IS NOT NULL{s_and()} GROUP BY username ORDER BY n DESC, username LIMIT 10",
+            p,
+        )
+        user_rows = await cursor.fetchall()
+        await cursor.close()
+        top_users = [LabeledCount(label=r["label"], count=int(r["n"])) for r in user_rows]
+
+        cursor = await self._db.execute(
+            "SELECT resource_address AS label, COUNT(*) AS n FROM sessions "
+            f"WHERE resource_address IS NOT NULL{s_and()} GROUP BY resource_address ORDER BY n DESC, resource_address LIMIT 10",
+            p,
+        )
+        sys_rows = await cursor.fetchall()
+        await cursor.close()
+        top_systems = [LabeledCount(label=r["label"], count=int(r["n"])) for r in sys_rows]
+
+        return DashboardStats(
+            total_sessions=total_sessions,
+            flagged_sessions=flagged_sessions,
+            by_severity=by_severity,
+            by_category=by_category,
+            top_users=top_users,
+            top_systems=top_systems,
+        )

@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{#
+  Sessions for one system, newest first. Columns are metadata only — username
+  (envelope SSO identity), shell_user (remote shell account, secondary detail),
+  start time, duration, and lifecycle status. No recording content appears here.
+
+  The client-side search box is a small Alpine.js filter over the already-rendered
+  rows (Light tier: no server round-trip). Everything is autoescaped.
+#}
+{% block title %}{{ system_label }} · Gatorcast{% endblock %}
+
+{% block content %}
+  <div class="breadcrumb">
+    <a href="/systems">Systems</a> / <span class="mono">{{ system_label }}</span>
+  </div>
+
+  <h1 class="mono">{{ system_label }}</h1>
+
+  {% if sessions %}
+    <div class="filter-bar" x-data="{ q: '' }">
+      <input
+        type="search"
+        placeholder="Filter by user or status…"
+        x-model="q"
+        aria-label="Filter sessions"
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Shell user</th>
+            <th>Started</th>
+            <th>Duration</th>
+            <th>Status</th>
+            <th>Risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for session in sessions %}
+            <tr
+              x-show="q === '' || $el.dataset.search.includes(q.toLowerCase())"
+              data-search="{{ (session.username ~ ' ' ~ (session.shell_user or '') ~ ' ' ~ session.status) | lower }}"
+            >
+              <td>
+                <a href="/sessions/{{ session.conn_id }}">
+                  {{ session.username or "(unknown user)" }}
+                </a>
+              </td>
+              <td class="dim mono">{{ session.shell_user or "—" }}</td>
+              <td class="dim">{{ session.started_at or "—" }}</td>
+              <td class="dim">{{ session.duration_display }}</td>
+              <td>
+                <span class="pill pill-{{ session.status }}">{{ session.status }}</span>
+              </td>
+              <td>
+                {% if session.finding_count and session.max_severity %}
+                  <span class="sev sev-{{ session.max_severity }}">
+                    {{ session.max_severity }} · {{ session.finding_count }}
+                  </span>
+                {% else %}
+                  <span class="dim">—</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="empty">No sessions for this system.</p>
+  {% endif %}
+{% endblock %}
