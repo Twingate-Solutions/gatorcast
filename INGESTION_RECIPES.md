@@ -81,13 +81,12 @@ Throughout this doc the placeholders are:
 
 ---
 
-## 2. systemd on a VM (the bash-script deployment)
+## 2. systemd on a VM
 
-**Setup.** The Gateway was installed by
-[`twingate-ssh-setup.sh`](https://github.com/your-org/twingate-ssh-setup) onto a
-dedicated Linux VM and runs as the `twingate-gateway` systemd service. Its
-stdout/stderr is captured by **journald**. Nothing forwards it off-box yet —
-that's this section.
+**Setup.** The Gateway runs as a native **systemd** service on a Linux VM —
+however you installed it (commonly as a unit named `twingate-gateway`). Its
+stdout/stderr is captured by **journald** under the identifier `gateway`. Nothing
+forwards it off-box yet — that's this section.
 
 > The single gotcha: to forward you must **read journald**. Pointing rsyslog at
 > the journal with `imjournal` fails on some hosts (notably LXC containers) where
@@ -95,22 +94,55 @@ that's this section.
 > nothing. The robust options below either read the journal **as root** or avoid
 > the journal entirely.
 
-### 2.1 journald → HTTP shipper (recommended; ships with the setup repo)
+### 2.1 journald → HTTP shipper (recommended; self-contained)
 
-The setup repo includes a dependency-free shipper that follows the Gateway's
-journald output and POSTs each line to any HTTP endpoint. This is the simplest
-reliable path and the one that targets Gatorcast directly.
+A small, dependency-free shipper that follows the Gateway's journald output and
+POSTs each line to Gatorcast. This is the simplest reliable path. It reads the
+journal **as root** (via the unit below), which is what makes it work even on
+hosts where rsyslog's privilege-drop cannot read the journal (notably LXC).
+
+The three files below are all you need — copy them onto the VM.
+
+**`/usr/local/bin/journald-http-shipper.sh`** (`chmod 755`):
 
 ```bash
-# From the twingate-ssh-setup checkout:
-sudo install -m 755 examples/log-forwarding/journald-http-shipper.sh /usr/local/bin/
-sudo install -m 600 examples/log-forwarding/journald-http-shipper.env.example /etc/journald-http-shipper.env
-sudo "${EDITOR:-vi}" /etc/journald-http-shipper.env
-sudo install -m 644 examples/log-forwarding/journald-http-shipper.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now journald-http-shipper
+#!/usr/bin/env bash
+# Follow the Twingate gateway's journald output and POST each line to Gatorcast.
+# Config comes from the EnvironmentFile in the unit below.
+set -euo pipefail
+
+: "${LOG_ENDPOINT:?set LOG_ENDPOINT (e.g. https://gatorcast.internal:8080/ingest)}"
+JOURNAL_ID="${JOURNAL_ID:-gateway}"
+CONTENT_TYPE="${CONTENT_TYPE:-application/x-ndjson}"
+AUTH_TOKEN="${AUTH_TOKEN:-}"
+
+post_line() {
+    local line="$1"
+    if [[ -n "$AUTH_TOKEN" ]]; then
+        curl -sS -m 10 -X POST "$LOG_ENDPOINT" \
+            -H "Authorization: Bearer ${AUTH_TOKEN}" \
+            -H "Content-Type: ${CONTENT_TYPE}" \
+            --data-binary "$line" >/dev/null
+    else
+        curl -sS -m 10 -X POST "$LOG_ENDPOINT" \
+            -H "Content-Type: ${CONTENT_TYPE}" \
+            --data-binary "$line" >/dev/null
+    fi
+}
+
+# -o cat = emit only the raw MESSAGE (the gateway's JSON); -f = follow;
+# --since now = forward only new lines. For gap-free delivery across restarts,
+# replace "--since now" with "--cursor-file=/var/lib/journald-http-shipper/cursor"
+# (create that directory first).
+journalctl -t "$JOURNAL_ID" -o cat -f --since now | while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if ! post_line "$line"; then
+        printf '%s: POST to %s failed, dropped one line\n' "${0##*/}" "$LOG_ENDPOINT" >&2
+    fi
+done
 ```
 
-`/etc/journald-http-shipper.env` for a Gatorcast target:
+**`/etc/journald-http-shipper.env`** (`chmod 600` — it holds the token):
 
 ```ini
 LOG_ENDPOINT=https://gatorcast.internal.example.com:8080/ingest
@@ -119,11 +151,35 @@ JOURNAL_ID=gateway
 CONTENT_TYPE=application/x-ndjson
 ```
 
-Start the shipper **before** driving a test session — it forwards only new lines
-(`--since now`). For gap-free delivery across restarts, switch the script to
-`--cursor-file=/var/lib/journald-http-shipper/cursor` (create the dir first).
+**`/etc/systemd/system/journald-http-shipper.service`**:
 
-Verify:
+```ini
+[Unit]
+Description=Ship Twingate gateway journald logs to Gatorcast
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/journald-http-shipper.env
+ExecStart=/usr/local/bin/journald-http-shipper.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now journald-http-shipper
+```
+
+Start the shipper **before** driving a test session — it forwards only new lines
+(`--since now`). Verify:
 
 ```bash
 systemctl status journald-http-shipper --no-pager
@@ -282,17 +338,21 @@ sinks:
 
 **Setup.** A small EC2 instance (t3.micro/small) in the same VPC as your SSH
 targets runs the Gateway under systemd. We provision it with Terraform and use
-**`user_data` (cloud-init)** to both install the Gateway (via the bash setup
-script) and lay down the journald → HTTP shipper from §2.1. Forwarding to
-Gatorcast is then automatic on every boot.
+**`user_data` (cloud-init)** to install the Gateway under systemd and lay down
+the journald → HTTP shipper from §2.1. Forwarding to Gatorcast is then automatic
+on every boot.
 
-`forwarder.tftpl` (a reusable cloud-init fragment — the forwarding half):
+`forwarder.tftpl` (a reusable cloud-init fragment — the forwarding half). It
+templates the `.env` (which carries the endpoint + token) and enables the
+service; the static `journald-http-shipper.sh` and `.service` from §2.1 are
+expected to already be on the instance — bake them into your golden image, or
+deliver them via cloud-init `write_files`:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- journald -> HTTP shipper (see §2.1) ---
+# --- journald -> HTTP shipper config (script + unit come from §2.1) ---
 install -m 600 /dev/stdin /etc/journald-http-shipper.env <<EOF
 LOG_ENDPOINT=${gatorcast_url}/ingest
 AUTH_TOKEN=${ingest_token}
@@ -300,9 +360,6 @@ JOURNAL_ID=gateway
 CONTENT_TYPE=application/x-ndjson
 EOF
 
-curl -fsSL "${shipper_base}/journald-http-shipper.sh" -o /usr/local/bin/journald-http-shipper.sh
-chmod 755 /usr/local/bin/journald-http-shipper.sh
-curl -fsSL "${shipper_base}/journald-http-shipper.service" -o /etc/systemd/system/journald-http-shipper.service
 systemctl daemon-reload
 systemctl enable --now journald-http-shipper
 ```
@@ -314,7 +371,6 @@ locals {
   forwarder = templatefile("${path.module}/forwarder.tftpl", {
     gatorcast_url = "https://gatorcast.internal.example.com:8080"
     ingest_token  = var.ingest_token            # pass via TF_VAR / secrets, never hardcode
-    shipper_base  = "https://raw.githubusercontent.com/your-org/twingate-ssh-setup/main/examples/log-forwarding"
   })
 }
 
@@ -380,7 +436,6 @@ locals {
   forwarder = templatefile("${path.module}/forwarder.tftpl", {
     gatorcast_url = "https://gatorcast.internal.example.com:8080"
     ingest_token  = var.ingest_token
-    shipper_base  = "https://raw.githubusercontent.com/your-org/twingate-ssh-setup/main/examples/log-forwarding"
   })
 }
 
@@ -433,7 +488,6 @@ locals {
   forwarder = templatefile("${path.module}/forwarder.tftpl", {
     gatorcast_url = "https://gatorcast.internal.example.com:8080"
     ingest_token  = var.ingest_token
-    shipper_base  = "https://raw.githubusercontent.com/your-org/twingate-ssh-setup/main/examples/log-forwarding"
   })
 }
 
@@ -660,7 +714,7 @@ and point the shipper at the private address.
 
 | Your Gateway runs as… | Start with |
 | --- | --- |
-| systemd on a VM (bash-script install) | §2.1 journald → HTTP shipper |
+| systemd on a VM (however installed) | §2.1 journald → HTTP shipper |
 | systemd, org standardizes on rsyslog | §2.2 (HTTP) or §2.3 (syslog TCP) |
 | systemd on LXC / privilege-drop host | §2.4 stderr-to-file → `imfile` |
 | systemd, also shipping logs elsewhere | §2.5 Vector |
