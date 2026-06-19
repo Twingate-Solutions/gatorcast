@@ -1,50 +1,18 @@
 # Gatorcast
 
+> **⚠️ Example project — provided as-is, with no support or warranty.** Gatorcast is published as a reference example to build from, not a supported product. Nothing here is guaranteed and no support is attached to it. It was developed with help from an LLM-based coding assistant. **Review the code and test it yourself before using it in any critical or production environment.** Your use is governed by the [Apache License 2.0](LICENSE), including its "AS IS", no-warranty (Section 7), and limitation-of-liability (Section 8) terms.
+
 Self-hosted, single-container service for **Twingate Identity Firewall Gateway session recordings**. The Twingate Gateway records interactive privileged sessions (`kubectl exec`, SSH shells) as asciicast v2 fragments and emits them via structured JSON audit logs. Twingate's reference pipeline ships those fragments to object storage but does not reassemble them into sessions or provide a browse/replay UI. Gatorcast fills that gap: it receives the Gateway's log lines via push (HTTP POST or syslog TCP), demultiplexes concurrent sessions by `conn_id`, reassembles each into a complete asciicast v2 document, stores it, and serves a lightweight web UI to browse **systems → sessions → replay** in a locally vendored asciinema player. All recordings stay on your infrastructure.
 
 ---
 
-## Architecture
+## Documentation
 
-```text
-  Twingate Gateway host (k8s pod OR SSH/VM)
-  emits gateway.audit JSON (asciicast v2 chunks) to stdout/stderr
-        │  push (operator's choice of shipper)
-        │   • rsyslog omhttp  → HTTP POST /ingest
-        │   • Docker syslog driver / rsyslog omfwd → syslog TCP
-        │   • curl (testing)  → HTTP POST /ingest
-        ▼
-┌──────────────────────── Gatorcast (single FastAPI container) ───────────────────────┐
-│  Ingest front doors                                                            │
-│    • POST /ingest        (NDJSON over HTTP, bearer-token auth)                  │
-│    • syslog TCP listener (octet-framed; strips <PRI> envelope)                  │
-│        │  raw line → normalize → JSON object                                    │
-│        ▼                                                                        │
-│  Classify & filter                                                              │
-│    • logger=="gateway.audit" AND asciicast!=null → recording chunk              │
-│    • logger=="gateway" "Authenticated connection" → session start + target      │
-│    • (close event if present) → finalize signal                                 │
-│        ▼                                                                        │
-│  Per-conn_id assembler (in-memory buffers)                                      │
-│    • append asciicast chunks, ordered by asciicast_sequence_num                 │
-│    • finalize on close-event OR idle timeout (APScheduler):                     │
-│        concat ALL chunks → parse asciicast → write .cast → complete row         │
-│        ▼                                                                        │
-│  Storage:  SQLite (WAL) metadata  +  /data/casts/<conn_id>.cast (named volume) │
-│  Retention purge (APScheduler, age/size)                                        │
-│        ▲                                                                        │
-│  Web UI (FastAPI + Jinja2 + HTMX, vendored asciinema player, UI auth)          │
-│    /systems → /systems/{addr} → /sessions/{id} → /sessions/{id}/cast           │
-└────────────────────────────────────────────────────────────────────────────────┘
-```
+This README covers install, configuration, and day-to-day operation. The deeper topics live in their own docs:
 
-**Key points:**
-
-- Single FastAPI process: ingestion, assembly, storage, scheduler, and UI all in one container.
-- State: SQLite (WAL mode) for metadata; a named Docker volume for `.cast` files.
-- APScheduler drives two background jobs: idle-timeout finalizer and daily retention purge.
-- Push-based: Gatorcast exposes endpoints and waits. It never reaches back into the Gateway, Docker, or Kubernetes.
-- All frontend assets are vendored locally. No CDN or external JS at runtime.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — how data flows through the service, the session lifecycle, encryption at rest, the security model, and retention.
+- **[SEARCH_AND_DETECTION.md](SEARCH_AND_DETECTION.md)** — the dashboard, search/filtering, content-search internals, and the full built-in detection rule set.
+- **[INGESTION_RECIPES.md](INGESTION_RECIPES.md)** — a cookbook for forwarding Gateway logs into Gatorcast from any deployment: systemd VMs, Terraform-provisioned cloud instances (AWS/GCP/Azure), Docker, and Kubernetes.
 
 ---
 
@@ -86,7 +54,7 @@ docker compose up -d
 
 Open `http://<your-host>:8080` in a browser. You will be prompted for the `UI_AUTH_USERNAME` and `UI_AUTH_PASSWORD` you set above.
 
-Sessions appear once the shipper begins forwarding Gateway logs and at least one session completes (or the idle timeout fires).
+Sessions appear once the shipper begins forwarding Gateway logs and at least one session completes (or the idle timeout fires). To forward logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 ---
 
@@ -106,168 +74,12 @@ All settings are environment variables. Secrets (`INGEST_TOKEN`, `UI_AUTH_*`) sh
 | `INGEST_TOKEN` | *(see .env.example)* | Bearer token the shipper presents to `POST /ingest` |
 | `UI_AUTH_USERNAME` | `admin` | Username for web UI HTTP Basic auth |
 | `UI_AUTH_PASSWORD` | *(see .env.example)* | Password for web UI HTTP Basic auth |
-| `ENCRYPTION_ENABLED` | `false` | Encrypt `.cast` recordings at rest (AES-256-GCM). Opt-in. |
+| `ENCRYPTION_ENABLED` | `false` | Encrypt `.cast` recordings at rest (AES-256-GCM). Opt-in. See [ARCHITECTURE.md](ARCHITECTURE.md#encryption-at-rest). |
 | `GATORCAST_MASTER_KEY` | *(unset)* | Base64 32-byte key. **Required** when encryption is enabled. Also keys the search sidecars. |
-| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection at finalize (produces findings). |
+| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection at finalize (produces findings). See [SEARCH_AND_DETECTION.md](SEARCH_AND_DETECTION.md). |
 | `BACKFILL_ON_STARTUP` | `true` | On startup, index + detect existing finalized recordings that lack a search sidecar. |
 | `SEARCH_PAGE_SIZE` | `50` | Default number of search results per page. |
 | `SEARCH_REGEX_MAX_CANDIDATES` | `2000` | Max sidecars scanned per keyword/regex content search (cost / ReDoS bound). |
-
----
-
-## Search & Automated Detection
-
-Beyond browsing systems → sessions → replay, Gatorcast indexes and scans every recording at finalize so auditors can find sessions fast and have dangerous activity flagged automatically.
-
-- **Dashboard** (`/dashboard`, the site root) — total and flagged session counts, severity/category breakdowns, and top users/systems, all server-rendered (offline, no external JS). It is **time-windowed** with a 7 / 30 / 90 / All-time toggle (default 30 days). Every breakdown is a **drill-down link**: a severity badge opens search filtered to that exact highest severity, a category opens search for that category, a top user opens that user's sessions, and a top system opens its session list — each carrying the active window so the figures and results line up.
-- **Search** (`/search`) — filter by user, system, status, date range, duration, severity (at-or-above), finding category, a dangerous-command rule multiselect, a free-text **keyword**, and a custom **regex**. Results paginate and the filters live in the URL (shareable). **CSV export** (`/search/export.csv`) writes session metadata plus a finding summary.
-- **Systems index** (`/systems`) — a **Findings column** flags each system with its highest-severity badge and total finding count (or `—` if clean), so you can see at a glance which systems to look into.
-- **Findings** — a built-in rule set scans each reassembled recording for **dangerous commands** (e.g. `rm -rf`, pipe-to-shell, `dd of=/dev/…`, `mkfs`, fork bombs, `kubectl delete`, reverse shells, history clearing, privilege changes) and **on-screen secrets** (AWS keys, private-key blocks, GitHub/Slack/Vault tokens, JWTs, inline `PASSWORD=`/`TOKEN=` assignments). Findings expose only the **rule label, severity, and replay offset** — never the matched text.
-- **Seek-to-finding** — clicking a finding on the session page jumps the asciinema player to that moment. The jump also works as a **deep link** (`/sessions/{id}?t=<seconds>`): opening or refreshing that URL loads the player already positioned at the timestamp (and autoplaying), so a "jump" from the search results lands in the right place.
-
-**How content search works (no full-text index).** At finalize, Gatorcast writes an ANSI-stripped plaintext rendering of the recording to a per-session **sidecar** file (`<conn_id>.txt.enc`). When `ENCRYPTION_ENABLED=true`, the sidecar is encrypted with a key derived independently from `GATORCAST_MASTER_KEY` (distinct HKDF context) — losing the key makes sidecars unrecoverable too. Keyword/regex search is **scan-on-demand**: metadata filters and precomputed findings narrow the candidate set, then only those sidecars are decrypted and scanned in a worker thread, bounded by `SEARCH_REGEX_MAX_CANDIDATES`. There is **no FTS5 and no SQLCipher**; the metadata database stays plaintext.
-
-> **The `.txt.enc` sidecars are secret-grade.** They hold on-screen plaintext, which can include typed secrets. They live on the same auth-gated volume as the `.cast` files, are encrypted under the same master key when encryption is on, and are deleted by retention alongside the recording — treat them at the same trust level as the recordings.
-
-**Detecting on pre-existing recordings.** With `BACKFILL_ON_STARTUP=true` (default), a throttled background pass on startup builds sidecars + findings for finalized recordings that predate this feature, so search and flags work on your whole history. It is idempotent — already-indexed sessions are skipped.
-
----
-
-## Encryption at Rest
-
-Gatorcast can encrypt the sensitive bulk of the data — the `.cast` recordings — on the volume. Recordings capture full on-screen content, including typed tokens and passwords, so encrypting them protects against a stolen disk, a leaked backup, or a volume snapshot.
-
-**What is and isn't protected:**
-
-| Scenario | Protected? |
-| --- | --- |
-| Stolen disk / laptop / leaked backup / volume snapshot | **Yes** — `.cast` content is ciphertext. |
-| Another process reading the live `/data` volume | **Yes for recordings** (ciphertext); **no for metadata** (the DB is plaintext). |
-| Compromise of the running app process | **No** — the key is in memory so the app can decrypt for replay. Inherent. |
-| Metadata (usernames, system addresses, shell user) | **No** — the metadata database stays plaintext. |
-
-This is the honest meaning of "at rest" for a service that must decrypt to replay. Encrypting the metadata DB would require SQLCipher, which this project deliberately avoids.
-
-**How it works:** `.cast` files are encrypted with AES-256-GCM (per-file random nonce, the connection id bound in as additional authenticated data). The key on disk is HKDF-derived from `GATORCAST_MASTER_KEY` — the raw env value is never used directly. The metadata database is unchanged.
-
-**Enabling it:**
-
-1. Generate a master key:
-
-   ```bash
-   openssl rand -base64 32
-   ```
-
-2. Set both variables (in `.env`, or inject `GATORCAST_MASTER_KEY` from a secrets manager):
-
-   ```bash
-   ENCRYPTION_ENABLED=true
-   GATORCAST_MASTER_KEY=<the base64 value from step 1>
-   ```
-
-3. Start the service. If encryption is enabled but the key is missing or invalid, Gatorcast **refuses to boot** (fail-closed) rather than silently storing recordings in the clear.
-
-**Pulling the key from a cloud vault → env:** The app only ever reads the key from the environment, so any vault that can inject an env var works:
-
-- **AWS Secrets Manager / Parameter Store** — reference the secret in an ECS task definition `secrets:` block so it lands as `GATORCAST_MASTER_KEY`.
-- **HashiCorp Vault** — use a Vault agent or an entrypoint wrapper that exports `GATORCAST_MASTER_KEY` before launching the process.
-- **Docker Compose secrets** — mount the secret and export it to the env in your entrypoint.
-
-**Important limitations:**
-
-- **Fresh-start only.** Enabling encryption does **not** migrate existing unencrypted recordings. Start with a clean `/data` (or expect previously-written plaintext files to remain plaintext).
-- **Losing the key means losing the recordings.** There is no recovery path and no key rotation in this version.
-- **The metadata database is not encrypted.**
-
----
-
-## Shipper Recipes
-
-Gatorcast is push-based. You configure your existing log-shipping infrastructure to forward the Gateway's stdout/stderr to Gatorcast. Three common patterns follow.
-
-> **Looking for your specific deployment?** [INGESTION_RECIPES.md](INGESTION_RECIPES.md) is a full cookbook of worked examples organized by how the Gateway is deployed — systemd VMs (journald shipper, rsyslog, Vector), Terraform-provisioned cloud instances (AWS EC2, GCP Compute Engine, Azure VM), Docker, and Kubernetes (EKS/AKS/GKE) — plus options for reaching a self-hosted Gatorcast. The three patterns below are the quick reference.
-
-### rsyslog omhttp (HTTP POST)
-
-On the host running rsyslog, add a configuration file to batch and POST the Gateway's log lines to `/ingest` with a bearer token:
-
-```conf
-# /etc/rsyslog.d/60-gatorcast.conf
-module(load="imjournal" StateFile="/var/lib/rsyslog/imjournal.state")
-module(load="omhttp")
-
-# Match only the Gateway container's journal unit (adjust as appropriate).
-if $programname == "gateway" then {
-    action(
-        type="omhttp"
-        server="gatorcast.example.internal"
-        serverport="8080"
-        httpcontenttype="application/x-ndjson"
-        restpath="ingest"
-        usehttps="off"
-        action.sendResendOnError="off"
-        action.execOnlyWhenPreviousIsSuspended="off"
-        template="RSYSLOG_FileFormat"
-        httpHeaders="Authorization: Bearer YOUR_INGEST_TOKEN_HERE"
-        batch="on"
-        batch.maxsize="100"
-        batch.timeout="5000"
-    )
-}
-```
-
-Replace `gatorcast.example.internal`, `8080`, and `YOUR_INGEST_TOKEN_HERE` with your actual values. Restart rsyslog after editing.
-
-### Docker syslog driver (syslog TCP)
-
-Run the Twingate Gateway container with the Docker syslog log driver pointed at Gatorcast's syslog TCP port. Docker uses octet-framed TCP by default, which is the framing Gatorcast expects.
-
-```bash
-docker run \
-  --log-driver=syslog \
-  --log-opt syslog-address=tcp://<gatorcast-host>:6514 \
-  --log-opt syslog-format=rfc5424 \
-  <gateway-image>
-```
-
-Or in a Compose file:
-
-```yaml
-services:
-  gateway:
-    image: <gateway-image>
-    logging:
-      driver: syslog
-      options:
-        syslog-address: "tcp://<gatorcast-host>:6514"
-        syslog-format: rfc5424
-```
-
-The syslog port carries no per-message authentication; keep it bound to an internal interface (see the Deployment section below).
-
-### curl (smoke testing)
-
-For a quick one-shot test from a file of Gateway log lines:
-
-```bash
-curl -s -X POST http://localhost:8080/ingest \
-  -H "Authorization: Bearer $INGEST_TOKEN" \
-  -H "Content-Type: application/x-ndjson" \
-  --data-binary @gateway.log
-```
-
-Or to stream a live file:
-
-```bash
-tail -F gateway.log | while IFS= read -r line; do
-  curl -s -X POST http://localhost:8080/ingest \
-    -H "Authorization: Bearer $INGEST_TOKEN" \
-    -H "Content-Type: text/plain" \
-    --data-binary "$line"
-done
-```
-
-This is for smoke testing only; use rsyslog or the Docker syslog driver for production.
 
 ---
 
@@ -288,35 +100,6 @@ ports:
 ```
 
 If your shipper runs on a different host, change `127.0.0.1` to the host's internal/VPN interface IP so only authorized shippers on that network can reach it. Never bind it to `0.0.0.0` in a production environment.
-
----
-
-## Security Model
-
-| Layer | Mechanism |
-| --- | --- |
-| `/ingest` endpoint | `Authorization: Bearer <INGEST_TOKEN>` checked with constant-time comparison. Missing or mismatched token → 401. |
-| Web UI (all routes) | HTTP Basic auth on every UI and cast route. Credentials checked with constant-time comparison. No route is reachable unauthenticated (except `/healthz` and `/static/*`). |
-| `.cast` file serving | Paths are confined to `casts_dir` with a `is_relative_to` check before serving, even though `conn_id` is already validated upstream. |
-| Container privileges | Runs as a dedicated non-root system user (`uid 10001`). |
-| Recording payloads | Never written to application logs. Session recordings may contain on-screen secrets (terminals, typed tokens). Treat all stored `.cast` files as secret-grade. |
-| Syslog TCP | No per-message auth. Bound to loopback by default. Cap on concurrent connections (128) and idle connections (5-minute timeout) to limit resource exhaustion. |
-| Insecure defaults | At startup, Gatorcast logs a warning for each secret still equal to a placeholder default. The service still boots, but the warning is prominent. |
-
-**Access control summary:** Set strong, unique values for `INGEST_TOKEN`, `UI_AUTH_USERNAME`, and `UI_AUTH_PASSWORD`. Put Gatorcast behind a TLS-terminating reverse proxy. Do not expose the syslog port on a public interface.
-
----
-
-## Retention
-
-Two independent policies run daily (APScheduler):
-
-1. **Age-based:** Sessions with a `started_at` older than `RETENTION_DAYS` days are deleted (row + `.cast` file). Sessions with no `started_at` are not age-purged (their age is unknown).
-2. **Size-based:** If `RETENTION_MAX_GB > 0`, the oldest complete sessions are deleted until the total `.cast` size is under the cap.
-
-Both policies are no-ops when disabled (`0`). Deleting a row and its `.cast` file is one logical operation; a missing file is tolerated and does not cause an error.
-
-To keep recordings indefinitely, set `RETENTION_DAYS=0` and `RETENTION_MAX_GB=0` (the defaults for size are already `0`).
 
 ---
 
@@ -351,7 +134,7 @@ A session is provisional while its chunks are buffering in memory. It becomes co
 
 ### Nothing showing up in the UI
 
-1. **Check `INGEST_TOKEN`:** Send a test `curl` request (see Shipper Recipes). A 401 response means the token does not match.
+1. **Check `INGEST_TOKEN`:** Send a test `curl` request (see [INGESTION_RECIPES.md](INGESTION_RECIPES.md)). A 401 response means the token does not match.
 2. **Two-stage recording filter:** Gatorcast only processes lines where `logger == "gateway.audit"` AND the `asciicast` field is non-null. API-audit lines (e.g. `kubectl logs` completions) emit `gateway.audit` lines without an `asciicast` field and are dropped by design. This is expected behavior.
 3. **Check the shipper connection:** For syslog TCP, confirm the shipper's IP/port settings match the binding. For HTTP, check that the shipper sends `Content-Type: application/x-ndjson` or `text/plain` and a valid `Authorization: Bearer` header.
 4. **Session-start event:** The UI groups sessions by target system (`resource_address`). If the Gateway does not emit an `"Authenticated connection"` line for a session, the session will appear in an "unknown" bucket.
@@ -405,3 +188,9 @@ The following are explicitly out of scope for this release and will not be added
 - SSO or multi-user RBAC (the current auth is single-operator HTTP Basic)
 - Object-storage offload for cold recordings
 - SSH/VM gateway journald tailing (Gatorcast is push-only)
+
+---
+
+## License
+
+Gatorcast is licensed under the [Apache License 2.0](LICENSE). It is provided on an "AS IS" basis, without warranties or conditions of any kind — see the disclaimer at the top of this README and Sections 7 and 8 of the license.

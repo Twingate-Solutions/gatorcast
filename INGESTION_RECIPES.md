@@ -155,6 +155,9 @@ if ($programname == "gateway") then {
         action.resumeRetryCount="-1"
         queue.type="LinkedList"
         queue.saveOnShutdown="on"
+        batch="on"
+        batch.maxsize="100"
+        batch.timeout="5000"
     )
     stop
 }
@@ -165,9 +168,11 @@ sudo systemctl restart rsyslog
 ```
 
 The `queue.*` settings give you durable buffering and retry — a real advantage of
-the rsyslog path over the simple shipper. Exact `omhttp` parameter names vary by
-rsyslog version; verify with `rsyslogd -v` and the `omhttp` docs if it doesn't
-start.
+the rsyslog path over the simple shipper. The `batch.*` settings post up to 100
+lines (or every 5 s) in one NDJSON request rather than one request per line;
+Gatorcast's `/ingest` accepts the batch and processes it line-by-line. Exact
+`omhttp` parameter names vary by rsyslog version; verify with `rsyslogd -v` and
+the `omhttp` docs if it doesn't start.
 
 ### 2.3 rsyslog `imjournal` → `omfwd` (Syslog TCP door)
 
@@ -507,9 +512,21 @@ services:
         tag: "gateway"
 ```
 
+Or as a plain `docker run` (same options):
+
+```bash
+docker run \
+  --log-driver=syslog \
+  --log-opt syslog-address=tcp://gatorcast.internal.example.com:6514 \
+  --log-opt syslog-format=rfc5424 \
+  --log-opt tag=gateway \
+  twingate/gateway:latest
+```
+
 Each stdout line is wrapped in a syslog frame and sent over TCP; Gatorcast strips
-the `<PRI>` header and parses the Gateway JSON. **TCP only** — never `udp://`
-(asciicast chunks would be truncated).
+the `<PRI>` header and parses the Gateway JSON. Docker uses octet-framed TCP by
+default — the framing Gatorcast expects. **TCP only** — never `udp://` (asciicast
+chunks would be truncated).
 
 **Alternative — HTTP via Fluent Bit/Vector sidecar.** If you'd rather use the
 authenticated HTTP door, run a Fluent Bit container with a `forward`/`docker`
@@ -602,6 +619,21 @@ journalctl -t gateway -o cat --since "10 min ago" \
       -H "Content-Type: application/x-ndjson" \
       --data-binary @-
 ```
+
+Or stream a growing file line-by-line (one POST per line — testing only, no
+batching or retry):
+
+```bash
+tail -F gateway.log | while IFS= read -r line; do
+  curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
+    -H "Authorization: Bearer <your INGEST_TOKEN>" \
+    -H "Content-Type: text/plain" \
+    --data-binary "$line"
+done
+```
+
+For anything beyond a smoke test, use one of the shipper recipes above — they
+give you batching, buffering, and retry that a bare `curl` loop does not.
 
 ---
 

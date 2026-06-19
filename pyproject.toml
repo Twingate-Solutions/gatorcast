@@ -8,7 +8,8 @@ version = "0.3.0"
 description = "Self-hosted ingest, reassembly, and replay UI for Twingate Identity Firewall Gateway session recordings (asciicast v2)."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "APL2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Ben Cameron" }]
 dependencies = [
     "fastapi>=0.111",
