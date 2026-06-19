@@ -185,6 +185,8 @@ This is the honest meaning of "at rest" for a service that must decrypt to repla
 
 Gatorcast is push-based. You configure your existing log-shipping infrastructure to forward the Gateway's stdout/stderr to Gatorcast. Three common patterns follow.
 
+> **Looking for your specific deployment?** [INGESTION_RECIPES.md](INGESTION_RECIPES.md) is a full cookbook of worked examples organized by how the Gateway is deployed — systemd VMs (journald shipper, rsyslog, Vector), Terraform-provisioned cloud instances (AWS EC2, GCP Compute Engine, Azure VM), Docker, and Kubernetes (EKS/AKS/GKE) — plus options for reaching a self-hosted Gatorcast. The three patterns below are the quick reference.
+
 ### rsyslog omhttp (HTTP POST)
 
 On the host running rsyslog, add a configuration file to batch and POST the Gateway's log lines to `/ingest` with a bearer token:
