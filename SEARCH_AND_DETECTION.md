@@ -94,6 +94,9 @@ quickest way to populate the dashboard and confirm both detection and the absenc
 of false positives. Because the detector scans on-screen output, simply `echo`-ing
 a dangerous string is enough to trip a rule — nothing destructive ever runs.
 
+For a full walkthrough — running the test suite, seeding demo data, and the exact
+paste-ready text to trip each rule by hand — see [TESTING.md](TESTING.md).
+
 ---
 
 ## How content search works (no full-text index)
