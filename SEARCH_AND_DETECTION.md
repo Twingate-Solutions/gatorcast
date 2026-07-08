@@ -1,10 +1,10 @@
 # Gatorcast — Search & Automated Detection
 
-Beyond browsing **systems → sessions → replay**, Gatorcast indexes and scans
-every recording at finalize so auditors can find sessions fast and have dangerous
-activity flagged automatically. This document covers the dashboard, search, the
-built-in detection rule set, and how content search and indexing work under the
-hood.
+Beyond browsing **systems → sessions → replay**, Gatorcast scans every recording
+**live as it is received** and indexes it for content search at seal, so auditors
+can find sessions fast and have dangerous activity flagged while a session is still
+in progress. This document covers the dashboard, search, the built-in detection
+rule set, and how content search and indexing work under the hood.
 
 For the overall design and how recordings are stored/encrypted, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -23,13 +23,20 @@ For the overall design and how recordings are stored/encrypted, see
 
 ## When detection runs
 
-Detection runs **once per session, at finalize** — the moment the recording is
-reassembled and written to disk (see the session lifecycle in
-[ARCHITECTURE.md](ARCHITECTURE.md#architecture)). It is not per-keystroke and not
-live during ingestion. The scan is gated by `DETECTION_ENABLED` (default `true`)
-and runs *after* the `.cast` file and metadata row are committed, so a scan
-failure can never prevent a session from being playable — it only forfeits search
-and findings for that one session.
+Detection runs **live** — on **every append** as chunks arrive, and once more at
+seal — so findings and a session's risk appear while it is still in progress (see
+the file-first session lifecycle in
+[ARCHITECTURE.md](ARCHITECTURE.md#session-lifecycle-provisional--complete-file-first)).
+Each pass re-scans the recording-so-far and replaces that session's findings
+(idempotent), so there are never duplicates. Granularity is per Gateway flush, not
+per keystroke; a command split across a not-yet-received chunk is flagged as soon
+as the chunk carrying the rest of it arrives.
+
+Detection is gated by `DETECTION_ENABLED` (default `true`) and any scan failure is
+swallowed — the `.cast` is already on disk, so a failed pass only forfeits findings
+for that pass, never a playable recording. The **content-search sidecar**
+(`<conn_id>.txt.enc`) is written only at seal, so keyword/regex content search
+covers sealed (complete) sessions; findings and risk badges are available live.
 
 Each rule is evaluated against the ANSI-stripped plaintext rendering of the
 recording. A rule that matches produces exactly one finding, carrying the replay
@@ -101,9 +108,9 @@ paste-ready text to trip each rule by hand — see [TESTING.md](TESTING.md).
 
 ## How content search works (no full-text index)
 
-At finalize, Gatorcast writes an ANSI-stripped plaintext rendering of the
-recording to a per-session **sidecar** file (`<conn_id>.txt.enc`), along with a
-character-offset → replay-time index so a keyword hit can be mapped back to a
+At seal (when a session completes), Gatorcast writes an ANSI-stripped plaintext
+rendering of the recording to a per-session **sidecar** file (`<conn_id>.txt.enc`),
+along with a character-offset → replay-time index so a keyword hit can be mapped back to a
 moment in the recording. When `ENCRYPTION_ENABLED=true`, the sidecar is encrypted
 with a key derived independently from `GATORCAST_MASTER_KEY` (distinct HKDF
 context) — losing the key makes sidecars unrecoverable too.
@@ -140,7 +147,7 @@ These settings (all defaulted; see the [README configuration table](README.md#co
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection at finalize. |
+| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection live (every append) and at seal. |
 | `BACKFILL_ON_STARTUP` | `true` | On startup, index + detect existing finalized recordings that lack a sidecar. |
 | `SEARCH_PAGE_SIZE` | `50` | Default number of search results per page. |
 | `SEARCH_REGEX_MAX_CANDIDATES` | `2000` | Max sidecars scanned per keyword/regex content search (cost / ReDoS bound). |

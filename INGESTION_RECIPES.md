@@ -661,8 +661,12 @@ curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
   --data-binary $'{"logger":"gateway","message":"Authenticated connection","conn_id":"test-001","resource_address":"demo-host","user":{"username":"you@corp"}}\n{"logger":"gateway.audit","conn_id":"test-001","asciicast_sequence_num":0,"asciicast":"{\\"version\\":2,\\"width\\":80,\\"height\\":24,\\"timestamp\\":1718700000}\\n[0.5,\\"o\\",\\"hello from gatorcast\\\\r\\\\n\\"]\\n","user":{"username":"you@corp"}}\n{"logger":"gateway","message":"Connection closed","conn_id":"test-001"}'
 ```
 
-A `204 No Content` means accepted. The close event finalizes the session
-immediately; otherwise it would finalize after the idle timeout (~2–2.5 min).
+A `204 No Content` means accepted. The recording is written to disk and playable
+as soon as its chunk is processed. The trailing close event seals it to *complete*
+immediately — as does the Gateway's real end signal, a recording chunk whose
+`message` is `"session finished"` (emitted by the recorder on session stop). With
+neither, the recording still seals via the idle backstop after
+`SESSION_MAX_IDLE_SECONDS` (default 1 h).
 
 To replay actual Gateway journald output through the door for a realistic test:
 

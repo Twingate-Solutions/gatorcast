@@ -25,13 +25,15 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 │        ▼                                                                        │
 │  Classify & filter                                                              │
 │    • logger=="gateway.audit" AND asciicast!=null → recording chunk              │
+│      (message=="session finished" → final chunk / end signal)                   │
 │    • logger=="gateway" "Authenticated connection" → session start + target      │
 │    • (close event if present) → finalize signal                                 │
 │        ▼                                                                        │
-│  Per-conn_id assembler (in-memory buffers)                                      │
-│    • append asciicast chunks, ordered by asciicast_sequence_num                 │
-│    • finalize on close-event OR idle timeout (APScheduler):                     │
-│        concat ALL chunks → parse asciicast → write .cast → complete row         │
+│  Per-conn_id assembler (file-first)                                             │
+│    • each chunk → reassemble (header once, events in seq order) →               │
+│        write PLAINTEXT .cast to disk + scan live (durable per append)           │
+│    • seal (encrypt if enabled → complete): on "session finished"/close          │
+│        (terminal) OR idle backstop (reopenable → late chunk resumes it)         │
 │        ▼                                                                        │
 │  Storage:  SQLite (WAL) metadata  +  /data/casts/<conn_id>.cast (named volume) │
 │  Retention purge (APScheduler, age/size)                                        │
@@ -45,20 +47,24 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 - Single FastAPI process: ingestion, assembly, storage, scheduler, and UI all in one container.
 - State: SQLite (WAL mode) for metadata; a named Docker volume for `.cast` files.
-- APScheduler drives two background jobs: idle-timeout finalizer and daily retention purge.
+- APScheduler drives two background jobs: the idle sweep (drops abandoned start-only sessions; applies the reopenable seal backstop) and the daily retention purge.
 - Push-based: Gatorcast exposes endpoints and waits. It never reaches back into the Gateway, Docker, or Kubernetes.
 - All frontend assets are vendored locally. No CDN or external JS at runtime.
 
-### Session lifecycle: provisional → complete
+### Session lifecycle: provisional → complete (file-first)
 
-A session is **provisional** while its chunks are buffering in memory, and becomes **complete** when it finalizes. Finalize fires on whichever comes first:
+Gatorcast is **file-first**: as each chunk arrives it is reassembled (the header kept once, event lines concatenated in `asciicast_sequence_num` order — the Gateway repeats the header in every chunk) and the growing document is written to `<conn_id>.cast` **as plaintext on every append**. So the recording is durable on disk from the first chunk, playable while in progress, and scanned for findings live. A session is **provisional** while it is still recording.
 
-- A connection-close event, if the Gateway emits one, or
-- `IDLE_TIMEOUT_SECONDS` of silence for that `conn_id`, caught by the idle-finalizer job (which runs every `max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds).
+The recording is **sealed** to **complete** — encrypted (if enabled) and finalized — in one of two ways:
 
-With the default 120-second timeout, a session finalizes roughly **2–2.5 minutes after its last output chunk** — and because the idle timer resets on every chunk, that clock counts from the *last* byte of output, not the first. On finalize, all chunks are concatenated in `asciicast_sequence_num` order, parsed as one asciicast v2 document, written to `<conn_id>.cast`, and the metadata row is flipped to complete. Partial buffers are always flushed, so an interrupted session still produces a playable file.
+- **Terminal seal**, on the Gateway's final flush (`message == "session finished"`, emitted by the recorder's `Stop()`) or a connection-close event. This is the normal, immediate path: the recording is complete the moment that line is processed.
+- **Reopenable seal**, on the idle backstop: an in-progress recording silent for `SESSION_MAX_IDLE_SECONDS` (default 3600 s) is sealed anyway, assuming the Gateway died without its final flush. If a later chunk *does* arrive for that `conn_id`, the sealed file is decrypted, appended to, and re-sealed — so a long interactive pause never loses or splits the recording.
 
-On restart, Gatorcast sweeps provisional rows orphaned by a crash: if a `.cast` file already exists it is recovered and finalized from disk; otherwise stale empty rows are removed.
+`IDLE_TIMEOUT_SECONDS` (default 120 s) no longer finalizes recordings; it only drops a connection that authenticated but recorded nothing. The idle sweep runs every `max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds.
+
+On restart, Gatorcast re-adopts each provisional row from its on-disk plaintext `.cast` as an in-progress session (so continuation chunks keep appending and it seals normally); a provisional row with no `.cast` older than the idle timeout is an abandoned start and is swept away.
+
+**Encryption note:** because recordings are written plaintext while in progress and only encrypted at seal, an in-progress recording is plaintext at rest until it seals (see [Encryption at Rest](#encryption-at-rest)).
 
 ---
 
@@ -70,8 +76,8 @@ Gatorcast can encrypt the sensitive bulk of the data — the `.cast` recordings 
 
 | Scenario | Protected? |
 | --- | --- |
-| Stolen disk / laptop / leaked backup / volume snapshot | **Yes** — `.cast` content is ciphertext. |
-| Another process reading the live `/data` volume | **Yes for recordings** (ciphertext); **no for metadata** (the DB is plaintext). |
+| Stolen disk / laptop / leaked backup / volume snapshot | **Yes for sealed recordings** — completed `.cast` content is ciphertext. In-progress recordings are plaintext until they seal (see note below). |
+| Another process reading the live `/data` volume | **Yes for sealed recordings** (ciphertext); **no for in-progress recordings** (plaintext until sealed) and **no for metadata** (the DB is plaintext). |
 | Compromise of the running app process | **No** — the key is in memory so the app can decrypt for replay. Inherent. |
 | Metadata (usernames, system addresses, shell user) | **No** — the metadata database stays plaintext. |
 
@@ -104,6 +110,7 @@ This is the honest meaning of "at rest" for a service that must decrypt to repla
 
 **Important limitations:**
 
+- **In-progress recordings are plaintext at rest.** A `.cast` is written plaintext on every append and only encrypted when the session seals (on "session finished" or the idle backstop). So a session that is still recording — or one held open and idle below the backstop — sits unencrypted on the volume until it seals. This is the accepted tradeoff for durability and live/in-progress playback; lower `SESSION_MAX_IDLE_SECONDS` to shorten the plaintext window for abandoned sessions.
 - **Fresh-start only.** Enabling encryption does **not** migrate existing unencrypted recordings. Start with a clean `/data` (or expect previously-written plaintext files to remain plaintext).
 - **Losing the key means losing the recordings.** There is no recovery path and no key rotation in this version.
 - **The metadata database is not encrypted.**

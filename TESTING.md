@@ -59,7 +59,7 @@ fires on a positive sample and that look-alike-but-safe input does not.
 [`scripts/seed_demo.py`](scripts/seed_demo.py) is the fastest way to populate the dashboard
 and search UI. It POSTs a handful of synthetic sessions (varied users, systems, and dates)
 through the **real `/ingest` front door**, then sends a close event per session so each
-finalizes immediately instead of waiting on the idle timeout.
+seals to complete immediately instead of waiting on the idle backstop.
 
 Between them the sessions trip **every** built-in rule at least once, and the final two
 sessions are controls: one ordinary clean session and one negative-control session of
@@ -94,7 +94,7 @@ craft a one-off test case. There are two ways to get the text in front of the de
 Open a session that the Gateway is recording (an SSH shell or `kubectl exec`), then paste the
 block below. Because each line is a single-quoted `echo`, the shell just prints the string —
 nothing executes — but the dangerous text still appears on screen and is captured in the
-recording. When the session finalizes, the scan fires the rules.
+recording. The scan fires the rules live as the output is received (and again at seal).
 
 ```bash
 echo 'rm -rf /tmp/foo'
@@ -179,7 +179,8 @@ curl -sS -X POST http://127.0.0.1:8080/ingest \
 NDJSON
 ```
 
-The session finalizes on the close event (or after `IDLE_TIMEOUT_SECONDS`), is scanned, and
+The session seals to complete on the close event (or a `"session finished"` chunk; otherwise
+the idle backstop after `SESSION_MAX_IDLE_SECONDS`). It is scanned live as it arrives and
 appears at `/sessions/c-manual-01` with `recursive-delete` and `aws-key` findings. Note the
 double-escaping: `asciicast` is a JSON **string** whose value is itself a JSON document, so
 its inner quotes and newlines are backslash-escaped.

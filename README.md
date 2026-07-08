@@ -55,7 +55,7 @@ docker compose up -d
 
 Open `http://<your-host>:8080` in a browser. You will be prompted for the `UI_AUTH_USERNAME` and `UI_AUTH_PASSWORD` you set above.
 
-Sessions appear once the shipper begins forwarding Gateway logs and at least one session completes (or the idle timeout fires). To forward logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
+Sessions appear as soon as the shipper begins forwarding Gateway logs — a recording shows up (in progress, and playable) on its first chunk and flips to complete when the Gateway sends its "session finished" flush. To forward logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 ---
 
@@ -68,7 +68,8 @@ All settings are environment variables. Secrets (`INGEST_TOKEN`, `UI_AUTH_*`) sh
 | `HTTP_PORT` | `8080` | FastAPI HTTP port (UI + `POST /ingest`) |
 | `SYSLOG_TCP_PORT` | `6514` | Syslog TCP listener port. `0` disables the listener. |
 | `DATA_DIR` | `/data` | Volume root for the SQLite database and `.cast` files |
-| `IDLE_TIMEOUT_SECONDS` | `120` | Finalize a session after this many seconds of silence from the shipper |
+| `IDLE_TIMEOUT_SECONDS` | `120` | Drop a connection that authenticated but recorded nothing after this silence. Does **not** finalize recordings (those seal on the Gateway's "session finished" flush). |
+| `SESSION_MAX_IDLE_SECONDS` | `3600` | Idle backstop: seal an in-progress recording after this much silence (assumes the Gateway died without its final flush). Reopenable — a later chunk resumes it. Also the window a recording stays plaintext at rest before encryption. |
 | `RETENTION_DAYS` | `90` | Purge sessions older than this many days. `0` keeps forever. |
 | `RETENTION_MAX_GB` | `0` | Optional total `.cast` size cap in GB. `0` disables size-based purge. |
 | `LOG_LEVEL` | `info` | structlog level (`debug`, `info`, `warning`, `error`) |
@@ -77,7 +78,7 @@ All settings are environment variables. Secrets (`INGEST_TOKEN`, `UI_AUTH_*`) sh
 | `UI_AUTH_PASSWORD` | *(see .env.example)* | Password for web UI HTTP Basic auth |
 | `ENCRYPTION_ENABLED` | `false` | Encrypt `.cast` recordings at rest (AES-256-GCM). Opt-in. See [ARCHITECTURE.md](ARCHITECTURE.md#encryption-at-rest). |
 | `GATORCAST_MASTER_KEY` | *(unset)* | Base64 32-byte key. **Required** when encryption is enabled. Also keys the search sidecars. |
-| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection at finalize (produces findings). See [SEARCH_AND_DETECTION.md](SEARCH_AND_DETECTION.md). |
+| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection live on every append and at seal (produces findings). See [SEARCH_AND_DETECTION.md](SEARCH_AND_DETECTION.md). |
 | `BACKFILL_ON_STARTUP` | `true` | On startup, index + detect existing finalized recordings that lack a search sidecar. |
 | `SEARCH_PAGE_SIZE` | `50` | Default number of search results per page. |
 | `SEARCH_REGEX_MAX_CANDIDATES` | `2000` | Max sidecars scanned per keyword/regex content search (cost / ReDoS bound). |
@@ -125,13 +126,13 @@ image: ghcr.io/twingate-solutions/gatorcast:v0.1.0
 
 ## Troubleshooting
 
-### Sessions stuck in "provisional" status
+### Sessions stuck in "provisional" (in-progress) status
 
-A session is provisional while its chunks are buffering in memory. It becomes complete when a close event arrives or `IDLE_TIMEOUT_SECONDS` of silence elapses. If sessions remain provisional indefinitely:
+A recording is provisional (shown as "in progress") while it is still recording; its `.cast` is on disk and playable throughout. It seals to complete when the Gateway sends its final flush (`message == "session finished"`), or — as a backstop — after `SESSION_MAX_IDLE_SECONDS` of silence. If sessions remain provisional indefinitely:
 
-- Verify your shipper is forwarding log lines continuously during active sessions (check rsyslog/Docker syslog driver stats).
-- Check whether the Gateway emits a connection-close log line. If it does not, the idle timeout is the only finalize signal; increase `IDLE_TIMEOUT_SECONDS` if sessions are very long.
-- On restart, Gatorcast sweeps orphaned provisional rows: if a `.cast` file already exists it is recovered; otherwise stale empty rows are removed.
+- Verify your shipper is forwarding log lines during active sessions (check rsyslog/Docker syslog driver stats). A recording that is provisional but *playable* just hasn't received its "session finished" flush yet.
+- Confirm the Gateway actually ends the session (its recorder emits "session finished" on `Stop()`). If the shipper drops that line, the recording seals via the backstop after `SESSION_MAX_IDLE_SECONDS`; lower that value to seal sooner, or raise it if you hold sessions idle for very long.
+- On restart, Gatorcast re-adopts provisional rows that have an on-disk `.cast` as in-progress (continuation chunks keep appending); a provisional row with no `.cast` older than `IDLE_TIMEOUT_SECONDS` is an abandoned start and is removed.
 
 ### Nothing showing up in the UI
 
@@ -183,9 +184,8 @@ Gatorcast makes zero external network requests at runtime. There are no CDN depe
 
 The following are explicitly out of scope for this release and will not be added without a design discussion:
 
-- Live/streaming replay of in-progress sessions
-- Per-keystroke live detection during ingestion (detection runs at finalize)
-- Alert dispatch (email/webhook/Slack) for findings — findings are produced and surfaced; dispatch is a later consumer
+- Auto-following (live-tailing) replay of an in-progress session — in-progress recordings **are** playable, but the player shows a snapshot; reload to see output appended since. True streaming/auto-append is out of scope.
+- Alert dispatch (email/webhook/Slack) for findings — detection runs live (on every append) and findings are surfaced immediately, but push/alert delivery is a later consumer
 - SSO or multi-user RBAC (the current auth is single-operator HTTP Basic)
 - Object-storage offload for cold recordings
 - SSH/VM gateway journald tailing (Gatorcast is push-only)

@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **File-first session assembly.** Recordings are no longer buffered in memory and written
+  once at finalize. Each `conn_id`'s `.cast` is now reassembled and written to disk
+  (plaintext) on **every append** — durable across a mid-session restart — and scanned for
+  findings **live**. A session is **sealed** to `complete` (encrypted if enabled) either
+  terminally on the Gateway's `"session finished"` flush / close event, or reopenably on the
+  idle backstop; a late chunk after a backstop seal decrypts, appends, and re-seals, so a
+  long interactive pause never loses or splits a recording.
+- **Correct multi-chunk reassembly.** Confirmed against the Gateway source
+  (`internal/sessionrecorder`) that each chunk is a self-contained `header + new-events`
+  document (the header repeats per flush; events are whole lines). Reassembly is now
+  line-based — keep the header once, concatenate event lines in `seq` order
+  (`reassemble_asciicast`), discriminating header vs event by JSON shape so it survives
+  Gateway header/version/event-type changes. Previous raw concatenation corrupted any
+  recording that spanned more than one chunk.
+- **Detection runs live** on every append (and again at seal) instead of once at finalize,
+  so risk shows on in-progress sessions. The content-search sidecar is still written only at
+  seal.
+- **In-progress recordings are playable** in the UI (served as plaintext; sealed recordings
+  are decrypted), shown with an "in progress" badge.
+- `IDLE_TIMEOUT_SECONDS` no longer finalizes recordings — it only drops a connection that
+  authenticated but recorded nothing.
+
+### Added
+
+- **`SESSION_MAX_IDLE_SECONDS`** (default `3600`): idle backstop that reopenably seals an
+  in-progress recording when the Gateway dies without its final flush; also bounds how long
+  a recording stays plaintext at rest under encryption.
+- **`"session finished"` end signal** (`is_final` on the recording chunk) — the Gateway's
+  reliable end-of-session marker, used to seal immediately.
+
+### Fixed
+
+- Sessions that outlived the old 120 s idle window (or whose recording shipped late) were
+  finalized prematurely as `error` and their eventual recording discarded. Recordings now
+  seal on the real end signal and recombine correctly by `conn_id`.
+
+### Security
+
+- With encryption enabled, in-progress recordings are **plaintext at rest** until sealed
+  (accepted tradeoff for durability + live playback). Lower `SESSION_MAX_IDLE_SECONDS` to
+  shorten that window for abandoned sessions. See ARCHITECTURE.md → Encryption at Rest.
+
 ## [0.3.0] - 2026-06-18
 
 ### Added
