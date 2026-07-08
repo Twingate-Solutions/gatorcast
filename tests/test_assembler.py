@@ -2,26 +2,41 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
+from gatorcast.crypto import Cryptor
+
 from gatorcast.db import init_db
 from gatorcast.models import RecordingChunk, SessionEnd, SessionStart
-from gatorcast.pipeline.assembler import Assembler, parse_asciicast
+from gatorcast.pipeline.assembler import (
+    Assembler,
+    parse_asciicast,
+    reassemble_asciicast,
+)
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
 from tests.samples import sample_lines
 
-# A small asciicast v2 document, split mid-tuple across two fragments to exercise
-# the "concatenate ALL fragments first, then parse" rule (CLAUDE.md rule 3).
+# Real Gateway chunking (confirmed against internal/sessionrecorder): each flush
+# re-emits the header, then only the events recorded since the previous flush.
+# Events are always whole lines — the recorder marshals one [t,"o",data] tuple per
+# line and never splits mid-tuple.
 HEADER = '{"version":2,"width":80,"height":24,"timestamp":1700000000,"user":"ubuntu"}\n'
-FRAG_A = HEADER + '[0.0,"o","a"]\n[1.5,"o'
-FRAG_B = '","b"]\n[3.25,"o","c"]\n'
-FULL_DOC = FRAG_A + FRAG_B
+CHUNK_1 = HEADER + '[0.0,"o","a"]\n[1.5,"o","b"]\n'
+CHUNK_2 = HEADER + '[3.25,"o","c"]\n'  # header repeats; only new events follow
+# What Gatorcast must store after reassembly: the header once, all events in order.
+FULL_DOC = HEADER + '[0.0,"o","a"]\n[1.5,"o","b"]\n[3.25,"o","c"]\n'
+
+
+def _nonblank(text: str) -> list[str]:
+    """Return the stripped, non-blank lines of a document (order preserved)."""
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 class FakeClock:
@@ -38,7 +53,7 @@ class FakeClock:
 
 
 async def _make(
-    tmp_path: Path, idle: int = 120, clock=None
+    tmp_path: Path, idle: int = 120, clock=None, max_idle: int = 3600
 ) -> tuple[Assembler, aiosqlite.Connection]:
     """Build an assembler backed by a fresh schema-initialized DB."""
     db = await init_db(tmp_path / "gatorcast.db")
@@ -48,6 +63,7 @@ async def _make(
         repo=repo,
         casts=casts,
         idle_timeout_seconds=idle,
+        session_max_idle_seconds=max_idle,
         clock=clock or (lambda: 0.0),
     )
     return asm, db
@@ -119,6 +135,38 @@ def test_parse_tolerates_trailing_partial_line() -> None:
 # --- reassembly -------------------------------------------------------------
 
 
+def test_reassemble_dedups_repeated_header() -> None:
+    """Multiple Gateway chunks (each header+events) rebuild to one clean document."""
+    doc = reassemble_asciicast([CHUNK_1, CHUNK_2])
+    assert doc == FULL_DOC
+    # Exactly one header line survives; all three events are kept in order.
+    meta = parse_asciicast(doc)
+    assert meta.ok
+    assert meta.event_count == 3
+    assert meta.duration_seconds == 3.25
+    assert doc.count('"version":2') == 1
+
+
+def test_reassemble_single_chunk_is_stable() -> None:
+    """A single chunk round-trips to an equivalent document (one header + events)."""
+    assert reassemble_asciicast([CHUNK_1]) == HEADER + '[0.0,"o","a"]\n[1.5,"o","b"]\n'
+
+
+def test_reassemble_tolerates_boundary_garbage_and_blank_lines() -> None:
+    """Blank lines and a non-JSON boundary fragment are skipped, not corrupting output."""
+    noisy = HEADER + '[0.0,"o","a"]\n\n(not json)\n[1.0,"o","b"]\n'
+    doc = reassemble_asciicast([noisy])
+    meta = parse_asciicast(doc)
+    assert meta.ok and meta.event_count == 2
+
+
+def test_reassemble_no_header_returns_events_only() -> None:
+    """With no header anywhere, events are kept (caller will mark the row error)."""
+    doc = reassemble_asciicast(['[0.0,"o","x"]\n'])
+    assert not parse_asciicast(doc).ok  # header missing → error, but raw kept
+    assert '[0.0,"o","x"]' in doc
+
+
 @pytest.mark.asyncio
 async def test_real_sample_reassembles(tmp_path: Path) -> None:
     """The real recording chunk finalizes to a valid, metadata-bearing .cast."""
@@ -131,7 +179,9 @@ async def test_real_sample_reassembles(tmp_path: Path) -> None:
     await asm.finalize(conn_id)
 
     cast = (tmp_path / "casts" / f"{conn_id}.cast").read_text(encoding="utf-8")
-    assert cast == obj["asciicast"]
+    # Reassembly is line-based: the stored cast has the same non-blank lines as the
+    # source chunk (a single chunk is already one header + its events).
+    assert _nonblank(cast) == _nonblank(obj["asciicast"])
     row = await _row(db, conn_id)
     assert row["status"] == "complete"
     assert row["width"] == 111
@@ -145,8 +195,8 @@ async def test_real_sample_reassembles(tmp_path: Path) -> None:
 async def test_multi_chunk_in_order(tmp_path: Path) -> None:
     asm, db = await _make(tmp_path)
     cid = "conn-multi"
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FRAG_A))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=FRAG_B))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2))
     await asm.finalize(cid)
     assert (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8") == FULL_DOC
     row = await _row(db, cid)
@@ -158,8 +208,8 @@ async def test_multi_chunk_in_order(tmp_path: Path) -> None:
 async def test_out_of_order_seq_reassembles_correctly(tmp_path: Path) -> None:
     asm, db = await _make(tmp_path)
     cid = "conn-ooo"
-    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=FRAG_B))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FRAG_A))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
     await asm.finalize(cid)
     assert (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8") == FULL_DOC
     await db.close()
@@ -184,10 +234,10 @@ async def test_duplicate_seq_last_write_wins(tmp_path: Path) -> None:
 async def test_interleaved_two_connections_separate(tmp_path: Path) -> None:
     asm, db = await _make(tmp_path)
     await asm.handle(SessionStart(conn_id="A", resource_address="host-a", username="u@x"))
-    await asm.handle(RecordingChunk(conn_id="A", seq=0, asciicast=FRAG_A))
+    await asm.handle(RecordingChunk(conn_id="A", seq=0, asciicast=CHUNK_1))
     await asm.handle(SessionStart(conn_id="B", resource_address="host-b", username="u@x"))
     await asm.handle(RecordingChunk(conn_id="B", seq=0, asciicast=HEADER))
-    await asm.handle(RecordingChunk(conn_id="A", seq=1, asciicast=FRAG_B))
+    await asm.handle(RecordingChunk(conn_id="A", seq=1, asciicast=CHUNK_2))
     await asm.finalize("A")
     await asm.finalize("B")
 
@@ -204,21 +254,212 @@ async def test_interleaved_two_connections_separate(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_idle_finalize(tmp_path: Path) -> None:
-    clock = FakeClock()
-    asm, db = await _make(tmp_path, idle=120, clock=clock)
-    cid = "conn-idle"
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=HEADER))
+async def test_final_chunk_finalizes_immediately(tmp_path: Path) -> None:
+    """The Gateway's 'session finished' flush (is_final) finalizes without any wait."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-final"
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC, is_final=True)
+    )
+    # No clock advance, no idle sweep: the end signal finalized it.
+    assert asm.active_count == 0
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["duration_seconds"] == 3.25
+    await db.close()
 
-    clock.advance(60)
+
+@pytest.mark.asyncio
+async def test_idle_does_not_cut_short_active_recording(tmp_path: Path) -> None:
+    """A recording that goes quiet past idle_timeout keeps buffering (not finalized)."""
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=3600)
+    cid = "conn-active"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+
+    clock.advance(300)  # long pause, well past idle_timeout but under max_idle
     await asm.finalize_idle()
-    assert asm.active_count == 1  # not silent long enough yet
+    assert asm.active_count == 1, "an active recording must not be finalized by idle"
+    assert (await _row(db, cid))["status"] == "provisional"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_then_resume_recombines_under_conn_id(tmp_path: Path) -> None:
+    """The core requirement: chunks split by a long pause recombine into ONE session.
+
+    A chunk arrives, the session goes silent past the idle timeout (an interactive
+    pause), then more chunks + the final flush arrive under the same conn_id. The
+    result is a single complete recording containing ALL events — nothing lost.
+    """
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=3600)
+    cid = "conn-pause"
+
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    clock.advance(600)  # user steps away for 10 minutes; no output flushes
+    await asm.finalize_idle()  # must NOT finalize/lock the session
     assert (await _row(db, cid))["status"] == "provisional"
 
-    clock.advance(61)  # now past the 120s idle window
+    # User resumes; the Gateway sends the next chunk and then the final flush.
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2, is_final=True)
+    )
+    assert asm.active_count == 0
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["chunk_count"] == 2
+    # All three events across both chunks survived the pause.
+    cast = (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8")
+    assert cast == FULL_DOC
+    assert parse_asciicast(cast).event_count == 3
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_idle_backstop_finalizes_abandoned_recording(tmp_path: Path) -> None:
+    """If 'session finished' never arrives (Gateway crash), the hard backstop finalizes."""
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=1800)
+    cid = "conn-crash"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+
+    clock.advance(1700)  # past idle, under max_idle → still buffering
+    await asm.finalize_idle()
+    assert (await _row(db, cid))["status"] == "provisional"
+
+    clock.advance(200)  # now past max_idle → backstop finalizes what we have
     await asm.finalize_idle()
     assert asm.active_count == 0
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["chunk_count"] == 1
+    await db.close()
+
+
+# --- file-first: durability, live detection, reopen, encryption ------------
+
+
+@pytest.mark.asyncio
+async def test_append_persists_plaintext_before_seal(tmp_path: Path) -> None:
+    """Durability: each append writes the plaintext .cast to disk immediately."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-persist"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    # No finalize yet: the file already exists with the current content, and the
+    # row is provisional with derived metadata mirrored on.
+    cast_path = tmp_path / "casts" / f"{cid}.cast"
+    assert cast_path.is_file()
+    assert parse_asciicast(cast_path.read_text(encoding="utf-8")).event_count == 2
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    assert row["width"] == 80 and row["size_bytes"] > 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_detection_before_seal(tmp_path: Path) -> None:
+    """Detection runs live on append: findings exist before the session is sealed."""
+    asm, repo, casts, search, db = await _make_with_search(tmp_path)
+    cid = "conn-live"
+    # A non-final chunk carrying a dangerous command.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=SCAN_CAST))
+
+    # Still in progress, but the finding is already recorded (live scan).
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    findings = await search.list_findings(cid)
+    assert any(f.rule_id == "recursive-delete" for f in findings)
+    # The search sidecar is NOT written until seal.
+    assert casts.has_sidecar(cid) is False
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_after_backstop_seal_recombines(tmp_path: Path) -> None:
+    """A backstop-sealed session that resumes reopens and recombines all events."""
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=1800)
+    cid = "conn-reopen"
+
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    clock.advance(1801)  # silent past the backstop
+    await asm.finalize_idle()
+    assert (await _row(db, cid))["status"] == "complete"  # reopenably sealed
+
+    # A late chunk (with the final flush) resumes it: reopen → append → re-seal.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2, is_final=True))
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    cast = (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8")
+    assert parse_asciicast(cast).event_count == 3  # nothing lost across the seal
+    await db.close()
+
+
+def _key() -> str:
+    """A deterministic base64-encoded 32-byte key for encryption tests."""
+    return base64.b64encode(b"k" * 32).decode()
+
+
+@pytest.mark.asyncio
+async def test_encryption_plaintext_while_in_progress_then_sealed(tmp_path: Path) -> None:
+    """In-progress .cast is plaintext on disk; sealing encrypts it (round-trips)."""
+    db = await init_db(tmp_path / "gatorcast.db")
+    repo = SessionRepository(db)
+    casts = CastStore(tmp_path / "casts", cryptor=Cryptor(_key()))
+    asm = Assembler(repo=repo, casts=casts, idle_timeout_seconds=120, clock=lambda: 0.0)
+    cid = "conn-enc"
+
+    # In progress: the on-disk file is PLAINTEXT even though encryption is enabled.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    raw = (tmp_path / "casts" / f"{cid}.cast").read_bytes()
+    assert raw.startswith(b'{"version":2'), "in-progress file must be plaintext"
+
+    # Seal via the final flush: the file is now encrypted, and decrypts back cleanly.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2, is_final=True))
+    sealed = (tmp_path / "casts" / f"{cid}.cast").read_bytes()
+    assert not sealed.startswith(b'{"version":2'), "sealed file must be encrypted"
+    assert await casts.read_cast(cid) == FULL_DOC
     assert (await _row(db, cid))["status"] == "complete"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_does_not_error_chunkless_start(tmp_path: Path) -> None:
+    """A started-but-not-yet-recorded session must survive the idle sweep.
+
+    Regression: the Gateway emits "Authenticated connection" at session start but
+    ships the asciicast recording only at session end. A long-running session (or
+    one whose recording is delayed past the idle window) therefore has a buffer
+    with ZERO chunks when the idle sweep fires. It must NOT be finalized as
+    ``error`` and must NOT be marked finalized — otherwise the real recording that
+    arrives later is discarded and the row is stuck at ``error``.
+    """
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock)
+    cid = "conn-late-record"
+
+    # Session start arrives; no recording chunks yet.
+    await asm.handle(
+        SessionStart(conn_id=cid, resource_address="10.0.0.30", username="u@x")
+    )
+    assert (await _row(db, cid))["status"] == "provisional"
+
+    # Idle window elapses with zero chunks. The sweep must leave it pending, not error it.
+    clock.advance(121)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row["status"] == "provisional", "chunkless start must not be errored by idle sweep"
+    assert (tmp_path / "casts" / f"{cid}.cast").exists() is False, "no .cast for a chunkless session"
+
+    # The real recording finally ships (with its final flush). It must be accepted
+    # (conn_id was never locked) and recombine under the same conn_id.
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC, is_final=True)
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "complete", "late-arriving recording must still finalize to complete"
+    assert row["resource_address"] == "10.0.0.30"  # identity from the start event preserved
     await db.close()
 
 
@@ -228,10 +469,10 @@ async def test_partial_session_still_finalizes(tmp_path: Path) -> None:
     asm, db = await _make(tmp_path)
     cid = "conn-partial"
     await asm.handle(SessionStart(conn_id=cid, resource_address="host", username="u@x"))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FRAG_A))  # mid-tuple
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))  # no final flush
     await asm.finalize(cid)
     row = await _row(db, cid)
-    # FRAG_A has a valid header, so it is complete and playable despite truncation.
+    # CHUNK_1 has a valid header, so it is complete and playable despite being partial.
     assert row["status"] == "complete"
     assert (tmp_path / "casts" / f"{cid}.cast").exists()
     await db.close()
@@ -288,11 +529,17 @@ async def test_sweep_deletes_stale_empty_provisional(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sweep_recovers_provisional_with_cast_on_disk(tmp_path: Path) -> None:
+async def test_sweep_readopts_provisional_with_cast_on_disk(tmp_path: Path) -> None:
+    """Restart: a provisional row + on-disk plaintext .cast is re-adopted as active.
+
+    File-first durability: instead of sealing on boot, the recording is re-adopted
+    in-progress (baseline from disk) so continuation chunks keep appending. It seals
+    normally afterward (here, on a terminal 'session finished' chunk) with ALL events.
+    """
     asm, db = await _make(tmp_path, idle=120)
     cid = "recovered"
     (tmp_path / "casts").mkdir(exist_ok=True)
-    (tmp_path / "casts" / f"{cid}.cast").write_text(FULL_DOC, encoding="utf-8")
+    (tmp_path / "casts" / f"{cid}.cast").write_text(CHUNK_1, encoding="utf-8")
     await db.execute(
         "INSERT INTO sessions (conn_id, status, created_at) "
         "VALUES (?, 'provisional', '2000-01-01 00:00:00')",
@@ -300,9 +547,19 @@ async def test_sweep_recovers_provisional_with_cast_on_disk(tmp_path: Path) -> N
     )
     await db.commit()
     await asm.sweep_startup()
+
+    # Re-adopted, not sealed: still provisional and buffering in memory.
+    assert asm.active_count == 1
+    assert (await _row(db, cid))["status"] == "provisional"
+
+    # A continuation chunk (with the final flush) recombines with the recovered
+    # baseline and seals to complete with every event.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2, is_final=True))
     row = await _row(db, cid)
     assert row["status"] == "complete"
     assert row["width"] == 80
+    cast = (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8")
+    assert parse_asciicast(cast).event_count == 3  # baseline's 2 + continuation's 1
     await db.close()
 
 
@@ -378,9 +635,9 @@ async def test_late_chunk_after_finalize_is_ignored(tmp_path: Path) -> None:
     asm, db = await _make(tmp_path, idle=10, clock=clock)
     cid = "conn-late"
 
-    # Normal happy path: two fragments → finalize → complete.
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FRAG_A))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=FRAG_B))
+    # Normal happy path: two chunks → finalize → complete.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2))
     await asm.finalize(cid)
 
     cast_path = tmp_path / "casts" / f"{cid}.cast"
@@ -480,7 +737,7 @@ async def test_refinalize_no_duplicate_findings(tmp_path: Path) -> None:
     assert len(first) >= 1
 
     # Drive the scan path again directly with the same content.
-    await asm._post_finalize_scan(cid, SCAN_CAST)
+    await asm._run_scan(cid, SCAN_CAST, write_sidecar=True)
 
     second = await search.list_findings(cid)
     assert len(second) == len(first)

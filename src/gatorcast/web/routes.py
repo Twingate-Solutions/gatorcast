@@ -617,7 +617,12 @@ async def session_cast(request: Request, conn_id: str) -> Response:
     if path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
 
-    if not casts.encryption_enabled:
+    # In the file-first model an in-progress (provisional) recording is plaintext on
+    # disk and only encrypted when sealed to 'complete'/'error'. So serve plaintext
+    # when encryption is off OR the session is still in progress; decrypt only a
+    # sealed row under encryption.
+    sealed = session.status in ("complete", "error")
+    if not casts.encryption_enabled or not sealed:
         return FileResponse(
             path=path,
             media_type=_CAST_MEDIA_TYPE,

@@ -92,6 +92,62 @@ class CastStore:
         size = await asyncio.to_thread(self._write_atomic, path, data)
         return path, size
 
+    async def write_plaintext(self, conn_id: str, text: str) -> tuple[Path, int]:
+        """Write a recording's current text to disk as PLAINTEXT (never encrypted).
+
+        Used while a session is in progress (file-first model): the ``.cast`` is
+        persisted on every append for durability, but stays plaintext so appends are
+        cheap and no decrypt/re-encrypt is needed mid-session. It is encrypted later
+        by :meth:`seal`. The write is atomic (temp + replace).
+
+        Args:
+            conn_id: The connection id naming the file.
+            text: The reassembled asciicast document so far.
+
+        Returns:
+            A ``(path, size_bytes)`` tuple for the written (plaintext) file.
+        """
+        path = self.path_for(conn_id)
+        data = text.encode("utf-8")
+        size = await asyncio.to_thread(self._write_atomic, path, data)
+        return path, size
+
+    async def read_plaintext(self, conn_id_or_path: str | Path) -> str:
+        """Read a recording file as PLAINTEXT (no decryption), off the event loop.
+
+        Used to read an in-progress ``.cast`` (which is not yet encrypted) — for live
+        detection, playback of an in-progress session, and to seed a reopen. Do not
+        use on a sealed/encrypted file; use :meth:`read_cast` for those.
+
+        Args:
+            conn_id_or_path: A bare ``conn_id`` or a concrete ``.cast`` path.
+
+        Returns:
+            The file's UTF-8 text.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
+        path = self._resolve(conn_id_or_path)
+        return await asyncio.to_thread(path.read_text, "utf-8")
+
+    async def reopen(self, conn_id: str) -> str:
+        """Revert a sealed (encrypted) ``.cast`` back to plaintext so it can grow again.
+
+        Decrypts the sealed file (or reads it, when unencrypted) and rewrites it as
+        plaintext. Returns the decrypted text so the caller can seed the in-memory
+        reassembly baseline. Used only on the rare late chunk after a timeout-seal.
+
+        Args:
+            conn_id: The connection id to reopen.
+
+        Returns:
+            The recording's plaintext text (also now written back to disk plaintext).
+        """
+        text = await self.read_cast(conn_id)
+        await self.write_plaintext(conn_id, text)
+        return text
+
     async def read_cast(self, conn_id_or_path: str | Path) -> str:
         """Read a recording's text, off the event loop.
 

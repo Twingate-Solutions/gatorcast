@@ -52,6 +52,24 @@ def test_chunk_requires_integer_seq() -> None:
     assert isinstance(classify({**base, "asciicast_sequence_num": 3}), RecordingChunk)
 
 
+def test_final_flush_marks_chunk_is_final() -> None:
+    """The Gateway's final flush ('session finished') sets is_final on the chunk."""
+    base = {
+        "logger": "gateway.audit",
+        "conn_id": "abc",
+        "asciicast": "x",
+        "asciicast_sequence_num": 5,
+    }
+    ongoing = classify({**base, "message": "session recording"})
+    assert isinstance(ongoing, RecordingChunk) and ongoing.is_final is False
+
+    final = classify({**base, "message": "session finished"})
+    assert isinstance(final, RecordingChunk) and final.is_final is True
+
+    # A chunk with no message field is treated as non-final.
+    assert classify(base).is_final is False
+
+
 def test_unsafe_conn_id_is_rejected() -> None:
     """A conn_id that could escape the casts directory is dropped (no path traversal)."""
     obj = {

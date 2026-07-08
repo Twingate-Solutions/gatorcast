@@ -158,6 +158,90 @@ class SessionRepository:
             started_at=started_at,
         )
 
+    async def update_progress(
+        self,
+        conn_id: str,
+        *,
+        username: str | None,
+        shell_user: str | None,
+        started_at: str | None,
+        ended_at: str | None,
+        duration_seconds: float | None,
+        width: int | None,
+        height: int | None,
+        chunk_count: int,
+        size_bytes: int,
+        cast_path: str,
+    ) -> None:
+        """Refresh an in-progress row's derived metadata WITHOUT sealing it.
+
+        Used by the file-first assembler on every append: the plaintext ``.cast`` has
+        just grown, so mirror its size/duration/dimensions onto the row while leaving
+        ``status = 'provisional'`` (the session is still recording). Guarded to only
+        touch provisional rows so it can never revert a sealed row.
+
+        Args:
+            conn_id: The connection id (row must already exist).
+            username: Envelope identity (backfilled via ``COALESCE``).
+            shell_user: asciicast header user (secondary detail).
+            started_at: Header-derived start, used only if the row had none.
+            ended_at: Timestamp of the latest chunk seen so far.
+            duration_seconds: Recording duration so far (max event offset).
+            width: Terminal width from the header.
+            height: Terminal height from the header.
+            chunk_count: Distinct chunks appended so far.
+            size_bytes: Current on-disk (plaintext) size.
+            cast_path: Path to the ``.cast`` file.
+        """
+        await self._db.execute(
+            """
+            UPDATE sessions SET
+                username         = COALESCE(?, username),
+                shell_user       = ?,
+                started_at       = COALESCE(started_at, ?),
+                ended_at         = ?,
+                duration_seconds = ?,
+                width            = ?,
+                height           = ?,
+                chunk_count      = ?,
+                size_bytes       = ?,
+                cast_path        = ?,
+                updated_at       = datetime('now')
+            WHERE conn_id = ? AND status = 'provisional'
+            """,
+            (
+                username,
+                shell_user,
+                started_at,
+                ended_at,
+                duration_seconds,
+                width,
+                height,
+                chunk_count,
+                size_bytes,
+                cast_path,
+                conn_id,
+            ),
+        )
+        await self._db.commit()
+
+    async def reopen(self, conn_id: str) -> None:
+        """Revert a timeout-sealed row from ``complete`` back to ``provisional``.
+
+        Called when a late chunk arrives for a session that was sealed by the idle
+        backstop (not by a terminal end signal). Puts the row back in the in-progress
+        state so subsequent appends and the eventual re-seal proceed normally.
+
+        Args:
+            conn_id: The connection id to reopen.
+        """
+        await self._db.execute(
+            "UPDATE sessions SET status = 'provisional', updated_at = datetime('now') "
+            "WHERE conn_id = ? AND status = 'complete'",
+            (conn_id,),
+        )
+        await self._db.commit()
+
     async def finalize(
         self,
         conn_id: str,

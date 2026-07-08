@@ -41,7 +41,21 @@ class Settings(BaseSettings):
 
     # --- Assembly / retention ---
     idle_timeout_seconds: int = 120
-    """Finalize a session after this many seconds of silence."""
+    """Drop a started-but-never-recorded (chunkless) session after this silence.
+
+    A session that has received recording chunks is NOT finalized at this threshold
+    — it keeps buffering so an interactive pause (no output) does not cut it short.
+    Normal sessions finalize on the Gateway's ``"session finished"`` flush; see
+    ``session_max_idle_seconds`` for the crash backstop.
+    """
+
+    session_max_idle_seconds: int = 3600
+    """Hard backstop: finalize a still-buffering recording after this much silence.
+
+    Reached only when the Gateway died without emitting its final
+    ``"session finished"`` flush. Should exceed the longest expected interactive
+    pause so a live session that goes quiet is never finalized prematurely.
+    """
 
     retention_days: int = 90
     """Purge sessions older than this many days. 0 keeps forever."""

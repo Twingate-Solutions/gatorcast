@@ -50,7 +50,7 @@
               <td class="dim">{{ session.started_at or "—" }}</td>
               <td class="dim">{{ session.duration_display }}</td>
               <td>
-                <span class="pill pill-{{ session.status }}">{{ session.status }}</span>
+                <span class="pill pill-{{ session.status }}">{{ "in progress" if session.status == "provisional" else session.status }}</span>
               </td>
               <td>
                 {% if session.finding_count and session.max_severity %}

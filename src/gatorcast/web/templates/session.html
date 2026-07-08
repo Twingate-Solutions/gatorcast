@@ -36,7 +36,7 @@
     <dd class="mono">{{ session.shell_user or "—" }}</dd>
 
     <dt>Status</dt>
-    <dd><span class="pill pill-{{ session.status }}">{{ session.status }}</span></dd>
+    <dd><span class="pill pill-{{ session.status }}">{{ "in progress" if session.status == "provisional" else session.status }}</span></dd>
 
     <dt>Started</dt>
     <dd class="dim">{{ session.started_at or "—" }}</dd>

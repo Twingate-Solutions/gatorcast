@@ -54,7 +54,7 @@
             {% if s.duration_seconds is not none %}{{ s.duration_seconds | round(0) | int }}s{% else %}—{% endif %}
           </td>
           <td>
-            <span class="pill pill-{{ s.status }}">{{ s.status }}</span>
+            <span class="pill pill-{{ s.status }}">{{ "in progress" if s.status == "provisional" else s.status }}</span>
           </td>
           <td>
             {% if s.finding_count and s.max_severity %}

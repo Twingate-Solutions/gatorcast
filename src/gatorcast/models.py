@@ -49,6 +49,14 @@ class RecordingChunk(BaseModel):
     asciicast: str
     username: str | None = None
     ts: str | None = None
+    is_final: bool = False
+    """True when this chunk is the Gateway's final flush for the connection.
+
+    The Gateway emits its last flush with ``message == "session finished"`` (from
+    the recorder's ``Stop()``). It is both the last data chunk and a reliable
+    end-of-session signal, so the assembler finalizes immediately on receiving it
+    rather than waiting for the idle backstop.
+    """
 
 
 class SessionStart(BaseModel):

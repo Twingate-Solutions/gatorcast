@@ -154,6 +154,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         repo=repo,
         casts=casts,
         idle_timeout_seconds=settings.idle_timeout_seconds,
+        session_max_idle_seconds=settings.session_max_idle_seconds,
         search=search,
         detection_enabled=settings.detection_enabled,
     )
@@ -175,8 +176,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     consumer = asyncio.create_task(_consume_queue(app))
 
     scheduler = AsyncIOScheduler()
-    # Idle-finalize job: flush buffers gone silent past IDLE_TIMEOUT_SECONDS.
-    # Check at a fraction of the timeout (bounded) so finalize is reasonably prompt.
+    # Idle sweep: drops abandoned chunkless sessions past IDLE_TIMEOUT_SECONDS and
+    # applies the SESSION_MAX_IDLE_SECONDS crash backstop. Normal sessions finalize
+    # on the Gateway's "session finished" flush, not here. Check at a bounded
+    # fraction of the idle timeout so the empty-drop is reasonably prompt.
     idle_interval = max(5, min(settings.idle_timeout_seconds, 30))
     scheduler.add_job(
         assembler.finalize_idle,

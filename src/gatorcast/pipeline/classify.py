@@ -34,9 +34,17 @@ Event = RecordingChunk | SessionStart | SessionEnd
 # otherwise hostile. Real values match this; anything else is dropped.
 _SAFE_CONN_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
-# Open Validation Item 2: the Gateway's connection-close message shape is not yet
-# confirmed from a real sample. These are conservative candidate messages so the
-# close-event path is wired and testable; idle timeout remains authoritative.
+# The Gateway's session recorder emits its final flush with this message (from
+# recorder.Stop()). The line still carries the last asciicast chunk, so it is
+# classified as a RecordingChunk with is_final=True: the assembler stores it and
+# then finalizes the connection immediately. If the Gateway ever renames this,
+# recordings still finalize via the idle backstop — this is an optimization, not
+# a dependency. Kept as a single named constant so it is trivial to adjust.
+_FINAL_RECORDING_MESSAGE = "session finished"
+
+# Candidate connection-close messages on the plain "gateway" logger. The recorder's
+# "session finished" (above) is the authoritative end signal; these remain wired as
+# a defensive fallback for a close event that carries no asciicast payload.
 _CLOSE_MESSAGES = frozenset({"Connection closed", "Closed connection"})
 
 
@@ -92,6 +100,7 @@ def classify(obj: dict) -> Event | None:
             asciicast=asciicast,
             username=_username(obj),
             ts=obj.get("ts"),
+            is_final=obj.get("message") == _FINAL_RECORDING_MESSAGE,
         )
 
     # 2. Session start: gateway "Authenticated connection".

@@ -14,7 +14,15 @@ services:
       HTTP_PORT: "8080"
       SYSLOG_TCP_PORT: "6514"
       DATA_DIR: "/data"
+      # Drop a started-but-never-recorded (chunkless) session after this silence.
+      # A session that HAS recording chunks is not cut short here — it keeps
+      # buffering across pauses and finalizes on the Gateway's "session finished".
       IDLE_TIMEOUT_SECONDS: "120"
+      # Hard backstop: finalize a still-buffering recording after this much silence,
+      # only reached if the Gateway died without its final "session finished" flush.
+      # Set above your longest expected interactive pause so live sessions with a
+      # long idle gap are never finalized prematurely.
+      SESSION_MAX_IDLE_SECONDS: "3600"
       RETENTION_DAYS: "90"
       RETENTION_MAX_GB: "0"
       LOG_LEVEL: "info"

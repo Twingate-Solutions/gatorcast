@@ -62,6 +62,7 @@ _SESSION_START_LINE = json.dumps(
 _RECORDING_CHUNK_LINE = json.dumps(
     {
         "logger": "gateway.audit",
+        "message": "session finished",  # final flush → assembler seals on the app loop
         "conn_id": CONN_ID,
         "asciicast": CAST,
         "asciicast_sequence_num": 0,
@@ -175,15 +176,9 @@ def test_e2e_ingest_to_search(tmp_path: Path) -> None:
         )
 
         # ------------------------------------------------------------------ #
-        # Step 3: Finalize the session deterministically via the assembler.   #
-        # This is the same pattern test_web_search.py uses for direct async   #
-        # calls: asyncio.run() on the already-running lifespan loop.         #
-        # ------------------------------------------------------------------ #
-        assembler = app.state.assembler
-        asyncio.run(assembler.finalize(CONN_ID))
-
-        # ------------------------------------------------------------------ #
-        # Step 4: Poll until status == "complete" (finalize + scan done).     #
+        # Step 3: The recording chunk carried "session finished", so the      #
+        # consumer seals the session on the app loop — no manual finalize.    #
+        # Poll until status == "complete" (seal + final scan done).           #
         # ------------------------------------------------------------------ #
         def _session_complete() -> bool:
             """Return True once the session row shows status='complete'."""
