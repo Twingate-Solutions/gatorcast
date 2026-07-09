@@ -27,14 +27,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   seal.
 - **In-progress recordings are playable** in the UI (served as plaintext; sealed recordings
   are decrypted), shown with an "in progress" badge.
-- `IDLE_TIMEOUT_SECONDS` no longer finalizes recordings — it only drops a connection that
-  authenticated but recorded nothing.
+- `IDLE_TIMEOUT_SECONDS` is no longer a finalize trigger — it only sets the idle-sweep cadence
+  and the startup-sweep cutoff.
+- **Unparseable ingest lines now log at `warning`** (was `debug`) with the line length (never
+  content), so a transport that mangles chunks — e.g. journald splitting large asciicast lines
+  at `LineMax` — is a one-glance `event=normalize.drop reason=unparseable length=49152` signal.
 
 ### Added
 
-- **`SESSION_MAX_IDLE_SECONDS`** (default `3600`): idle backstop that reopenably seals an
-  in-progress recording when the Gateway dies without its final flush; also bounds how long
-  a recording stays plaintext at rest under encryption.
+- **`SESSION_MAX_IDLE_SECONDS`** (default `3600`): idle backstop. After this much silence a
+  data-bearing recording is sealed reopenably (Gateway died without its final flush), and a
+  session that **started but never recorded a valid chunk** is marked `error` so it no longer
+  sits "in progress" forever (a genuinely-late chunk still recovers it). Must exceed the
+  Gateway's flush interval; also bounds the plaintext-at-rest window under encryption.
 - **`"session finished"` end signal** (`is_final` on the recording chunk) — the Gateway's
   reliable end-of-session marker, used to seal immediately.
 
@@ -43,12 +48,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Sessions that outlived the old 120 s idle window (or whose recording shipped late) were
   finalized prematurely as `error` and their eventual recording discarded. Recordings now
   seal on the real end signal and recombine correctly by `conn_id`.
+- A session whose recording chunks were all dropped (e.g. journald `LineMax` splitting) no
+  longer stays "in progress" indefinitely: the backstop marks it `error`, and it recovers if
+  valid data arrives late.
 
 ### Security
 
 - With encryption enabled, in-progress recordings are **plaintext at rest** until sealed
   (accepted tradeoff for durability + live playback). Lower `SESSION_MAX_IDLE_SECONDS` to
   shorten that window for abandoned sessions. See ARCHITECTURE.md → Encryption at Rest.
+
+### Documentation
+
+- Documented a journald ingestion pitfall: `LineMax` (default 48 KB) splits large asciicast
+  lines and rate limiting drops them, so high-volume / full-screen-TUI sessions (`btop`,
+  `top`, `watch`) silently fail to record. INGESTION_RECIPES.md §2.1 now has a caveat + fix
+  (raise `LineMax`/relax rate limiting, or use the §2.4 file-tail transport), §2.4 is
+  flagged as the sturdiest transport for chunky sessions, and the README troubleshooting
+  guide has a matching callout.
 
 ## [0.3.0] - 2026-06-18
 

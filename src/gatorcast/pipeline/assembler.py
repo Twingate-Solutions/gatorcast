@@ -275,19 +275,19 @@ class Assembler:
         Args:
             repo: Session metadata repository (all SQL).
             casts: Cast file store (all ``.cast`` file I/O).
-            idle_timeout_seconds: Silence after which a *chunkless* (start-only)
-                in-progress entry is dropped as an abandoned/non-recording
-                connection. A session that has received recording data is NOT sealed
-                at this threshold — it keeps its on-disk file and buffering state so a
-                pause (no output) and later resume still recombine under one
-                ``conn_id``.
+            idle_timeout_seconds: Sweep granularity / startup-sweep cutoff. Not a
+                finalize trigger: it sets how often the idle sweep runs (see
+                ``main``) and, on restart, the age past which a provisional row with
+                no ``.cast`` is treated as an abandoned start and swept.
             clock: Monotonic clock source (injectable for tests).
-            session_max_idle_seconds: Idle backstop. An in-progress recording silent
-                this long is sealed anyway (assume the Gateway died without its final
-                ``"session finished"`` flush) — but *reopenably*, so a still-later
-                chunk reopens and extends it. Also the window a recording stays
-                plaintext on disk before encryption; should exceed the longest
-                expected interactive pause.
+            session_max_idle_seconds: Idle backstop for a session that never got its
+                terminal ``"session finished"`` flush. After this much silence a
+                buffer *with* data is sealed reopenably (a still-later chunk reopens
+                and extends it), and a *chunkless* buffer (started, never recorded)
+                has its row marked ``error``. Must exceed the Gateway's flush interval
+                (a quiet-but-active session is chunkless until its first flush) and,
+                under encryption, also bounds how long a recording stays plaintext on
+                disk before it seals.
             search: Optional findings/search store. When provided (and
                 ``detection_enabled``), detection runs live on every append and the
                 encrypted search sidecar is written at seal. When ``None`` no scan
@@ -381,6 +381,10 @@ class Assembler:
                     buf = InProgress(conn_id=event.conn_id, baseline=baseline)
                     log.info("assembler.reopen", conn_id=event.conn_id)
                 else:
+                    # New session — or one the backstop had marked 'error' (started
+                    # but never recorded). A late chunk recovers it: revert the row so
+                    # this and later appends record normally (no-op for a fresh row).
+                    await self._repo.revert_error_to_provisional(event.conn_id)
                     buf = InProgress(conn_id=event.conn_id)
                 self._buffers[event.conn_id] = buf
 
@@ -405,42 +409,43 @@ class Assembler:
             await self._seal(buf, reopenable=False)
 
     async def finalize_idle(self) -> None:
-        """Idle sweep. Intended to run on an APScheduler interval.
+        """Idle backstop sweep. Intended to run on an APScheduler interval.
 
-        Two silence thresholds, by whether the entry holds any recording data:
+        Resolves any session silent for at least ``session_max_idle`` — normally the
+        Gateway's ``"session finished"`` flush ends a session long before this, so
+        reaching the backstop means that signal never came:
 
-          * **Chunkless (start-only)**, silent >= ``idle_timeout``: authenticated but
-            recorded nothing — an abandoned/non-recording connection. Drop the
-            in-memory entry and leave its ``provisional`` row (reclaimed by the
-            startup sweep). NOT sealed, so a later recording still records normally.
-          * **Has data**, silent >= ``session_max_idle``: normally sealed by the
-            Gateway's ``"session finished"``; reaching this backstop means that never
-            came. Seal *reopenably* — the on-disk recording is preserved and encrypted,
-            and a still-later chunk will reopen and extend it (nothing is lost).
+          * **Has data** → seal *reopenably* (encrypt if enabled, mark ``complete``).
+            The on-disk recording is preserved; a still-later chunk reopens and
+            extends it, so nothing is lost.
+          * **Chunkless (start-only)** → mark the row ``error``. The session
+            authenticated but never delivered a single valid recording chunk within
+            the window — a failed recording (most often the transport mangled/dropped
+            every chunk; see the journald ``LineMax`` note in INGESTION_RECIPES §2.1).
+            Erroring stops it showing "in progress" forever; a genuinely-late chunk
+            still recovers it (``_on_chunk`` reverts ``error`` → ``provisional``).
 
-        An in-progress recording only *idle_timeout*-silent is left untouched so a long
-        interactive pause keeps recombining under one ``conn_id``.
+        The backstop must exceed the Gateway's flush interval: a quiet-but-active
+        session is *expected* to be chunkless until its first flush, so
+        ``session_max_idle`` has to be long enough that a real session always flushes
+        at least once before it is judged a failed recording.
         """
         now = self._clock()
         async with self._lock:
-            drop_empty = [
+            stale = [
                 conn_id
                 for conn_id, buf in self._buffers.items()
-                if not buf.has_data and now - buf.last_activity >= self._idle
+                if now - buf.last_activity >= self._max_idle
             ]
-            hard_stale = [
-                conn_id
-                for conn_id, buf in self._buffers.items()
-                if buf.has_data and now - buf.last_activity >= self._max_idle
-            ]
-            for conn_id in drop_empty:
-                self._buffers.pop(conn_id, None)  # drop; not sealed, not locked
-            if drop_empty:
-                log.debug("assembler.drop_empty", count=len(drop_empty))
-            for conn_id in hard_stale:
+            for conn_id in stale:
                 buf = self._buffers.pop(conn_id)
-                log.info("assembler.backstop_seal", conn_id=conn_id)
-                await self._seal(buf, reopenable=True)
+                if buf.has_data:
+                    log.info("assembler.backstop_seal", conn_id=conn_id)
+                    await self._seal(buf, reopenable=True)
+                else:
+                    # Started but never recorded within the window → failed recording.
+                    await self._repo.mark_error_if_provisional(conn_id)
+                    log.warning("assembler.empty_error", conn_id=conn_id)
 
     async def sweep_startup(self) -> None:
         """Reconcile provisional rows left behind by a restart.

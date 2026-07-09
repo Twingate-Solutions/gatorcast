@@ -186,6 +186,32 @@ systemctl status journald-http-shipper --no-pager
 journalctl -u journald-http-shipper -f   # quiet unless a POST fails
 ```
 
+> **⚠️ journald has two limits that silently break large recordings.** This path routes recordings through journald, and asciicast chunks can be big — a busy shell, and especially a full-screen TUI (`btop`, `top`, `htop`, `watch`, `vim`), emits large, rapid frames. Two journald defaults bite:
+>
+> 1. **`LineMax` (default 48 KB)** — journald splits any single log line longer than this into multiple entries. Each fragment is only a piece of a JSON object, so it fails to parse: Gatorcast drops it (`event=normalize.drop reason=unparseable`) and the recording never assembles. The session then shows **"in progress" forever with no recording** (the start line arrived, but no valid chunks).
+> 2. **Rate limiting (`RateLimitIntervalSec` / `RateLimitBurst`)** — under a firehose (a repainting TUI), journald *drops* entries entirely once the burst is exceeded. You'll see `Suppressed N messages` in the journal and gaps in `asciicast_sequence_num`.
+>
+> **Quick check on the Gateway host** (as root) — reproduce a heavy session, then look for lines pinned at exactly the 48 KB cap:
+>
+> ```bash
+> sudo journalctl -t gateway -o cat --since -3min \
+>   | python3 -c 'import sys; [print("len", len(l)) for l in sys.stdin.buffer.read().split(b"\n") if l.strip()]' \
+>   | sort | uniq -c | sort -rn | head
+> ```
+>
+> Any cluster at **49152** = journald truncating. Also grep for drops: `sudo journalctl --since -20min | grep -iE "suppressed|rate.?limit"`.
+>
+> **Fix — raise both in `/etc/systemd/journald.conf`:**
+>
+> ```ini
+> LineMax=4M              # comfortably exceed the Gateway's largest flush
+> RateLimitBurst=0        # disable rate limiting (or set a high value)
+> ```
+>
+> then `sudo systemctl restart systemd-journald && sudo systemctl restart journald-http-shipper` (restarting journald drops the shipper's `-f` follow, so bounce the shipper too).
+>
+> **Better for high-volume / TUI recording:** don't route recordings through journald at all — use **[§2.4](#24-lxc--privilege-drop-fallback--redirect-stderr-to-a-file-tail-with-imfile)** (stderr → file → `imfile`), which has neither a line cap nor a rate limit. If you expect people to run `btop`-class tools over recorded sessions, prefer §2.4 regardless of host type.
+
 ### 2.2 rsyslog `imjournal` → `omhttp` (HTTP, where rsyslog *can* read the journal)
 
 Use this if you already standardize on rsyslog and the host is **not** an LXC
@@ -260,9 +286,12 @@ the JSON that follows.
 
 ### 2.4 LXC / privilege-drop fallback — redirect stderr to a file, tail with `imfile`
 
-When the host is an LXC container and rsyslog can't read the journal, sidestep
-journald entirely. Add a drop-in to the Gateway unit so its output also lands in
-a plain file:
+Use this when the host is an LXC container and rsyslog can't read the journal —
+**or whenever you expect large / high-rate recordings** (full-screen TUIs like
+`btop`, verbose build output). Tailing a file sidesteps both journald limits
+called out in §2.1 (the 48 KB `LineMax` line cap and rate-limit drops), so it is
+the sturdiest transport for chunky sessions. Add a drop-in to the Gateway unit so
+its output also lands in a plain file:
 
 ```bash
 sudo systemctl edit twingate-gateway

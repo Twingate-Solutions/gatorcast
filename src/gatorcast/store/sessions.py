@@ -242,6 +242,43 @@ class SessionRepository:
         )
         await self._db.commit()
 
+    async def mark_error_if_provisional(self, conn_id: str) -> None:
+        """Mark a still-provisional session ``error`` — started but never recorded.
+
+        Called by the idle backstop for a session that authenticated but never
+        received a single valid recording chunk within the backstop window (e.g. the
+        transport mangled or dropped every chunk). Flipping it to ``error`` stops it
+        showing "in progress" forever. Guarded to ``provisional`` so it can never
+        overwrite a completed or already-errored row.
+
+        Args:
+            conn_id: The connection id to mark errored.
+        """
+        await self._db.execute(
+            "UPDATE sessions SET status = 'error', "
+            "ended_at = COALESCE(ended_at, datetime('now')), updated_at = datetime('now') "
+            "WHERE conn_id = ? AND status = 'provisional'",
+            (conn_id,),
+        )
+        await self._db.commit()
+
+    async def revert_error_to_provisional(self, conn_id: str) -> None:
+        """Revert an ``error`` row to ``provisional`` when late data finally arrives.
+
+        The mirror of :meth:`mark_error_if_provisional`: if a chunk shows up for a
+        session that the backstop had given up on, put it back in the in-progress
+        state so the recording records and seals normally. Guarded to ``error`` rows.
+
+        Args:
+            conn_id: The connection id to recover.
+        """
+        await self._db.execute(
+            "UPDATE sessions SET status = 'provisional', updated_at = datetime('now') "
+            "WHERE conn_id = ? AND status = 'error'",
+            (conn_id,),
+        )
+        await self._db.commit()
+
     async def finalize(
         self,
         conn_id: str,

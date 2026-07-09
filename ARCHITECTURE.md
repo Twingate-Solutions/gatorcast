@@ -47,7 +47,7 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 - Single FastAPI process: ingestion, assembly, storage, scheduler, and UI all in one container.
 - State: SQLite (WAL mode) for metadata; a named Docker volume for `.cast` files.
-- APScheduler drives two background jobs: the idle sweep (drops abandoned start-only sessions; applies the reopenable seal backstop) and the daily retention purge.
+- APScheduler drives two background jobs: the idle backstop sweep (seals data-bearing sessions reopenably; marks never-recorded start-only sessions `error`) and the daily retention purge.
 - Push-based: Gatorcast exposes endpoints and waits. It never reaches back into the Gateway, Docker, or Kubernetes.
 - All frontend assets are vendored locally. No CDN or external JS at runtime.
 
@@ -60,7 +60,7 @@ The recording is **sealed** to **complete** — encrypted (if enabled) and final
 - **Terminal seal**, on the Gateway's final flush (`message == "session finished"`, emitted by the recorder's `Stop()`) or a connection-close event. This is the normal, immediate path: the recording is complete the moment that line is processed.
 - **Reopenable seal**, on the idle backstop: an in-progress recording silent for `SESSION_MAX_IDLE_SECONDS` (default 3600 s) is sealed anyway, assuming the Gateway died without its final flush. If a later chunk *does* arrive for that `conn_id`, the sealed file is decrypted, appended to, and re-sealed — so a long interactive pause never loses or splits the recording.
 
-`IDLE_TIMEOUT_SECONDS` (default 120 s) no longer finalizes recordings; it only drops a connection that authenticated but recorded nothing. The idle sweep runs every `max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds.
+`IDLE_TIMEOUT_SECONDS` (default 120 s) is not a finalize trigger — it only sets the idle-sweep cadence (`max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds) and the startup-sweep cutoff. A session that authenticated but never recorded a valid chunk is marked `error` at the `SESSION_MAX_IDLE_SECONDS` backstop (so it doesn't linger "in progress"); a genuinely-late chunk reverts it and records. `SESSION_MAX_IDLE_SECONDS` must therefore exceed the Gateway's flush interval, since a quiet-but-active session is legitimately chunkless until its first flush.
 
 On restart, Gatorcast re-adopts each provisional row from its on-disk plaintext `.cast` as an in-progress session (so continuation chunks keep appending and it seals normally); a provisional row with no `.cast` older than the idle timeout is an abandoned start and is swept away.
 

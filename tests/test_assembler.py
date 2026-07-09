@@ -464,6 +464,41 @@ async def test_idle_does_not_error_chunkless_start(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chunkless_session_errors_at_backstop_then_recovers(tmp_path: Path) -> None:
+    """A session that starts but never records is marked error at the backstop.
+
+    This is the "unparseable data / broken shipper" case: the start event created a
+    row but no valid chunk ever arrived. Below the backstop it stays provisional
+    (a quiet session may just not have flushed yet); past the backstop it flips to
+    error so it stops showing "in progress". A genuinely-late chunk still recovers it.
+    """
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=1800)
+    cid = "conn-norecord"
+    await asm.handle(
+        SessionStart(conn_id=cid, resource_address="10.0.0.30", username="u@x")
+    )
+
+    clock.advance(600)  # past idle, under backstop → still provisional (waiting)
+    await asm.finalize_idle()
+    assert (await _row(db, cid))["status"] == "provisional"
+
+    clock.advance(1300)  # now past max_idle (1800) with still no chunk → error
+    await asm.finalize_idle()
+    assert asm.active_count == 0
+    assert (await _row(db, cid))["status"] == "error"
+
+    # A genuinely-late chunk recovers it: error → provisional → complete.
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC, is_final=True)
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "complete", "late chunk must recover an errored empty session"
+    assert row["resource_address"] == "10.0.0.30"  # start-event identity preserved
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_session_still_finalizes(tmp_path: Path) -> None:
     """An interrupted session (no close event) still produces a playable .cast."""
     asm, db = await _make(tmp_path)

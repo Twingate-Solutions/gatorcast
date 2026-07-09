@@ -68,8 +68,8 @@ All settings are environment variables. Secrets (`INGEST_TOKEN`, `UI_AUTH_*`) sh
 | `HTTP_PORT` | `8080` | FastAPI HTTP port (UI + `POST /ingest`) |
 | `SYSLOG_TCP_PORT` | `6514` | Syslog TCP listener port. `0` disables the listener. |
 | `DATA_DIR` | `/data` | Volume root for the SQLite database and `.cast` files |
-| `IDLE_TIMEOUT_SECONDS` | `120` | Drop a connection that authenticated but recorded nothing after this silence. Does **not** finalize recordings (those seal on the Gateway's "session finished" flush). |
-| `SESSION_MAX_IDLE_SECONDS` | `3600` | Idle backstop: seal an in-progress recording after this much silence (assumes the Gateway died without its final flush). Reopenable — a later chunk resumes it. Also the window a recording stays plaintext at rest before encryption. |
+| `IDLE_TIMEOUT_SECONDS` | `120` | Idle-sweep cadence + startup-sweep cutoff. **Not** a finalize trigger (recordings seal on the Gateway's "session finished" flush). |
+| `SESSION_MAX_IDLE_SECONDS` | `3600` | Idle backstop after this much silence: a recording **with data** is sealed (reopenable — a later chunk resumes it); a session that started but **never recorded** a valid chunk is marked `error`. **Must exceed the Gateway's flush interval** (a quiet-but-active session is chunkless until its first flush). Under encryption, also bounds how long a recording stays plaintext at rest. |
 | `RETENTION_DAYS` | `90` | Purge sessions older than this many days. `0` keeps forever. |
 | `RETENTION_MAX_GB` | `0` | Optional total `.cast` size cap in GB. `0` disables size-based purge. |
 | `LOG_LEVEL` | `info` | structlog level (`debug`, `info`, `warning`, `error`) |
@@ -132,7 +132,17 @@ A recording is provisional (shown as "in progress") while it is still recording;
 
 - Verify your shipper is forwarding log lines during active sessions (check rsyslog/Docker syslog driver stats). A recording that is provisional but *playable* just hasn't received its "session finished" flush yet.
 - Confirm the Gateway actually ends the session (its recorder emits "session finished" on `Stop()`). If the shipper drops that line, the recording seals via the backstop after `SESSION_MAX_IDLE_SECONDS`; lower that value to seal sooner, or raise it if you hold sessions idle for very long.
+- **Provisional forever with no recording?** A session that authenticated but never delivered a single valid chunk (e.g. its chunks were all dropped — see the big/chatty-session note below) is marked `error` at the `SESSION_MAX_IDLE_SECONDS` backstop, so it won't sit "in progress" indefinitely. Watch for `event=normalize.drop reason=unparseable length=…` in the logs — a `length` at/near 49152 means the transport is splitting your chunks (journald `LineMax`). If a real recording does arrive late, the errored row automatically recovers.
 - On restart, Gatorcast re-adopts provisional rows that have an on-disk `.cast` as in-progress (continuation chunks keep appending); a provisional row with no `.cast` older than `IDLE_TIMEOUT_SECONDS` is an abandoned start and is removed.
+
+### Big or "chatty" sessions not recording (`btop`, `top`, `watch`, verbose output)
+
+If ordinary sessions record fine but a session that ran a **full-screen TUI or produced a firehose of output** stays "in progress" with no recording, the culprit is almost always your **log transport**, not Gatorcast — most commonly **systemd-journald limits** when shipping via journald (INGESTION_RECIPES.md §2.1):
+
+- **`LineMax` (default 48 KB):** journald splits any log line longer than this, so a large asciicast chunk arrives as unparseable fragments and is dropped (`event=normalize.drop reason=unparseable`). The recording never assembles.
+- **Rate limiting:** a rapidly repainting TUI can exceed journald's `RateLimitBurst`, so entries are dropped outright (`Suppressed N messages`), leaving gaps.
+
+Quick fixes: raise `LineMax` (e.g. `LineMax=4M`) and relax rate limiting (`RateLimitBurst=0`) in `/etc/systemd/journald.conf`, then restart `systemd-journald` **and** your shipper. For recording TUIs routinely, prefer the **file-tail transport (§2.4)** — it has neither limit. Full detail and a diagnosis command are in [INGESTION_RECIPES.md](INGESTION_RECIPES.md) §2.1. (UDP syslog has the same truncation problem — always ship over TCP or HTTP.)
 
 ### Nothing showing up in the UI
 

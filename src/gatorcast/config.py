@@ -41,20 +41,24 @@ class Settings(BaseSettings):
 
     # --- Assembly / retention ---
     idle_timeout_seconds: int = 120
-    """Drop a started-but-never-recorded (chunkless) session after this silence.
+    """Idle-sweep granularity and startup-sweep cutoff — NOT a finalize trigger.
 
-    A session that has received recording chunks is NOT finalized at this threshold
-    — it keeps buffering so an interactive pause (no output) does not cut it short.
+    Sets how often the idle backstop sweep runs, and on restart the age past which a
+    provisional row with no ``.cast`` is treated as an abandoned start and removed.
     Normal sessions finalize on the Gateway's ``"session finished"`` flush; see
-    ``session_max_idle_seconds`` for the crash backstop.
+    ``session_max_idle_seconds`` for the backstop.
     """
 
     session_max_idle_seconds: int = 3600
-    """Hard backstop: finalize a still-buffering recording after this much silence.
+    """Idle backstop for a session that never got its ``"session finished"`` flush.
 
-    Reached only when the Gateway died without emitting its final
-    ``"session finished"`` flush. Should exceed the longest expected interactive
-    pause so a live session that goes quiet is never finalized prematurely.
+    After this much silence: a recording that has data is sealed (reopenably — a
+    later chunk still extends it), and a session that started but never recorded a
+    valid chunk is marked ``error`` (a failed recording — commonly the transport
+    dropped its chunks; see the journald note in INGESTION_RECIPES §2.1). **Must
+    exceed the Gateway's flush interval** — a quiet-but-active session is chunkless
+    until its first flush, so too low a value would wrongly error live sessions.
+    Under encryption it also bounds how long a recording stays plaintext at rest.
     """
 
     retention_days: int = 90

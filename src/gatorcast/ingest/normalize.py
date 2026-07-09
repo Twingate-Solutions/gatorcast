@@ -77,11 +77,16 @@ def normalize(line: str) -> dict | None:
             parsed = _try_json(stripped[brace:])
 
     if parsed is None:
-        log.debug("normalize.drop", reason="unparseable")
+        # WARNING, not debug: an unparseable line almost always means the transport
+        # mangled it — most commonly systemd-journald's LineMax (default 48 KB)
+        # splitting a large asciicast chunk into JSON fragments. We log the length
+        # (a value at/near 49152 is the journald-split tell) but NEVER the content
+        # (rule 5), so "recordings silently vanishing" is a one-glance signal.
+        log.warning("normalize.drop", reason="unparseable", length=len(stripped))
         return None
 
     if not isinstance(parsed, dict):
-        log.debug("normalize.drop", reason="not_an_object")
+        log.warning("normalize.drop", reason="not_an_object", length=len(stripped))
         return None
 
     # Unwrap a collector envelope (e.g. Docker's {"log": "...", "stream": ...}).
