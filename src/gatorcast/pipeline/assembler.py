@@ -228,6 +228,7 @@ class InProgress:
     conn_id: str
     username: str | None = None
     resource_address: str | None = None
+    shell_user: str | None = None  # envelope session_start only; header wins
     first_ts: str | None = None
     last_ts: str | None = None
     chunks: dict[int, str] = field(default_factory=dict)
@@ -348,6 +349,8 @@ class Assembler:
                 buf.resource_address = event.resource_address
             if event.username is not None:
                 buf.username = event.username
+            if event.shell_user is not None:
+                buf.shell_user = event.shell_user
             if buf.first_ts is None:
                 buf.first_ts = event.ts
             if event.ts is not None:
@@ -496,7 +499,9 @@ class Assembler:
         await self._repo.update_progress(
             buf.conn_id,
             username=buf.username,
-            shell_user=meta.shell_user,
+            # Header-derived shell user wins (legacy format); envelope headers
+            # carry no user field, so fall back to the session_start's value.
+            shell_user=meta.shell_user or buf.shell_user,
             started_at=meta.started_at,
             ended_at=buf.last_ts,
             duration_seconds=meta.duration_seconds,
@@ -532,7 +537,7 @@ class Assembler:
         await self._repo.finalize(
             buf.conn_id,
             username=buf.username,
-            shell_user=meta.shell_user,
+            shell_user=meta.shell_user or buf.shell_user,
             started_at=meta.started_at,
             ended_at=buf.last_ts,
             duration_seconds=meta.duration_seconds,

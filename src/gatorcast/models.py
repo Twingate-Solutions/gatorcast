@@ -71,6 +71,12 @@ class SessionStart(BaseModel):
     conn_id: str
     resource_address: str | None = None
     username: str | None = None
+    shell_user: str | None = None
+    """Resolved OS account, when the source carries it (envelope wire format only).
+
+    Secondary detail — never identity (CLAUDE.md rule 4). Legacy log lines never
+    set this; the legacy path derives shell_user from the asciicast header instead.
+    """
     ts: str | None = None
 
 
