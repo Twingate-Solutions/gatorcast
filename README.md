@@ -4,6 +4,30 @@
 
 Self-hosted, single-container service for **Twingate Identity Firewall Gateway session recordings**. The Twingate Gateway records interactive privileged sessions (`kubectl exec`, SSH shells) as asciicast v2 fragments and emits them via structured JSON audit logs. Twingate's reference pipeline ships those fragments to object storage but does not reassemble them into sessions or provide a browse/replay UI. Gatorcast fills that gap: it receives the Gateway's log lines via push (HTTP POST or syslog TCP), demultiplexes concurrent sessions by `conn_id`, reassembles each into a complete asciicast v2 document, stores it, and serves a lightweight web UI to browse **systems → sessions → replay** in a locally vendored asciinema player. All recordings stay on your infrastructure.
 
+![Session replay — full session metadata, in-browser playback, and detection findings with jump-to-timestamp links](images/session_replay.png)
+
+---
+
+## A Quick Tour
+
+**Dashboard** — session volume, flagged sessions, findings by severity and category, and the most active users and systems over a selectable time window:
+
+![Dashboard with session totals, severity breakdown, findings by category, and top users/systems](images/dashboard.png)
+
+**Systems → sessions** — recordings are grouped by target system (`resource_address`), with per-system findings badges; drill into a system to see every session with its user, duration, status, and risk:
+
+![Systems list with session counts, findings badges, and last-seen timestamps](images/systems_list.png)
+
+![Sessions for one system showing user, shell user, duration, status, and risk badges](images/sessions_list_one_system.png)
+
+**Search** — filter by user, system, time, duration, status, finding severity/category or specific detection rules, plus full-content keyword/regex search; results link straight to each finding's timestamp in the replay, and any result set exports to CSV:
+
+![Search with metadata filters, detection-rule filters, content search, and findings with jump links](images/search_results.png)
+
+**Detection** — built-in dangerous-command and secret-exposure rules run live on every session; each finding jumps the player to the exact moment it happened:
+
+![Replay of a session where an inline secret was detected, with the finding's jump-to-timestamp link](images/findings.png)
+
 ---
 
 ## Documentation
