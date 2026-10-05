@@ -72,6 +72,20 @@
       <div class="card-value">{{ stats.flagged_sessions }}</div>
       <div class="card-label">Flagged sessions</div>
     </div>
+    {# kubectl API requests (metadata only), windowed on requested_at. #}
+    <div class="card card-kubectl">
+      <div class="card-value">{{ stats.api_requests_total }}</div>
+      <div class="card-label">kubectl API requests</div>
+      <div class="card-sub">
+        <span class="badge-count">{{ stats.api_flagged_requests }} flagged</span>
+        {% for row in api_severity_rows %}
+          <span class="card-sub-item">
+            <span class="sev sev-{{ row.label }}">{{ row.label }}</span>
+            <span class="badge-count">{{ row.count }}</span>
+          </span>
+        {% endfor %}
+      </div>
+    </div>
   </div>
 
   <div class="panel-grid">

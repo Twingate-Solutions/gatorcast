@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{#
+  One kubectl activity session: header (user, cluster, span, counts) and the
+  command table. Each command has a <details> list of its requests (time, method,
+  stored URL, status, outcome, finding labels) and a replay link per linked
+  recording (joined by request_id, never conn_id).
+
+  Metadata only: no player here, and only allowlisted stored columns are rendered.
+  Every value — including stored request URLs, which are attacker-influenced — is
+  autoescaped by Jinja. Never add |safe to anything on this page, and never
+  interpolate stored text into a class name: the status band is computed from the
+  integer status code and "failed" is matched by equality.
+
+  Visual language (see app.css, "kubectl activity"):
+    * HTTP status    -> small monospace chip; 4xx/5xx are amber (--warn).
+    * failed outcome -> red (--err) pill with a cross glyph plus a red stripe on the
+                        row. This is the Gateway's "API request failed" outcome and
+                        is deliberately different from any non-2xx status: a 502 that
+                        the Gateway logged as completed gets only the amber chip.
+#}
+{% block title %}kubectl activity · {{ system_label }} · Gatorcast{% endblock %}
+
+{% macro status_chip(code) -%}
+  {%- if code is number -%}
+    {%- set band = ('5xx' if code >= 500 else ('4xx' if code >= 400 else ('3xx' if code >= 300 else ('2xx' if code >= 200 else '1xx')))) -%}
+    <span class="status status-{{ band }}">{{ code }}</span>
+  {%- else -%}
+    <span class="dim">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro failed_pill(outcome) -%}
+  {%- if outcome == 'failed' -%}
+    <span class="outcome-failed"><span aria-hidden="true">✕</span> failed</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro severity_cell(count, severity) -%}
+  {%- if count and severity -%}
+    <span class="sev sev-{{ severity }}">{{ severity }} · {{ count }}</span>
+  {%- else -%}
+    <span class="dim">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+  <div class="breadcrumb">
+    <a href="/systems">Systems</a> /
+    <a class="mono" href="/systems/{{ system_slug }}">{{ system_label }}</a> /
+    <span>kubectl activity</span>
+  </div>
+
+  <h1 class="activity-title"><span class="pill pill-kubectl">kubectl</span> {{ user_label }}</h1>
+
+  <dl class="activity-meta">
+    <div class="wide"><dt>Cluster</dt><dd class="mono">{{ system_label }}</dd></div>
+    <div class="wide"><dt>From</dt><dd class="mono">{{ span_from }}</dd></div>
+    <div class="wide"><dt>To</dt><dd class="mono">{{ span_to }}</dd></div>
+    <div><dt>Duration</dt><dd>{{ duration_display }}</dd></div>
+    <div><dt>Commands</dt><dd>{{ command_count }}</dd></div>
+    <div><dt>Requests</dt><dd>{{ request_count }}</dd></div>
+    <div><dt>Recordings</dt><dd>{{ recordings | length }}</dd></div>
+    <div><dt>Findings</dt><dd>{{ severity_cell(finding_count, max_severity) }}</dd></div>
+  </dl>
+
+  {% if truncated %}
+    <p class="truncated-notice">
+      Showing the first {{ max_rows }} requests of this activity session — results
+      are truncated.
+    </p>
+  {% endif %}
+
+  <p class="activity-discovery">
+    {% if show_discovery %}
+      <span>Showing {{ discovery_count }} discovery request(s).</span>
+      <a href="{{ discovery_toggle_url }}">Hide discovery</a>
+    {% else %}
+      <span>{{ hidden_discovery_count }} discovery request(s) hidden.</span>
+      <a href="{{ discovery_toggle_url }}">Show discovery</a>
+    {% endif %}
+  </p>
+
+  {% if commands %}
+    <div class="table-scroll">
+      <table class="command-table">
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Request</th>
+            <th>Status</th>
+            <th class="num">Requests</th>
+            <th>Findings</th>
+            <th>Recordings</th>
+          </tr>
+        </thead>
+        {# One <tbody> per command so the summary row and its request list hover and stripe together. #}
+        {% for cmd in commands %}
+          <tbody class="command">
+            <tr class="command-row{{ ' is-failed' if cmd.outcome == 'failed' else '' }}{{ ' is-discovery' if cmd.is_discovery_only else '' }}">
+              <td>
+                <span class="mono command-label">{{ cmd.label }}</span>
+                {% if cmd.is_discovery_only %}<span class="tag">discovery only</span>{% endif %}
+                <div class="dim mono command-time">{{ cmd.started_at }}</div>
+              </td>
+              <td class="request-cell">
+                <span class="method mono">{{ cmd.method or "" }}</span>
+                <span class="mono request-url">{{ cmd.path or "—" }}</span>
+              </td>
+              <td class="status-cell">{{ status_chip(cmd.status_code) }} {{ failed_pill(cmd.outcome) }}</td>
+              <td class="num">
+                {{ cmd.request_count }}
+                {% if cmd.discovery_count %}<div class="dim command-sub">{{ cmd.discovery_count }} discovery</div>{% endif %}
+              </td>
+              <td>
+                {{ severity_cell(cmd.finding_count, cmd.max_severity) }}
+                {% if cmd.finding_count and cmd.max_severity %}
+                  {% for label in cmd.finding_labels %}
+                    <div class="finding-tag">{{ label }}</div>
+                  {% endfor %}
+                {% endif %}
+              </td>
+              <td>
+                {% if cmd.recordings %}
+                  <span class="recording-links">
+                    {% for rec in cmd.recordings %}
+                      <a class="recording-link" href="{{ rec.url }}" aria-label="Replay recording {{ loop.index }} of {{ cmd.label }}"><span aria-hidden="true">▶</span> Replay</a>
+                    {% endfor %}
+                  </span>
+                {% else %}
+                  <span class="dim">—</span>
+                {% endif %}
+              </td>
+            </tr>
+            <tr class="command-requests">
+              <td colspan="6">
+                <details>
+                  <summary>{{ cmd.requests | length }} request(s)</summary>
+                  <div class="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Time</th>
+                          <th>Method</th>
+                          <th>URL</th>
+                          <th>Status</th>
+                          <th>Outcome</th>
+                          <th>Findings</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {% for req in cmd.requests %}
+                          <tr class="{{ 'is-failed' if req.outcome == 'failed' else '' }}{{ ' is-discovery' if req.is_discovery else '' }}">
+                            <td class="dim mono">{{ req.requested_at }}</td>
+                            <td class="mono">{{ req.method }}</td>
+                            <td class="mono request-url">{{ req.url }}{% if req.is_discovery %} <span class="tag">discovery</span>{% endif %}</td>
+                            <td>{{ status_chip(req.status_code) }}</td>
+                            <td>
+                              {% if req.outcome == 'failed' %}{{ failed_pill(req.outcome) }}{% else %}<span class="dim">{{ req.outcome }}</span>{% endif %}
+                            </td>
+                            <td>
+                              {% for label in req.finding_labels %}
+                                <div class="finding-tag">{{ label }}</div>
+                              {% else %}
+                                <span class="dim">—</span>
+                              {% endfor %}
+                            </td>
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </td>
+            </tr>
+          </tbody>
+        {% endfor %}
+      </table>
+    </div>
+  {% else %}
+    <p class="empty">Only discovery requests in this activity session.</p>
+  {% endif %}
+{% endblock %}

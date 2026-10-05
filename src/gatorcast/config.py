@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Placeholder secret defaults. These keep tests and local runs working out of the
@@ -105,9 +105,32 @@ class Settings(BaseSettings):
     search_regex_max_candidates: int = 2000
     """Cap on sidecars scanned per content search (ReDoS / resource bound)."""
 
+    # --- kubectl activity grouping ---
+    kubectl_activity_gap_seconds: int = 900
+    """Inactivity gap that splits kubectl activity sessions."""
+
+    kubectl_activity_max_seconds: int = 14400
+    """Hard cap on one kubectl activity session's span.
+
+    Bounds long-lived clients (k9s, ``kubectl get -w``, CI polling) that would
+    otherwise never leave a gap.
+    """
+
     # --- Logging ---
     log_level: str = "info"
     """structlog level (debug, info, warning, error)."""
+
+    @model_validator(mode="after")
+    def _check_kubectl_activity_window(self) -> Settings:
+        """Require ``0 < KUBECTL_ACTIVITY_GAP_SECONDS <= KUBECTL_ACTIVITY_MAX_SECONDS``."""
+        gap = self.kubectl_activity_gap_seconds
+        cap = self.kubectl_activity_max_seconds
+        if not 0 < gap <= cap:
+            raise ValueError(
+                "KUBECTL_ACTIVITY_GAP_SECONDS must be > 0 and <= "
+                f"KUBECTL_ACTIVITY_MAX_SECONDS (got gap={gap}, max={cap})"
+            )
+        return self
 
     @property
     def db_path(self) -> Path:

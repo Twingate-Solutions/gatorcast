@@ -33,6 +33,7 @@ from gatorcast.pipeline.assembler import Assembler
 from gatorcast.pipeline.backfill import run_backfill
 from gatorcast.pipeline.classify import classify
 from gatorcast.pipeline.retention import RetentionPurger
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -132,7 +133,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage startup/shutdown of durable resources and background tasks."""
     settings: Settings = app.state.settings
 
-    app.state.db = await init_db(settings.db_path)
+    # casts_dir lets the one-time v1 migration keep any start-only-looking session
+    # row whose plaintext .cast is already on disk (crash mid-append).
+    app.state.db = await init_db(settings.db_path, casts_dir=settings.casts_dir)
 
     # Persistence: SQLite metadata repository + on-volume .cast file store.
     # The cryptor (or None) was built and validated in create_app (fail-closed). The
@@ -146,14 +149,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # Search/detection store: findings persistence + scan-on-demand over sidecars.
     search = SearchStore(app.state.db, casts)
+    # kubectl activity store: pending connections + deduplicated API audit metadata.
+    activity = ActivityStore(app.state.db)
     app.state.repo = repo
     app.state.casts = casts
     app.state.search = search
+    app.state.activity = activity
 
     assembler = Assembler(
         repo=repo,
         casts=casts,
         idle_timeout_seconds=settings.idle_timeout_seconds,
+        activity=activity,
         session_max_idle_seconds=settings.session_max_idle_seconds,
         search=search,
         detection_enabled=settings.detection_enabled,
@@ -176,8 +183,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     consumer = asyncio.create_task(_consume_queue(app))
 
     scheduler = AsyncIOScheduler()
-    # Idle backstop sweep: seals data-bearing sessions and errors chunkless ones once
-    # silent past SESSION_MAX_IDLE_SECONDS. Normal sessions finalize on the Gateway's
+    # Idle backstop sweep: seals data-bearing sessions and expires pending connections
+    # (no chunk, no API audit) to visible error rows once silent past
+    # SESSION_MAX_IDLE_SECONDS. Normal sessions finalize on the Gateway's
     # "session finished" flush, not here. IDLE_TIMEOUT_SECONDS only sets the sweep
     # cadence (bounded) so the backstop is reasonably prompt.
     idle_interval = max(5, min(settings.idle_timeout_seconds, 30))
@@ -189,13 +197,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_instances=1,
         coalesce=True,
     )
-    # Retention purge: delete aged-out / over-cap recordings (row + .cast file).
+    # Retention purge: delete aged-out / over-cap recordings (row + .cast file), and
+    # API requests + connections older than the same RETENTION_DAYS cutoff.
     purger = RetentionPurger(
         repo=repo,
         casts=casts,
         retention_days=settings.retention_days,
         retention_max_gb=settings.retention_max_gb,
         search=search,
+        activity=activity,
     )
     app.state.purger = purger
     scheduler.add_job(

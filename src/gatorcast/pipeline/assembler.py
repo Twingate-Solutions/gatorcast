@@ -21,9 +21,28 @@ Reassembly contract (confirmed against the Gateway's ``internal/sessionrecorder`
   * Finalize is idempotent: re-finalizing a finished ``conn_id`` is a no-op.
   * Recording payloads are never written to application logs (rule 5).
 
-Persistence is delegated: SQLite metadata via ``SessionRepository``, ``.cast`` files
-via ``CastStore``. The assembler owns only the in-memory buffering and reassembly
-contract; the repository and cast store own all SQL and file I/O.
+Connection lifecycle (kubectl activity spec §6). ``Authenticated connection``
+creates only a hidden *pending connection* in the ``connections`` table — no
+``sessions`` row. From there:
+
+  * the first recording chunk *promotes* it: the in-memory buffer is seeded from
+    the connection (identity, cluster, start time), a ``provisional`` session row
+    is created, and the connection becomes ``recording``. A k8s exec/attach chunk's
+    ``request_id`` is stored on the session row (SSH chunks carry none);
+  * an API audit line (``ApiRequest``) is stored once per ``request_id`` (redelivery
+    is a no-op), scanned by the API rules, and marks the connection ``api`` — an
+    API-only connection never gets a session row;
+  * a connection with neither chunks nor audits within ``session_max_idle_seconds``
+    is expired by the idle sweep into today's visible ``error`` session row.
+
+All state transitions run under one lock, serialized with chunk handling. Raw
+audit lines, URLs, and header values are never logged — counters and ``conn_id``
+only.
+
+Persistence is delegated: SQLite metadata via ``SessionRepository``, connection
+and API-request metadata via ``ActivityStore``, ``.cast`` files via ``CastStore``.
+The assembler owns only the in-memory buffering, the lifecycle transitions, and
+the reassembly contract; the stores own all SQL and file I/O.
 """
 
 from __future__ import annotations
@@ -37,9 +56,10 @@ from pathlib import Path
 from typing import Callable
 
 from gatorcast.logging import get_logger
-from gatorcast.models import RecordingChunk, SessionEnd, SessionStart
-from gatorcast.pipeline.detect import detect, load_rules, max_severity
+from gatorcast.models import ApiRequest, RecordingChunk, SessionEnd, SessionStart
+from gatorcast.pipeline.detect import Finding, detect, detect_api, load_rules, max_severity
 from gatorcast.pipeline.extract import extract_plaintext
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -231,6 +251,7 @@ class InProgress:
     shell_user: str | None = None  # envelope session_start only; header wins
     first_ts: str | None = None
     last_ts: str | None = None
+    request_id: str | None = None  # k8s exec/attach only; first chunk carrying one wins
     chunks: dict[int, str] = field(default_factory=dict)
     baseline: str | None = None
     last_activity: float = 0.0  # monotonic seconds; drives the idle sweep
@@ -258,6 +279,10 @@ class Assembler:
     — either terminally on the Gateway's ``"session finished"`` flush / a close
     event, or reopenably on the idle backstop. A reopenable-sealed session that
     receives a late chunk is decrypted, appended to, and re-sealed.
+
+    Connections without a recording live only in the ``connections`` table
+    (``pending`` / ``api`` / ``error``) until a chunk promotes them; see the module
+    docstring and kubectl activity spec §6.
     """
 
     def __init__(
@@ -267,6 +292,7 @@ class Assembler:
         idle_timeout_seconds: int,
         clock: Callable[[], float] = time.monotonic,
         *,
+        activity: ActivityStore,
         session_max_idle_seconds: int = 3600,
         search: SearchStore | None = None,
         detection_enabled: bool = True,
@@ -276,6 +302,8 @@ class Assembler:
         Args:
             repo: Session metadata repository (all SQL).
             casts: Cast file store (all ``.cast`` file I/O).
+            activity: Connection + API-request store. Holds pending connections
+                (so they survive restarts) and the deduplicated API audit metadata.
             idle_timeout_seconds: Sweep granularity / startup-sweep cutoff. Not a
                 finalize trigger: it sets how often the idle sweep runs (see
                 ``main``) and, on restart, the age past which a provisional row with
@@ -284,20 +312,24 @@ class Assembler:
             session_max_idle_seconds: Idle backstop for a session that never got its
                 terminal ``"session finished"`` flush. After this much silence a
                 buffer *with* data is sealed reopenably (a still-later chunk reopens
-                and extends it), and a *chunkless* buffer (started, never recorded)
-                has its row marked ``error``. Must exceed the Gateway's flush interval
-                (a quiet-but-active session is chunkless until its first flush) and,
-                under encryption, also bounds how long a recording stays plaintext on
-                disk before it seals.
+                and extends it), and a *pending* connection (authenticated, but no
+                chunk and no API audit line) becomes a visible ``error`` session
+                row. Must exceed the Gateway's flush interval (a quiet-but-active
+                session is chunkless until its first flush) and, under encryption,
+                also bounds how long a recording stays plaintext on disk before it
+                seals. Pending connections are aged on SQLite wall-clock time
+                (``last_seen_at``), not on ``clock``, so the backstop survives
+                restarts.
             search: Optional findings/search store. When provided (and
                 ``detection_enabled``), detection runs live on every append and the
-                encrypted search sidecar is written at seal. When ``None`` no scan
-                runs.
-            detection_enabled: Master switch for detection/search. No effect when
-                ``search`` is ``None``.
+                encrypted search sidecar is written at seal. When ``None`` no cast
+                scan runs.
+            detection_enabled: Master switch for detection. Gates the cast scan
+                (which also needs ``search``) and the API-request rules.
         """
         self._repo = repo
         self._casts = casts
+        self._activity = activity
         self._idle = idle_timeout_seconds
         self._max_idle = session_max_idle_seconds
         self._clock = clock
@@ -312,13 +344,20 @@ class Assembler:
         self._sealed: dict[str, bool] = {}
         # Debug counter: late chunks ignored because their conn_id is terminally sealed.
         self._ignored_finalized = 0
+        # Envelope-format start lines carry the OS account (``shell_user``), which the
+        # ``connections`` table has no column for. Held here between the start line
+        # and the promoting chunk so envelope recordings keep it (secondary detail;
+        # lost on restart). Bounded like ``_sealed``.
+        self._pending_shell_user: dict[str, str] = {}
 
     @property
     def active_count(self) -> int:
         """Number of sessions currently in progress (provisional, buffering)."""
         return len(self._buffers)
 
-    async def handle(self, event: RecordingChunk | SessionStart | SessionEnd) -> None:
+    async def handle(
+        self, event: RecordingChunk | SessionStart | SessionEnd | ApiRequest
+    ) -> None:
         """Apply one classified event."""
         match event:
             case SessionStart():
@@ -331,9 +370,18 @@ class Assembler:
                     await self.finalize(event.conn_id)
             case SessionEnd():
                 await self.finalize(event.conn_id)
+            case ApiRequest():
+                await self._on_api(event)
 
     async def _on_start(self, event: SessionStart) -> None:
-        """Pre-register a session: annotate in-progress state and upsert its row."""
+        """Record an authenticated connection as a *pending* connection.
+
+        Writes only the ``connections`` row (identity, cluster, start time); no
+        ``sessions`` row is created, so an API-only connection never appears as a
+        recording. If a chunk already arrived for this ``conn_id`` (start line
+        delivered late), the in-progress buffer is annotated and its provisional row
+        refreshed as before.
+        """
         async with self._lock:
             if event.conn_id in self._sealed:
                 # Already sealed (terminal or reopenable). A bare start carries no
@@ -341,10 +389,24 @@ class Assembler:
                 self._ignored_finalized += 1
                 log.debug("assembler.ignore_sealed", phase="start")
                 return
+            await self._activity.upsert_connection_start(
+                conn_id=event.conn_id,
+                user_id=event.user_id,
+                username=event.username,
+                resource_address=event.resource_address,
+                started_at=event.ts,
+            )
             buf = self._buffers.get(event.conn_id)
             if buf is None:
-                buf = InProgress(conn_id=event.conn_id)
-                self._buffers[event.conn_id] = buf
+                # Pending connection only. A chunk promotes it; an audit line marks
+                # it ``api``; neither within the backstop expires it to ``error``.
+                if event.shell_user is not None:
+                    self._remember_shell_user(event.conn_id, event.shell_user)
+                return
+            # A chunk arrived before the start line: the connection is already
+            # recording. Keep its state there (the upsert above never changes state,
+            # but a row inserted just now would be ``pending``).
+            await self._activity.set_state(event.conn_id, "recording")
             if event.resource_address is not None:
                 buf.resource_address = event.resource_address
             if event.username is not None:
@@ -364,7 +426,12 @@ class Assembler:
             )
 
     async def _on_chunk(self, event: RecordingChunk) -> None:
-        """Store a chunk, persist the growing plaintext ``.cast``, and scan live."""
+        """Store a chunk, persist the growing plaintext ``.cast``, and scan live.
+
+        The first chunk for a ``conn_id`` promotes its connection (``pending``,
+        ``api``, ``error``, or not yet seen) to ``recording`` and creates the
+        ``provisional`` session row, seeded from the connection's start line.
+        """
         async with self._lock:
             buf = self._buffers.get(event.conn_id)
             if buf is None:
@@ -384,14 +451,12 @@ class Assembler:
                     buf = InProgress(conn_id=event.conn_id, baseline=baseline)
                     log.info("assembler.reopen", conn_id=event.conn_id)
                 else:
-                    # New session — or one the backstop had marked 'error' (started
-                    # but never recorded). A late chunk recovers it: revert the row so
-                    # this and later appends record normally (no-op for a fresh row).
-                    await self._repo.revert_error_to_provisional(event.conn_id)
-                    buf = InProgress(conn_id=event.conn_id)
+                    buf = await self._promote(event.conn_id)
                 self._buffers[event.conn_id] = buf
 
             buf.chunks[event.seq] = event.asciicast  # last write wins → dup-safe
+            if event.request_id is not None and buf.request_id is None:
+                buf.request_id = event.request_id
             if event.username is not None and buf.username is None:
                 buf.username = event.username
             if buf.first_ts is None:
@@ -402,6 +467,104 @@ class Assembler:
             # Persist the plaintext .cast now (durable) and scan it live.
             cast_text = await self._persist(buf)
             await self._maybe_scan(buf.conn_id, cast_text, write_sidecar=False)
+
+    async def _promote(self, conn_id: str) -> InProgress:
+        """Promote a connection to ``recording`` on its first chunk; return its buffer.
+
+        Seeds the new buffer (identity, cluster, start time) from the connection's
+        start line, recovers a backstop ``error`` row if there is one (a late chunk
+        reverts it to ``provisional``), creates/refreshes the ``provisional`` session
+        row, and marks the connection ``recording`` (``has_api`` is kept). A chunk
+        with no start line seen inserts a minimal ``recording`` connection, so a
+        start line arriving later never leaves it ``pending``. Caller holds the lock.
+        """
+        conn = await self._activity.get_connection(conn_id)
+        buf = InProgress(conn_id=conn_id)
+        if conn is not None:
+            buf.username = conn.username
+            buf.resource_address = conn.resource_address
+            buf.first_ts = conn.started_at
+        buf.shell_user = self._pending_shell_user.pop(conn_id, None)
+        # A connection the backstop had expired (started but never recorded) has a
+        # visible 'error' row; revert it first so the upsert below can refresh it.
+        # No-op for a fresh connection.
+        await self._repo.revert_error_to_provisional(conn_id)
+        await self._repo.upsert_start(
+            conn_id=conn_id,
+            username=buf.username,
+            resource_address=buf.resource_address,
+            started_at=buf.first_ts,
+        )
+        await self._activity.set_state(conn_id, "recording")
+        log.info(
+            "assembler.promote",
+            conn_id=conn_id,
+            from_state=conn.state if conn is not None else None,
+        )
+        return buf
+
+    async def _on_api(self, event: ApiRequest) -> None:
+        """Store one API audit line and advance its connection's state.
+
+        Deduplicated by ``request_id``: a redelivered line is a no-op (no second
+        row, no duplicate findings, no state change). The API rules run on the
+        method + path first (pure and cheap, only when detection is enabled); the
+        request — with the connection's cluster, ``NULL`` until the start line
+        backfills it — and its findings are then stored in one transaction, so a
+        crash or DB error between them can never leave a request whose findings a
+        redelivery would skip as a duplicate. If detection itself raises, the
+        request is still stored (without findings) and the exception type is
+        logged. The connection then moves to ``api`` — or stays ``recording`` if it
+        carries a recording (e.g. an exec's status-101 line). A connection the
+        backstop had expired to ``error`` loses its phantom start-only error row:
+        it was API-only after all. Never logs the URL, header values, or the raw
+        line.
+        """
+        async with self._lock:
+            conn_id = event.conn_id
+            findings: list[Finding] = []
+            if self._detection_enabled:
+                try:
+                    findings = list(detect_api(event.method, event.url))
+                except Exception as exc:
+                    # Detection failure forfeits only the findings; the request is
+                    # still stored below. Exception type only (rule 5).
+                    findings = []
+                    log.warning(
+                        "assembler.api_detect_error",
+                        conn_id=conn_id,
+                        error=type(exc).__name__,
+                    )
+
+            conn = await self._activity.get_connection(conn_id)
+            resource_address = conn.resource_address if conn is not None else None
+            inserted = await self._activity.insert_request_with_findings(
+                event, resource_address, findings
+            )
+            if not inserted:
+                log.debug("assembler.api_duplicate", conn_id=conn_id)
+                return
+            finding_count = len(findings)
+
+            is_recording = (
+                conn_id in self._buffers
+                or conn_id in self._sealed
+                or (conn is not None and conn.state == "recording")
+            )
+            if is_recording:
+                await self._activity.set_state(conn_id, "recording", has_api=True)
+            else:
+                if conn is not None and conn.state == "error":
+                    # A late audit (e.g. a long `get -w`) on an expired connection.
+                    await self._repo.delete_start_only_error(conn_id)
+                await self._activity.set_state(conn_id, "api", has_api=True)
+                self._pending_shell_user.pop(conn_id, None)
+            log.debug(
+                "assembler.api_request",
+                conn_id=conn_id,
+                findings=finding_count,
+                recording=is_recording,
+            )
 
     async def finalize(self, conn_id: str) -> None:
         """Seal a connection terminally (end signal / close). Idempotent no-op if unknown."""
@@ -414,19 +577,23 @@ class Assembler:
     async def finalize_idle(self) -> None:
         """Idle backstop sweep. Intended to run on an APScheduler interval.
 
-        Resolves any session silent for at least ``session_max_idle`` — normally the
+        Resolves anything silent for at least ``session_max_idle`` — normally the
         Gateway's ``"session finished"`` flush ends a session long before this, so
         reaching the backstop means that signal never came:
 
-          * **Has data** → seal *reopenably* (encrypt if enabled, mark ``complete``).
-            The on-disk recording is preserved; a still-later chunk reopens and
-            extends it, so nothing is lost.
-          * **Chunkless (start-only)** → mark the row ``error``. The session
-            authenticated but never delivered a single valid recording chunk within
-            the window — a failed recording (most often the transport mangled/dropped
-            every chunk; see the journald ``LineMax`` note in INGESTION_RECIPES §2.1).
-            Erroring stops it showing "in progress" forever; a genuinely-late chunk
-            still recovers it (``_on_chunk`` reverts ``error`` → ``provisional``).
+          * **Recording with data** → seal *reopenably* (encrypt if enabled, mark
+            ``complete``). The on-disk recording is preserved; a still-later chunk
+            reopens and extends it, so nothing is lost.
+          * **Pending connection** (authenticated, but no chunk and no API audit
+            line) → ``expire_pending`` flips it to ``error`` and a visible ``error``
+            session row is created for it. The connection never delivered a single
+            valid recording chunk within the window — a failed recording (most often
+            the transport mangled/dropped every chunk; see the journald ``LineMax``
+            note in INGESTION_RECIPES §2.1). A genuinely-late chunk still recovers it
+            (``_promote`` reverts ``error`` → ``provisional``); a late API audit
+            deletes the row instead (``_on_api``). Aged on SQLite wall-clock
+            ``last_seen_at``, so it is correct across restarts. ``api`` connections
+            are never expired: they have no visible row to resolve.
 
         The backstop must exceed the Gateway's flush interval: a quiet-but-active
         session is *expected* to be chunkless until its first flush, so
@@ -446,9 +613,40 @@ class Assembler:
                     log.info("assembler.backstop_seal", conn_id=conn_id)
                     await self._seal(buf, reopenable=True)
                 else:
-                    # Started but never recorded within the window → failed recording.
+                    # Defensive: buffers are created only by a chunk or a re-adopted
+                    # non-empty .cast, so one without data should not exist.
                     await self._repo.mark_error_if_provisional(conn_id)
                     log.warning("assembler.empty_error", conn_id=conn_id)
+            await self._expire_pending_connections()
+
+    async def _expire_pending_connections(self) -> None:
+        """Turn pending connections past the backstop into visible ``error`` rows.
+
+        Caller holds the lock. Each expired connection gets a session row built
+        from its start line (``upsert_start``) and is then marked ``error``
+        (``mark_error_if_provisional``) — the same visible row a start-only session
+        produced before connections were tracked separately. Logged as a counter.
+        """
+        expired = await self._activity.expire_pending(self._max_idle)
+        errored = 0
+        for conn in expired:
+            self._pending_shell_user.pop(conn.conn_id, None)
+            if conn.conn_id in self._buffers or conn.conn_id in self._sealed:
+                # Defensive: this conn_id is actually recording (e.g. a session
+                # re-adopted at startup whose start line was redelivered). Never
+                # error a live recording; restore its connection state instead.
+                await self._activity.set_state(conn.conn_id, "recording")
+                continue
+            await self._repo.upsert_start(
+                conn_id=conn.conn_id,
+                username=conn.username,
+                resource_address=conn.resource_address,
+                started_at=conn.started_at,
+            )
+            await self._repo.mark_error_if_provisional(conn.conn_id)
+            errored += 1
+        if errored:
+            log.warning("assembler.pending_expired", count=errored)
 
     async def sweep_startup(self) -> None:
         """Reconcile provisional rows left behind by a restart.
@@ -494,7 +692,10 @@ class Assembler:
         path, size = await self._casts.write_plaintext(buf.conn_id, cast_text)
         # Ensure the row exists (a session may start with a chunk, no auth line first).
         await self._repo.add_chunk_meta(
-            conn_id=buf.conn_id, username=buf.username, started_at=buf.first_ts
+            conn_id=buf.conn_id,
+            username=buf.username,
+            started_at=buf.first_ts,
+            request_id=buf.request_id,
         )
         await self._repo.update_progress(
             buf.conn_id,
@@ -510,6 +711,7 @@ class Assembler:
             chunk_count=len(buf.chunks),
             size_bytes=size,
             cast_path=str(path),
+            request_id=buf.request_id,
         )
         return cast_text
 
@@ -593,6 +795,16 @@ class Assembler:
             log.warning(
                 "assembler.scan_error", conn_id=conn_id, error=type(exc).__name__
             )
+
+    def _remember_shell_user(self, conn_id: str, shell_user: str) -> None:
+        """Hold a pending connection's envelope ``shell_user`` until it is promoted.
+
+        Caller holds the lock. Bounded: cleared once it exceeds ``_FINALIZED_MAX``;
+        forgetting an entry only drops secondary detail for an envelope recording.
+        """
+        if len(self._pending_shell_user) >= _FINALIZED_MAX:
+            self._pending_shell_user.clear()
+        self._pending_shell_user[conn_id] = shell_user
 
     def _mark_sealed(self, conn_id: str, reopenable: bool) -> None:
         """Record a conn_id as sealed (``reopenable`` flag). Caller holds the lock.

@@ -34,9 +34,15 @@ plus the session-start line that carries the target system:
 {"logger":"gateway","message":"Authenticated connection","conn_id":"<uuid>","resource_address":"prod-db-01"}
 ```
 
+For Kubernetes access, the Gateway also emits one `gateway.audit` line per API
+request (`"message":"API request completed"` or `"API request failed"`, with no
+`asciicast`). Gatorcast stores these as allowlisted kubectl activity metadata (see
+the README's [kubectl Activity](README.md#kubectl-activity) section), joining each to
+its cluster through the session-start line's `conn_id`, so ship both.
+
 You do **not** need to filter these out of the Gateway's other output — Gatorcast
-classifies and drops everything that isn't a recording chunk or a session
-event. **Ship the Gateway's whole log stream; Gatorcast sorts it out.** The only
+classifies and drops everything that isn't a recording chunk, a session event, or an
+API-request audit. **Ship the Gateway's whole log stream; Gatorcast sorts it out.** The only
 hard requirement is that **whole lines arrive intact and untruncated** —
 asciicast chunks are multi-KB.
 
@@ -188,7 +194,7 @@ journalctl -u journald-http-shipper -f   # quiet unless a POST fails
 
 > **⚠️ journald has two limits that silently break large recordings.** This path routes recordings through journald, and asciicast chunks can be big — a busy shell, and especially a full-screen TUI (`btop`, `top`, `htop`, `watch`, `vim`), emits large, rapid frames. Two journald defaults bite:
 >
-> 1. **`LineMax` (default 48 KB)** — journald splits any single log line longer than this into multiple entries. Each fragment is only a piece of a JSON object, so it fails to parse: Gatorcast drops it (`event=normalize.drop reason=unparseable`) and the recording never assembles. The session then shows **"in progress" forever with no recording** (the start line arrived, but no valid chunks).
+> 1. **`LineMax` (default 48 KB)** — journald splits any single log line longer than this into multiple entries. Each fragment is only a piece of a JSON object, so it fails to parse: Gatorcast drops it (`event=normalize.drop reason=unparseable`) and the recording never assembles. The recording never appears: the connection stays a hidden pending connection and, after `SESSION_MAX_IDLE_SECONDS` with no valid chunks, becomes a visible **`error`** session with no recording.
 > 2. **Rate limiting (`RateLimitIntervalSec` / `RateLimitBurst`)** — under a firehose (a repainting TUI), journald *drops* entries entirely once the burst is exceeded. You'll see `Suppressed N messages` in the journal and gaps in `asciicast_sequence_num`.
 >
 > **Quick check on the Gateway host** (as root) — reproduce a heavy session, then look for lines pinned at exactly the 48 KB cap:

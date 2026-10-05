@@ -32,6 +32,12 @@ class Session(BaseModel):
     status: str = "provisional"
     finding_count: int = 0
     max_severity: str | None = None
+    request_id: str | None = None
+    """Gateway request UUID of a Kubernetes exec/attach recording (``None`` for SSH).
+
+    Equals the ``request_id`` of the exec's status-101 API audit line, which is how
+    kubectl activity links a command to this recording.
+    """
 
 
 class RecordingChunk(BaseModel):
@@ -57,6 +63,12 @@ class RecordingChunk(BaseModel):
     end-of-session signal, so the assembler finalizes immediately on receiving it
     rather than waiting for the idle backstop.
     """
+    request_id: str | None = None
+    """Gateway request UUID carried by Kubernetes exec/attach chunk lines.
+
+    Matches the ``request_id`` of the exec's status-101 API audit line, which is
+    how an activity command links to its recording. SSH chunks carry none.
+    """
 
 
 class SessionStart(BaseModel):
@@ -71,6 +83,8 @@ class SessionStart(BaseModel):
     conn_id: str
     resource_address: str | None = None
     username: str | None = None
+    user_id: str | None = None
+    """Gateway user id (``user.id``). Set by the legacy log-line branch only."""
     shell_user: str | None = None
     """Resolved OS account, when the source carries it (envelope wire format only).
 
@@ -92,3 +106,34 @@ class SessionEnd(BaseModel):
 
     conn_id: str
     ts: str | None = None
+
+
+class ApiRequest(BaseModel):
+    """One stock Gateway API-request audit line (metadata only, allowlisted).
+
+    Emitted by ``classify`` for a ``gateway.audit`` line with no ``asciicast``
+    whose message is ``"API request completed"`` or ``"API request failed"``.
+    Only allowlisted fields are modeled: no ``Authorization`` value, cookie, other
+    request header, response header, ``remote_addr``, or ``panic`` text is ever
+    carried (CLAUDE.md rule 2).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    conn_id: str
+    request_id: str
+    """Gateway UUID, or a synthesized ``"h:<hex>"`` id when the line carries none."""
+    requested_at: str
+    """Normalized UTC timestamp, ``YYYY-MM-DDTHH:MM:SS.mmmZ``."""
+    user_id: str | None = None
+    username: str | None = None
+    """Envelope SSO identity (``user.username``); identity per CLAUDE.md rule 4."""
+    method: str
+    url: str
+    """Sanitized by ``classify._store_url`` (exec/attach query stripped)."""
+    status_code: int | None = None
+    outcome: str = "completed"
+    """``"completed"`` or ``"failed"``."""
+    kubectl_command: str | None = None
+    kubectl_session: str | None = None
+    user_agent: str | None = None

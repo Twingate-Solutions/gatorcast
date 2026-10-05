@@ -5,9 +5,13 @@ Runs a fixed set of regex rules against the plaintext reconstruction produced by
 :class:`Finding` describing the rule that fired and the earliest replay offset at
 which it matched.
 
+It also runs a second, independent rule set (:class:`ApiRule`) against Kubernetes
+API request metadata (method + URL path) from the Gateway's API-request audit
+lines. API findings have no replay offset (``offset_seconds`` is always ``None``).
+
 Security (CLAUDE.md rules 5 + 6): a :class:`Finding` carries only the rule label,
 category, severity, and time offset. It NEVER carries the matched text, and this
-module never logs recorded content.
+module never logs recorded content, URLs, or header values.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import re
 from dataclasses import dataclass
 
 from gatorcast.pipeline.extract import ExtractResult, offset_at
+from gatorcast.pipeline.urlnorm import match_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,3 +259,138 @@ def max_severity(findings: list[Finding]) -> str | None:
     if not findings:
         return None
     return max(findings, key=lambda f: SEVERITY_RANK.get(f.severity, 0)).severity
+
+
+# ---------------------------------------------------------------------------
+# Kubernetes API request detection (spec §10)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ApiRule:
+    """A detection rule over one Kubernetes API request's method and URL path.
+
+    ``methods`` is the set of uppercase HTTP methods the rule applies to, or
+    ``None`` to apply to any method. ``path`` is searched against the normalized,
+    lower-cased URL path only (see :func:`gatorcast.pipeline.urlnorm.match_path`),
+    never the query string, so write patterns in lower case.
+    """
+
+    id: str
+    category: str
+    severity: str
+    label: str
+    methods: frozenset[str] | None
+    path: re.Pattern[str]
+
+
+API_CATEGORY = "kube-api"
+
+BUILTIN_API_RULES: list[ApiRule] = [
+    ApiRule(
+        "kube-delete",
+        API_CATEGORY,
+        "high",
+        "Kubernetes resource delete",
+        frozenset({"DELETE"}),
+        re.compile(r"^/"),
+    ),
+    ApiRule(
+        "kube-secrets",
+        API_CATEGORY,
+        "high",
+        "Kubernetes secret access",
+        None,
+        re.compile(r"/secrets(/|$)"),
+    ),
+    ApiRule(
+        "kube-evict",
+        API_CATEGORY,
+        "high",
+        "Pod eviction (drain)",
+        frozenset({"POST"}),
+        re.compile(r"/pods/[^/]+/eviction$"),
+    ),
+    ApiRule(
+        "kube-cordon",
+        API_CATEGORY,
+        "medium",
+        "Node patched (cordon/uncordon)",
+        frozenset({"PATCH"}),
+        re.compile(r"^/api/v1/nodes/[^/]+$"),
+    ),
+    ApiRule(
+        "kube-exec",
+        API_CATEGORY,
+        "medium",
+        "Pod exec/attach",
+        None,
+        re.compile(r"/pods/[^/]+/(exec|attach)$"),
+    ),
+    # Kubelet exec through the API server's node proxy. classify keeps
+    # ``/nodes/<n>/proxy/<exec|run|attach>`` as the stored prefix (and drops the
+    # rest of the path and the query), so this rule still sees it on stored URLs.
+    ApiRule(
+        "kube-node-proxy-exec",
+        API_CATEGORY,
+        "high",
+        "Node proxy exec/run/attach",
+        None,
+        re.compile(r"/nodes/[^/]+/proxy/(exec|run|attach)(/|$)"),
+    ),
+]
+
+
+def load_api_rules() -> list[ApiRule]:
+    """Return the active Kubernetes API rule set.
+
+    Same seam as :func:`load_rules`: a future YAML-backed loader would plug in
+    here; for v1 it returns the built-in API rules verbatim.
+
+    Returns:
+        The list of :class:`ApiRule` objects to evaluate.
+    """
+    return BUILTIN_API_RULES
+
+
+def detect_api(method: str, url: str, rules: list[ApiRule] | None = None) -> list[Finding]:
+    """Evaluate API rules against one request's method and URL path.
+
+    The URL is normalized with the same helper classify uses (fragment dropped,
+    path unquoted once, repeated ``/`` collapsed, trailing ``/`` stripped) and
+    lower-cased, so callers may pass raw or stored URLs and encoded or oddly
+    shaped variants (``/%73ecrets/x``, ``/pods/p/exec/``) still match. The query
+    string is never matched, so query content (e.g. a ``labelSelector``
+    mentioning ``/secrets``) does not affect the result. Stored URLs are
+    normalized a second time here; a double-encoded path therefore errs toward a
+    finding. ``method`` is compared case-insensitively. Each matching rule yields
+    exactly one :class:`Finding` with ``offset_seconds=None``; the URL is never
+    copied into the finding.
+
+    Args:
+        method: The HTTP method of the request (e.g. ``"DELETE"``).
+        url: The raw or stored request URL; only its normalized path is matched.
+        rules: Optional explicit rule set; defaults to :func:`load_api_rules`.
+
+    Returns:
+        A list of findings, one per matching rule, in rule-declaration order.
+    """
+    active = load_api_rules() if rules is None else rules
+    verb = method.upper()
+    path = match_path(url)
+    findings: list[Finding] = []
+    for rule in active:
+        if rule.methods is not None and verb not in rule.methods:
+            continue
+        if rule.path.search(path) is None:
+            continue
+        findings.append(
+            Finding(
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                label=rule.label,
+                offset_seconds=None,
+            )
+        )
+    return findings

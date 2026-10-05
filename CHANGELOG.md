@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Start-only connections are now pending, not provisional.** An `Authenticated connection`
+  line no longer creates a visible session. It writes a hidden *pending connection*
+  (`connections` table); the first recording chunk promotes it to a `provisional` session. An
+  API-only connection never becomes a session. A connection that delivers neither chunks nor
+  API audits within `SESSION_MAX_IDLE_SECONDS` becomes a visible `error` session.
+- **One-time database migration (`PRAGMA user_version` 0 to 1).** Historical start-only
+  `sessions` rows (`provisional`/`error`, zero chunks, no `.cast` path, zero bytes) are moved
+  into `connections`, so empty sessions left by API-only kubectl connections and SSH transport
+  failures disappear from the sessions list. Old SSH transport-failure rows cannot be told apart
+  from API-only rows and are moved too. Session counts can drop after the upgrade; this is
+  expected. A row whose `<conn_id>.cast` or `.txt.enc` file exists on disk is kept. Back up the
+  `/data` volume before upgrading.
+- **Retention covers kubectl activity.** The `RETENTION_DAYS` purge now also deletes
+  `api_requests` (with their findings) and `connections` on the same cutoff. There is no new
+  setting. `RETENTION_MAX_GB` still counts `.cast` bytes only and never touches API rows.
+- **The two-stage recording filter no longer drops API audits.** `gateway.audit` lines with no
+  `asciicast` and the message `API request completed` or `API request failed` are classified as
+  API requests instead of being dropped. They are still never treated as recording chunks.
 - **File-first session assembly.** Recordings are no longer buffered in memory and written
   once at finalize. Each `conn_id`'s `.cast` is now reassembled and written to disk
   (plaintext) on **every append** — durable across a mid-session restart — and scanned for
@@ -35,6 +53,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **kubectl activity.** The stock Gateway's per-request API audit lines are stored as
+  allowlisted metadata (method, sanitized URL, status, user, outcome, and the `User-Agent`,
+  `Kubectl-Command` and `Kubectl-Session` headers), deduplicated by `request_id`. Requests are
+  grouped per user and cluster into **activity sessions** (split by gap and max window), and
+  within a session into **commands** by `Kubectl-Session` (falling back to the connection).
+  Exec/attach recordings link to their command by `request_id`, never by `conn_id`. Grouping
+  is computed on view; nothing is cached. API-discovery `GET`s are hidden by default.
+- **Activity UI.** The systems list now includes clusters with only API activity and shows a
+  kubectl request count. The system page has a paged kubectl activity table (7 days per page).
+  New `GET /systems/{slug}/activity` page shows one activity session's commands, requests,
+  findings and recording links. The dashboard has a kubectl API requests card (total, flagged,
+  severity breakdown).
+- **API findings.** Six built-in rules run on each stored request's method and normalized
+  path, category `kube-api`: `kube-delete` (high), `kube-secrets` (high), `kube-evict` (high),
+  `kube-cordon` (medium), `kube-exec` (medium) and `kube-node-proxy-exec` (high). Findings
+  store the rule, severity and label only, never the URL.
+- **`KUBECTL_ACTIVITY_GAP_SECONDS`** (default `900`) and **`KUBECTL_ACTIVITY_MAX_SECONDS`**
+  (default `14400`): the activity-session split gap and the hard cap on one session's span.
+  Startup fails if `0 < gap <= max` does not hold. Both are listed in `.env.example`.
+- **Schema**: new `connections`, `api_requests` and `api_findings` tables, plus a
+  `sessions.request_id` column linking exec recordings to their API audit line.
 - **`SESSION_MAX_IDLE_SECONDS`** (default `3600`): idle backstop. After this much silence a
   data-bearing recording is sealed reopenably (Gateway died without its final flush), and a
   session that **started but never recorded a valid chunk** is marked `error` so it no longer
@@ -54,6 +93,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Request-header allowlist.** Only `User-Agent`, `Kubectl-Command` and `Kubectl-Session` are
+  read from a request, matched case-insensitively, first value only, capped at 256 characters.
+  `Authorization` (present on every request), cookies, all other request headers, all response
+  headers, `remote_addr` and panic content are never stored or logged, and raw audit lines are
+  never logged.
+- **URL normalization and query allowlist.** Every stored URL is normalized first (fragment
+  dropped, path unquoted once, repeated `/` collapsed, trailing `/` stripped). Only allowlisted
+  query keys survive, and only with a value that passes validation (at most 256 characters, no
+  `;`, no control characters). Every other key is dropped, not kept blank. Detection matches on
+  the same normalized path, so encoded variants such as `%73ecrets` still produce findings.
+- **Exec/attach parameters are validated.** `…/pods/<name>/exec` and `…/attach` keep only
+  `container`, `stdin`, `stdout`, `stderr` and `tty`. Flags must be `true`, `false`, `1` or
+  `0`, and `container` must be a valid name. `command=`, which can hold secrets, is always
+  dropped.
+- **Proxy paths are truncated.** Everything after a `/proxy` segment, and the whole query, is
+  dropped because it is forwarded to a backend. `/nodes/<n>/proxy/exec|run|attach` keeps that
+  one segment so `kube-node-proxy-exec` still matches.
+- **Fail-closed on encoded `?` and `#`.** If the unquoted path contains `?` or `#` (from `%3F`
+  or `%23`), the path is cut there and the query is discarded. A path that is still
+  percent-encoded after one decode also has its query discarded.
+- **Atomic request and findings insert.** A request row and its findings are written in one
+  transaction, so a redelivered line cannot leave a request without its findings or duplicate
+  findings.
+- **Retention purges on ingest time too.** An API request is purged when either its
+  Gateway-supplied `requested_at` or the server-assigned insert time is past the cutoff, so a
+  forged future timestamp cannot keep a row forever. Connections are purged on server time only.
+- **The migration keeps rows with on-disk recordings.** A start-only-looking `sessions` row is
+  never moved if its `.cast` or sidecar file exists, which would otherwise orphan a
+  secret-grade file. Rows with an unsafe `conn_id` are skipped without building a path.
 - With encryption enabled, in-progress recordings are **plaintext at rest** until sealed
   (accepted tradeoff for durability + live playback). Lower `SESSION_MAX_IDLE_SECONDS` to
   shorten that window for abandoned sessions. See ARCHITECTURE.md → Encryption at Rest.

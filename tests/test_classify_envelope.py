@@ -18,6 +18,7 @@ from gatorcast.db import init_db
 from gatorcast.models import RecordingChunk, SessionEnd, SessionStart
 from gatorcast.pipeline.assembler import Assembler
 from gatorcast.pipeline.classify import classify
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.sessions import SessionRepository
 
@@ -202,6 +203,7 @@ async def _make(tmp_path: Path) -> tuple[Assembler, aiosqlite.Connection]:
         casts=CastStore(tmp_path / "casts"),
         idle_timeout_seconds=120,
         clock=lambda: 0.0,
+        activity=ActivityStore(db),
     )
     return asm, db
 

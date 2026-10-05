@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {#
   Systems index: one row per distinct resource_address (the target system), with a
-  session count and last-seen timestamp. The NULL/unknown resource_address bucket
-  is labelled "(unknown)" and linked through a sentinel path segment so it remains
-  browsable. All values are autoescaped by Jinja.
+  session count, kubectl API-request count, and last-seen timestamp. Clusters with
+  only kubectl API activity (no recordings) are listed too. The NULL/unknown
+  resource_address bucket is labelled "(unknown)" and linked through a sentinel path
+  segment so it remains browsable. All values are autoescaped by Jinja.
 #}
 {% block title %}Systems · Gatorcast{% endblock %}
 
@@ -16,6 +17,7 @@
         <tr>
           <th>System (resource address)</th>
           <th>Sessions</th>
+          <th>API requests</th>
           <th>Findings</th>
           <th>Last seen</th>
         </tr>
@@ -28,7 +30,21 @@
                 {{ system.label }}
               </a>
             </td>
-            <td>{{ system.summary.session_count }}</td>
+            <td>
+              {% if system.summary.session_count %}
+                {{ system.summary.session_count }}
+              {% else %}
+                <span class="dim">0</span>
+              {% endif %}
+            </td>
+            <td class="api-count">
+              {% if system.summary.api_request_count %}
+                <span class="pill pill-kubectl">kubectl</span>
+                <span class="badge-count">{{ system.summary.api_request_count }}</span>
+              {% else %}
+                <span class="dim">—</span>
+              {% endif %}
+            </td>
             <td>
               {% if system.summary.finding_count and system.summary.max_severity %}
                 <span class="sev sev-{{ system.summary.max_severity }}">{{ system.summary.max_severity }}</span>
@@ -43,6 +59,6 @@
       </tbody>
     </table>
   {% else %}
-    <p class="empty">No recordings yet.</p>
+    <p class="empty">No recordings or kubectl activity yet.</p>
   {% endif %}
 {% endblock %}

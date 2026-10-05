@@ -69,4 +69,78 @@
   {% else %}
     <p class="empty">No sessions for this system.</p>
   {% endif %}
+
+  {#
+    kubectl activity: per-user activity sessions computed on view from API-request
+    metadata (no player, no request detail here). Each row links to its activity
+    page via a server-built, autoescaped URL. Window: [since, until).
+  #}
+  <section class="activity-section" aria-labelledby="activity-heading">
+    <div class="activity-section-head">
+      <h2 id="activity-heading">kubectl activity</h2>
+      <p class="activity-window dim">
+        Window <span class="mono">{{ activity_window_since }}</span>
+        → <span class="mono">{{ activity_window_until }}</span>
+      </p>
+    </div>
+
+    {% if activity_truncated %}
+      <p class="truncated-notice">
+        Showing the first {{ activity_max_rows }} requests in this window — results
+        are truncated. Page to an older window or narrow the time range.
+      </p>
+    {% endif %}
+
+    {% if activity_sessions %}
+      <div class="table-scroll">
+        <table class="activity-table">
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>User</th>
+              <th>Start</th>
+              <th>End</th>
+              <th>Duration</th>
+              <th class="num">Commands</th>
+              <th class="num">Requests</th>
+              <th class="num">Recordings</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for a in activity_sessions %}
+              <tr>
+                <td><span class="pill pill-kubectl">kubectl</span></td>
+                <td><a href="{{ a.url }}">{{ a.user_label }}</a></td>
+                <td class="dim mono">{{ a.started_at }}</td>
+                <td class="dim mono">{{ a.ended_at }}</td>
+                <td class="dim">{{ a.duration_display }}</td>
+                <td class="num">{{ a.command_count }}</td>
+                <td class="num">{{ a.request_count }}</td>
+                <td class="num">{{ a.recording_count }}</td>
+                <td>
+                  {% if a.finding_count and a.max_severity %}
+                    <span class="sev sev-{{ a.max_severity }}">
+                      {{ a.max_severity }} · {{ a.finding_count }}
+                    </span>
+                  {% else %}
+                    <span class="dim">—</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No kubectl activity in this window.</p>
+    {% endif %}
+
+    <nav class="activity-paging" aria-label="kubectl activity window">
+      {% if activity_latest_url %}
+        <a class="window-opt" href="{{ activity_latest_url }}">Latest</a>
+      {% endif %}
+      <a class="window-opt" href="{{ activity_older_url }}">Older</a>
+    </nav>
+  </section>
 {% endblock %}

@@ -13,10 +13,10 @@ For the overall design and how recordings are stored/encrypted, see
 
 ## Features at a glance
 
-- **Dashboard** (`/dashboard`, the site root) — total and flagged session counts, severity/category breakdowns, and top users/systems, all server-rendered (offline, no external JS). It is **time-windowed** with a 7 / 30 / 90 / All-time toggle (default 30 days). Every breakdown is a **drill-down link**: a severity badge opens search filtered to that exact highest severity, a category opens search for that category, a top user opens that user's sessions, and a top system opens its session list — each carrying the active window so the figures and results line up.
+- **Dashboard** (`/dashboard`, the site root) — total and flagged session counts, severity/category breakdowns, and top users/systems, plus a **kubectl API requests** card (total requests, flagged requests, severity breakdown; no drill-down links), all server-rendered (offline, no external JS). It is **time-windowed** with a 7 / 30 / 90 / All-time toggle (default 30 days). Every breakdown is a **drill-down link**: a severity badge opens search filtered to that exact highest severity, a category opens search for that category, a top user opens that user's sessions, and a top system opens its session list — each carrying the active window so the figures and results line up.
 - **Search** (`/search`) — filter by user, system, status, date range, duration, severity (at-or-above), finding category, a dangerous-command rule multiselect, a free-text **keyword**, and a custom **regex**. Results paginate and the filters live in the URL (shareable). **CSV export** (`/search/export.csv`) writes session metadata plus a finding summary.
-- **Systems index** (`/systems`) — a **Findings column** flags each system with its highest-severity badge and total finding count (or `—` if clean), so you can see at a glance which systems to look into.
-- **Findings** — a built-in rule set scans each reassembled recording for **dangerous commands** and **on-screen secrets** (full list below). Findings expose only the **rule label, category, severity, and replay offset** — never the matched text.
+- **Systems index** (`/systems`) — a **Findings column** flags each system with its highest-severity badge and total finding count (or `—` if clean), so you can see at a glance which systems to look into. The column counts recording findings only; clusters with only kubectl activity are listed too.
+- **Findings** — a built-in rule set scans each reassembled recording for **dangerous commands** and **on-screen secrets** (full list below). Findings expose only the **rule label, category, severity, and replay offset** — never the matched text. A separate small rule set flags risky **kubectl API requests** (see [kubectl API rules](#kubectl-api-rules)).
 - **Seek-to-finding** — clicking a finding on the session page jumps the asciinema player to that moment. The jump also works as a **deep link** (`/sessions/{id}?t=<seconds>`): opening or refreshing that URL loads the player already positioned at the timestamp (and autoplaying), so a "jump" from the search results lands in the right place.
 
 ---
@@ -47,8 +47,9 @@ occurrence.
 
 ## Built-in detection rules
 
-The rule set is built in for v1. There are two categories — **dangerous-command**
-(what the operator did) and **secret-exposure** (what appeared on screen).
+The rule set is built in for v1. Recordings are scanned against two categories —
+**dangerous-command** (what the operator did) and **secret-exposure** (what appeared
+on screen). Kubectl API requests have their own rules, listed [below](#kubectl-api-rules).
 Severity ranks `critical > high > medium > low`; a session's headline severity is
 the highest among its findings.
 
@@ -91,10 +92,31 @@ case-sensitive so token fidelity (`AKIA…`, `ghp_…`, `eyJ…`, `hvs.…`) is 
 > operator scrubs to that offset in the player. This keeps the findings index
 > (and any CSV export) free of the very secrets it points at.
 
+### kubectl API rules
+
+Each stored kubectl API request is checked on its method and URL path when it is
+ingested (gated by `DETECTION_ENABLED`). The path is normalized (fragment dropped,
+unquoted once, repeated `/` collapsed, trailing `/` stripped) and lower-cased before
+matching, so encoded or oddly shaped variants such as `%73ecrets` or `exec/` still
+match. The query string is never matched. Findings use the category `kube-api` and,
+like recording findings, never carry the URL.
+
+| Rule | Severity | Flags |
+| --- | --- | --- |
+| `kube-delete` | high | any `DELETE` request |
+| `kube-secrets` | high | any request to a `…/secrets` path |
+| `kube-evict` | high | `POST …/pods/<name>/eviction` (drain) |
+| `kube-cordon` | medium | `PATCH /api/v1/nodes/<name>` (cordon/uncordon) |
+| `kube-exec` | medium | `…/pods/<name>/exec` or `…/attach` |
+| `kube-node-proxy-exec` | high | `…/nodes/<name>/proxy/exec`, `run` or `attach` |
+
+API findings appear on the system's kubectl activity page and in the dashboard card.
+They are not part of search or CSV export.
+
 ### Testing the rules
 
 The repo includes [`scripts/seed_demo.py`](scripts/seed_demo.py), which posts a
-set of synthetic sessions that, between them, trip **every** built-in rule, plus a
+set of synthetic sessions that, between them, trip **every** built-in recording rule, plus a
 negative-control session of look-alike-but-safe commands (e.g. `rm` without
 `-rf`, `chmod 755`, `kubectl get`) that must produce zero findings. It is the
 quickest way to populate the dashboard and confirm both detection and the absence
@@ -147,7 +169,7 @@ These settings (all defaulted; see the [README configuration table](README.md#co
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection live (every append) and at seal. |
+| `DETECTION_ENABLED` | `true` | Run dangerous-command + secret-exposure detection live (every append) and at seal, and the kubectl API rules as each request is ingested. |
 | `BACKFILL_ON_STARTUP` | `true` | On startup, index + detect existing finalized recordings that lack a sidecar. |
 | `SEARCH_PAGE_SIZE` | `50` | Default number of search results per page. |
 | `SEARCH_REGEX_MAX_CANDIDATES` | `2000` | Max sidecars scanned per keyword/regex content search (cost / ReDoS bound). |

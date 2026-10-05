@@ -1,8 +1,9 @@
 """Tests for the HTTP ingestion front door: auth + tolerant batch parsing.
 
 The front door delivers to the real pipeline now (classify → assembler), so
-acceptance is verified by the session rows that land in SQLite rather than by a
-raw enqueue counter. The DB is read from the test thread via a separate sqlite3
+acceptance is verified by the rows that land in SQLite (session rows for
+recordings, pending connections for start lines, API-request rows for audit
+lines) rather than by a raw enqueue counter. The DB is read from the test thread via a separate sqlite3
 connection (WAL allows concurrent readers), avoiding the app's event loop.
 """
 
@@ -27,26 +28,54 @@ def _settings(tmp_path: Path) -> Settings:
     return Settings(data_dir=tmp_path, syslog_tcp_port=0, ingest_token=TOKEN)
 
 
-def _count_sessions(db_path: Path) -> int:
-    """Count rows in the sessions table via an independent reader connection."""
+# Sample fixture: line 0 is a recording chunk (conn A), line 1 an
+# "Authenticated connection" start (conn B), line 2 a legacy API audit on conn A.
+CONN_B = "22f2002a-9a49-45ca-b365-616dc9cfd203"
+
+
+def _scalar(db_path: Path, sql: str, params: tuple = ()) -> object:
+    """Run a single-value query via an independent reader connection."""
     conn = sqlite3.connect(str(db_path))
     try:
-        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        row = conn.execute(sql, params).fetchone()
+        return row[0] if row is not None else None
     finally:
         conn.close()
 
 
-def _wait_for_sessions(db_path: Path, expected: int, timeout: float = 3.0) -> int:
-    """Poll the sessions table until it has at least ``expected`` rows."""
+def _count_sessions(db_path: Path) -> int:
+    """Count rows in the sessions table via an independent reader connection."""
+    return int(_scalar(db_path, "SELECT COUNT(*) FROM sessions"))
+
+
+def _wait_for(
+    db_path: Path, sql: str, expected: int, params: tuple = (), timeout: float = 3.0
+) -> int:
+    """Poll a ``COUNT(*)`` query until it reaches at least ``expected``."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if _count_sessions(db_path) >= expected:
+            if int(_scalar(db_path, sql, params)) >= expected:
                 break
         except sqlite3.OperationalError:
             pass  # db not yet created / momentarily locked
         time.sleep(0.02)
-    return _count_sessions(db_path)
+    return int(_scalar(db_path, sql, params))
+
+
+def _wait_for_sessions(db_path: Path, expected: int, timeout: float = 3.0) -> int:
+    """Poll the sessions table until it has at least ``expected`` rows."""
+    return _wait_for(db_path, "SELECT COUNT(*) FROM sessions", expected, timeout=timeout)
+
+
+def _wait_for_pending_b(db_path: Path) -> None:
+    """Wait until the start line's connection B is stored as a pending connection."""
+    sql = "SELECT COUNT(*) FROM connections WHERE conn_id = ?"
+    assert _wait_for(db_path, sql, 1, params=(CONN_B,)) == 1
+    state = _scalar(
+        db_path, "SELECT state FROM connections WHERE conn_id = ?", (CONN_B,)
+    )
+    assert state == "pending"
 
 
 def _auth() -> dict[str, str]:
@@ -66,11 +95,29 @@ def test_auth_required(tmp_path: Path) -> None:
         )
 
 
+def _assert_sample_batch_processed(db_path: Path) -> None:
+    """Assert the full three-line sample batch landed as designed.
+
+    The recording chunk (conn A) becomes the only session row; the start line
+    (conn B) becomes a hidden pending connection with no session row; the API
+    audit line is stored as API activity metadata on conn A. The consumer drains
+    in order, so waiting for the audit row (last line) means all three are done.
+    """
+    assert _wait_for(db_path, "SELECT COUNT(*) FROM api_requests", 1) == 1
+    assert _count_sessions(db_path) == 1
+    _wait_for_pending_b(db_path)
+    assert (
+        _scalar(db_path, "SELECT COUNT(*) FROM sessions WHERE conn_id = ?", (CONN_B,))
+        == 0
+    )
+
+
 def test_ndjson_accepted_and_processed(tmp_path: Path) -> None:
-    """A valid NDJSON batch returns 204; the two recordable lines become rows.
+    """A valid NDJSON batch returns 204 and every line reaches the pipeline.
 
     The sample has a recording chunk (conn A), a session-start (conn B), and one
-    API-audit noise line that classify drops — so two session rows are expected.
+    API-audit line (conn A). Only the chunk creates a session row: the start is a
+    pending connection, and the audit line is stored as API activity metadata.
     """
     settings = _settings(tmp_path)
     app = create_app(settings)
@@ -82,11 +129,11 @@ def test_ndjson_accepted_and_processed(tmp_path: Path) -> None:
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
         assert resp.status_code == 204
-        assert _wait_for_sessions(settings.db_path, 2) == 2
+        _assert_sample_batch_processed(settings.db_path)
 
 
 def test_json_array_accepted(tmp_path: Path) -> None:
-    """An application/json array of objects is processed (two session rows)."""
+    """An application/json array of objects is processed like the NDJSON batch."""
     settings = _settings(tmp_path)
     app = create_app(settings)
     objs = [json.loads(line) for line in sample_lines()]
@@ -97,7 +144,7 @@ def test_json_array_accepted(tmp_path: Path) -> None:
             headers={**_auth(), "Content-Type": "application/json"},
         )
         assert resp.status_code == 204
-        assert _wait_for_sessions(settings.db_path, 2) == 2
+        _assert_sample_batch_processed(settings.db_path)
 
 
 def test_single_json_object_accepted(tmp_path: Path) -> None:
@@ -169,8 +216,10 @@ def test_json_collector_wrapped_array_unwrapped(tmp_path: Path) -> None:
             headers={**_auth(), "Content-Type": "application/json"},
         )
         assert resp.status_code == 204
-        # Both the recording chunk and the session-start produce session rows.
-        assert _wait_for_sessions(settings.db_path, 2) == 2
+        # Both reach the pipeline: the session-start becomes a pending connection
+        # (no session row) and the recording chunk the only session row.
+        _wait_for_pending_b(settings.db_path)
+        assert _wait_for_sessions(settings.db_path, 1) == 1
 
 
 def test_json_plain_object_still_works_alongside_collector(tmp_path: Path) -> None:
@@ -189,4 +238,6 @@ def test_json_plain_object_still_works_alongside_collector(tmp_path: Path) -> No
             headers={**_auth(), "Content-Type": "application/json"},
         )
         assert resp.status_code == 204
-        assert _wait_for_sessions(settings.db_path, 2) == 2
+        # Plain chunk → session row; wrapped start → pending connection.
+        _wait_for_pending_b(settings.db_path)
+        assert _wait_for_sessions(settings.db_path, 1) == 1

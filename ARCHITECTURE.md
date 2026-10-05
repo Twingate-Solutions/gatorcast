@@ -11,7 +11,8 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 ```text
   Twingate Gateway host (k8s pod OR SSH/VM)
-  emits gateway.audit JSON (asciicast v2 chunks) to stdout/stderr
+  emits gateway / gateway.audit JSON (asciicast v2 chunks + API-request audits)
+  to stdout/stderr
         │  push (operator's choice of shipper)
         │   • rsyslog omhttp  → HTTP POST /ingest
         │   • Docker syslog driver / rsyslog omfwd → syslog TCP
@@ -26,20 +27,29 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 │  Classify & filter                                                              │
 │    • logger=="gateway.audit" AND asciicast!=null → recording chunk              │
 │      (message=="session finished" → final chunk / end signal)                   │
-│    • logger=="gateway" "Authenticated connection" → session start + target      │
+│    • gateway.audit, no asciicast, "API request completed"/"failed"              │
+│      → API request (allowlisted metadata; URL via pipeline/urlnorm.py)          │
+│    • logger=="gateway" "Authenticated connection" → pending connection + target │
 │    • (close event if present) → finalize signal                                 │
 │        ▼                                                                        │
-│  Per-conn_id assembler (file-first)                                             │
+│  Per-conn_id assembler (file-first) + connection lifecycle                      │
+│    • pending → recording on first chunk; pending → api on first audit;          │
+│        pending → visible error after SESSION_MAX_IDLE_SECONDS with neither      │
 │    • each chunk → reassemble (header once, events in seq order) →               │
 │        write PLAINTEXT .cast to disk + scan live (durable per append)           │
 │    • seal (encrypt if enabled → complete): on "session finished"/close          │
 │        (terminal) OR idle backstop (reopenable → late chunk resumes it)         │
+│    • API request → dedup by request_id → row + API findings, one transaction    │
 │        ▼                                                                        │
-│  Storage:  SQLite (WAL) metadata  +  /data/casts/<conn_id>.cast (named volume) │
+│  Storage:  SQLite (WAL) metadata (sessions, connections, api_requests,          │
+│            api_findings, findings)  +  /data/casts/<conn_id>.cast (named volume)│
+│            (store/activity.py holds connections + API rows)                     │
 │  Retention purge (APScheduler, age/size)                                        │
 │        ▲                                                                        │
 │  Web UI (FastAPI + Jinja2 + HTMX, vendored asciinema player, UI auth)          │
 │    /systems → /systems/{addr} → /sessions/{id} → /sessions/{id}/cast           │
+│                              └→ /systems/{addr}/activity (kubectl, no player)  │
+│    (activity grouping computed on view by pipeline/activity.py)                 │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,20 +57,21 @@ forwarding Gateway logs in, see [INGESTION_RECIPES.md](INGESTION_RECIPES.md).
 
 - Single FastAPI process: ingestion, assembly, storage, scheduler, and UI all in one container.
 - State: SQLite (WAL mode) for metadata; a named Docker volume for `.cast` files.
-- APScheduler drives two background jobs: the idle backstop sweep (seals data-bearing sessions reopenably; marks never-recorded start-only sessions `error`) and the daily retention purge.
+- APScheduler drives two background jobs: the idle backstop sweep (seals data-bearing sessions reopenably; expires pending connections that delivered neither chunks nor API audits to a visible `error` session) and the daily retention purge.
+- kubectl activity: the Gateway's API-request audits are stored as allowlisted metadata (`store/activity.py`), their URLs normalized and sanitized by `pipeline/urlnorm.py` and `pipeline/classify.py`, and grouped per user and cluster into activity sessions and commands on each page view by `pipeline/activity.py`. Nothing is cached. See the [README](README.md#kubectl-activity).
 - Push-based: Gatorcast exposes endpoints and waits. It never reaches back into the Gateway, Docker, or Kubernetes.
 - All frontend assets are vendored locally. No CDN or external JS at runtime.
 
 ### Session lifecycle: provisional → complete (file-first)
 
-Gatorcast is **file-first**: as each chunk arrives it is reassembled (the header kept once, event lines concatenated in `asciicast_sequence_num` order — the Gateway repeats the header in every chunk) and the growing document is written to `<conn_id>.cast` **as plaintext on every append**. So the recording is durable on disk from the first chunk, playable while in progress, and scanned for findings live. A session is **provisional** while it is still recording.
+Gatorcast is **file-first**: as each chunk arrives it is reassembled (the header kept once, event lines concatenated in `asciicast_sequence_num` order — the Gateway repeats the header in every chunk) and the growing document is written to `<conn_id>.cast` **as plaintext on every append**. So the recording is durable on disk from the first chunk, playable while in progress, and scanned for findings live. A connection starts as a hidden **pending connection** (the Gateway's `Authenticated connection` line creates only that); its first recording chunk creates the session row, and the session is **provisional** while it is still recording. A connection that only makes API requests never becomes a session.
 
 The recording is **sealed** to **complete** — encrypted (if enabled) and finalized — in one of two ways:
 
 - **Terminal seal**, on the Gateway's final flush (`message == "session finished"`, emitted by the recorder's `Stop()`) or a connection-close event. This is the normal, immediate path: the recording is complete the moment that line is processed.
 - **Reopenable seal**, on the idle backstop: an in-progress recording silent for `SESSION_MAX_IDLE_SECONDS` (default 3600 s) is sealed anyway, assuming the Gateway died without its final flush. If a later chunk *does* arrive for that `conn_id`, the sealed file is decrypted, appended to, and re-sealed — so a long interactive pause never loses or splits the recording.
 
-`IDLE_TIMEOUT_SECONDS` (default 120 s) is not a finalize trigger — it only sets the idle-sweep cadence (`max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds) and the startup-sweep cutoff. A session that authenticated but never recorded a valid chunk is marked `error` at the `SESSION_MAX_IDLE_SECONDS` backstop (so it doesn't linger "in progress"); a genuinely-late chunk reverts it and records. `SESSION_MAX_IDLE_SECONDS` must therefore exceed the Gateway's flush interval, since a quiet-but-active session is legitimately chunkless until its first flush.
+`IDLE_TIMEOUT_SECONDS` (default 120 s) is not a finalize trigger — it only sets the idle-sweep cadence (`max(5, min(IDLE_TIMEOUT_SECONDS, 30))` seconds) and the startup-sweep cutoff. A pending connection that delivers neither a recording chunk nor an API audit within `SESSION_MAX_IDLE_SECONDS` becomes a visible `error` session at the backstop; a genuinely-late chunk reverts it and records, and a late API audit removes the error row. `SESSION_MAX_IDLE_SECONDS` must therefore exceed the Gateway's flush interval, since a quiet-but-active session is legitimately chunkless until its first flush.
 
 On restart, Gatorcast re-adopts each provisional row from its on-disk plaintext `.cast` as an in-progress session (so continuation chunks keep appending and it seals normally); a provisional row with no `.cast` older than the idle timeout is an abandoned start and is swept away.
 
@@ -126,6 +137,7 @@ This is the honest meaning of "at rest" for a service that must decrypt to repla
 | `.cast` file serving | Paths are confined to `casts_dir` with a `is_relative_to` check before serving, even though `conn_id` is already validated upstream. |
 | Container privileges | Runs as a dedicated non-root system user (`uid 10001`). |
 | Recording payloads | Never written to application logs. Session recordings may contain on-screen secrets (terminals, typed tokens). Treat all stored `.cast` files as secret-grade. |
+| kubectl API metadata | Only `User-Agent`, `Kubectl-Command` and `Kubectl-Session` request headers are stored. `Authorization`, cookies, other headers, response headers, `remote_addr` and panic content are never stored or logged. URLs are normalized and keep only allowlisted query keys; `command=` is always dropped. See the [README](README.md#what-is-stored-and-what-is-never-stored). |
 | Syslog TCP | No per-message auth. Bound to loopback by default. Cap on concurrent connections (128) and idle connections (5-minute timeout) to limit resource exhaustion. |
 | Insecure defaults | At startup, Gatorcast logs a warning for each secret still equal to a placeholder default. The service still boots, but the warning is prominent. |
 
@@ -141,5 +153,7 @@ Two independent policies run daily (APScheduler):
 2. **Size-based:** If `RETENTION_MAX_GB > 0`, the oldest complete sessions are deleted until the total `.cast` size is under the cap.
 
 Both policies are no-ops when disabled (`0`). Deleting a row and its `.cast` file is one logical operation; a missing file is tolerated and does not cause an error. A purged session's plaintext search sidecar and findings are removed alongside it.
+
+The age-based purge also deletes kubectl activity on the same `RETENTION_DAYS` cutoff, with no separate setting: `api_requests` (with their `api_findings`) and `connections`. An API request is purged when either its Gateway `requested_at` or the time Gatorcast stored it is past the cutoff; connections are purged on Gatorcast's own timestamps. The size cap counts `.cast` bytes only and never deletes API rows or connections.
 
 To keep recordings indefinitely, set `RETENTION_DAYS=0` and `RETENTION_MAX_GB=0` (the defaults for size are already `0`).

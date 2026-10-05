@@ -24,13 +24,19 @@ from gatorcast.models import Session
 
 
 class SystemSummary(BaseModel):
-    """Aggregate view of one target system (distinct ``resource_address``)."""
+    """Aggregate view of one target system (distinct ``resource_address``).
+
+    A system is listed when it has recording sessions, kubectl API requests, or
+    both. ``finding_count``/``max_severity`` summarize recording findings only;
+    API-request findings are shown on the system's kubectl activity table.
+    """
 
     resource_address: str | None
     session_count: int
     last_seen: str | None
     finding_count: int = 0
     max_severity: str | None = None
+    api_request_count: int = 0
 
 
 # Maps the SQL severity-rank back to a label (0 / no findings → None).
@@ -55,7 +61,7 @@ class PurgedSession(BaseModel):
 _SESSION_COLUMNS = (
     "conn_id, username, resource_address, shell_user, started_at, ended_at, "
     "duration_seconds, width, height, chunk_count, size_bytes, cast_path, status, "
-    "finding_count, max_severity"
+    "finding_count, max_severity, request_id"
 )
 
 
@@ -77,6 +83,7 @@ def _row_to_session(row: aiosqlite.Row) -> Session:
         status=row["status"],
         finding_count=row["finding_count"] or 0,
         max_severity=row["max_severity"],
+        request_id=row["request_id"],
     )
 
 
@@ -113,49 +120,68 @@ class SessionRepository:
             resource_address: Target system address, if known.
             started_at: Session start timestamp (start event / first chunk), if known.
         """
+        await self._upsert_provisional(
+            conn_id, username, resource_address, started_at, request_id=None
+        )
+
+    async def _upsert_provisional(
+        self,
+        conn_id: str,
+        username: str | None,
+        resource_address: str | None,
+        started_at: str | None,
+        *,
+        request_id: str | None,
+    ) -> None:
+        """Shared INSERT-or-refresh of a provisional row (see :meth:`upsert_start`).
+
+        ``request_id`` is first-wins (``COALESCE(sessions.request_id, ?)``): once a
+        k8s exec/attach chunk has set it, later chunks never overwrite it.
+        """
         await self._db.execute(
             """
             INSERT INTO sessions (
-                conn_id, username, resource_address, started_at, status,
+                conn_id, username, resource_address, started_at, request_id, status,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
+            VALUES (?, ?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
             ON CONFLICT(conn_id) DO UPDATE SET
                 username         = COALESCE(excluded.username, sessions.username),
                 resource_address = COALESCE(excluded.resource_address, sessions.resource_address),
                 started_at       = COALESCE(sessions.started_at, excluded.started_at),
+                request_id       = COALESCE(sessions.request_id, excluded.request_id),
                 updated_at       = datetime('now')
             WHERE sessions.status = 'provisional'
             """,
-            (conn_id, username, resource_address, started_at),
+            (conn_id, username, resource_address, started_at, request_id),
         )
         await self._db.commit()
 
-    # add_chunk_meta refreshes the same provisional row a chunk arrives on. The
-    # assembler tracked no extra per-chunk columns, so this is upsert_start with the
-    # chunk's known fields — kept as a distinct method for caller clarity.
+    # add_chunk_meta refreshes the same provisional row a chunk arrives on. It is
+    # upsert_start with the chunk's known fields (including the k8s request_id) —
+    # kept as a distinct method for caller clarity.
     async def add_chunk_meta(
         self,
         conn_id: str,
         username: str | None,
         started_at: str | None,
+        request_id: str | None = None,
     ) -> None:
         """Refresh the provisional row when a recording chunk arrives.
 
         Equivalent to ``upsert_start`` for the fields a chunk can carry (it has no
         ``resource_address``). Keeps the provisional row's ``updated_at`` current and
-        backfills ``username``/``started_at`` if they were not yet known.
+        backfills ``username``/``started_at``/``request_id`` if not yet known.
 
         Args:
             conn_id: The connection id (primary key).
             username: Envelope SSO identity from the chunk, if present.
             started_at: First-seen timestamp for the session, if known.
+            request_id: Gateway request UUID from a k8s exec/attach chunk; ``None``
+                for SSH. Written with ``COALESCE`` so the first value wins.
         """
-        await self.upsert_start(
-            conn_id=conn_id,
-            username=username,
-            resource_address=None,
-            started_at=started_at,
+        await self._upsert_provisional(
+            conn_id, username, None, started_at, request_id=request_id
         )
 
     async def update_progress(
@@ -172,6 +198,7 @@ class SessionRepository:
         chunk_count: int,
         size_bytes: int,
         cast_path: str,
+        request_id: str | None = None,
     ) -> None:
         """Refresh an in-progress row's derived metadata WITHOUT sealing it.
 
@@ -192,6 +219,8 @@ class SessionRepository:
             chunk_count: Distinct chunks appended so far.
             size_bytes: Current on-disk (plaintext) size.
             cast_path: Path to the ``.cast`` file.
+            request_id: Gateway request UUID from a k8s exec/attach chunk; ``None``
+                for SSH. Written with ``COALESCE`` so an existing value is kept.
         """
         await self._db.execute(
             """
@@ -206,6 +235,7 @@ class SessionRepository:
                 chunk_count      = ?,
                 size_bytes       = ?,
                 cast_path        = ?,
+                request_id       = COALESCE(request_id, ?),
                 updated_at       = datetime('now')
             WHERE conn_id = ? AND status = 'provisional'
             """,
@@ -220,10 +250,36 @@ class SessionRepository:
                 chunk_count,
                 size_bytes,
                 cast_path,
+                request_id,
                 conn_id,
             ),
         )
         await self._db.commit()
+
+    async def delete_start_only_error(self, conn_id: str) -> bool:
+        """Delete a visible ``error`` row that never received a recording chunk.
+
+        Called when a late API audit line arrives for a connection the pending
+        backstop had surfaced as ``error`` (e.g. a long ``kubectl get -w``): the
+        connection is API-only after all, so its phantom row is removed. Guarded so a
+        row that holds any recording data (chunks or a ``.cast`` path) is never
+        deleted.
+
+        Args:
+            conn_id: The connection id whose start-only error row to delete.
+
+        Returns:
+            True if a row was deleted.
+        """
+        cursor = await self._db.execute(
+            "DELETE FROM sessions WHERE conn_id = ? AND status = 'error' "
+            "AND COALESCE(chunk_count, 0) = 0 AND cast_path IS NULL",
+            (conn_id,),
+        )
+        deleted = cursor.rowcount == 1
+        await cursor.close()
+        await self._db.commit()
+        return deleted
 
     async def reopen(self, conn_id: str) -> None:
         """Revert a timeout-sealed row from ``complete`` back to ``provisional``.
@@ -483,26 +539,54 @@ class SessionRepository:
     # --- query path (web UI) ---------------------------------------------------
 
     async def list_systems(self) -> list[SystemSummary]:
-        """List distinct target systems with session count, last-seen, and risk.
+        """List distinct target systems with session/API counts, last-seen, and risk.
 
-        Ordered by most-recent activity first. ``last_seen`` is the newest
-        ``updated_at`` across the system's sessions. ``finding_count`` is the total
-        findings across the system's sessions and ``max_severity`` is the single
-        highest severity seen on any of them — a visual cue for which systems an
-        admin should look into.
+        The union of systems that have recording sessions and clusters that have
+        only kubectl API activity (kubectl activity spec §9): a ``UNION ALL`` of the
+        per-system ``sessions`` aggregate and a ``GROUP BY resource_address`` over
+        ``api_requests``, folded by an outer ``GROUP BY``. ``GROUP BY`` keeps the
+        NULL (unknown) bucket as one group.
+
+        ``last_seen`` is the newest of the sessions' ``updated_at`` and the API
+        requests' ``requested_at``. The two tables store different timestamp formats
+        (``YYYY-MM-DD HH:MM:SS`` vs ``YYYY-MM-DDTHH:MM:SS.mmmZ``), so both sides are
+        normalized with ``datetime(...)`` before comparing; the result is in the
+        sessions table's ``YYYY-MM-DD HH:MM:SS`` format. ``finding_count`` and
+        ``max_severity`` summarize recording findings only.
 
         Returns:
-            A list of ``SystemSummary`` rows.
+            A list of ``SystemSummary`` rows, most-recent activity first.
         """
         cursor = await self._db.execute(
             f"""
             SELECT
-                resource_address           AS resource_address,
-                COUNT(*)                   AS session_count,
-                MAX(updated_at)            AS last_seen,
-                COALESCE(SUM(finding_count), 0) AS finding_count,
-                MAX({_SEVERITY_RANK_CASE}) AS sev_rank
-            FROM sessions
+                resource_address                  AS resource_address,
+                SUM(session_count)                AS session_count,
+                SUM(api_request_count)            AS api_request_count,
+                MAX(last_seen)                    AS last_seen,
+                SUM(finding_count)                AS finding_count,
+                MAX(sev_rank)                     AS sev_rank
+            FROM (
+                SELECT
+                    resource_address                AS resource_address,
+                    COUNT(*)                        AS session_count,
+                    0                               AS api_request_count,
+                    MAX(datetime(updated_at))       AS last_seen,
+                    COALESCE(SUM(finding_count), 0) AS finding_count,
+                    MAX({_SEVERITY_RANK_CASE})      AS sev_rank
+                FROM sessions
+                GROUP BY resource_address
+                UNION ALL
+                SELECT
+                    resource_address                AS resource_address,
+                    0                               AS session_count,
+                    COUNT(*)                        AS api_request_count,
+                    MAX(datetime(requested_at))     AS last_seen,
+                    0                               AS finding_count,
+                    0                               AS sev_rank
+                FROM api_requests
+                GROUP BY resource_address
+            )
             GROUP BY resource_address
             ORDER BY last_seen DESC
             """
@@ -512,10 +596,11 @@ class SessionRepository:
         return [
             SystemSummary(
                 resource_address=row["resource_address"],
-                session_count=row["session_count"],
+                session_count=int(row["session_count"] or 0),
                 last_seen=row["last_seen"],
                 finding_count=int(row["finding_count"] or 0),
                 max_severity=_RANK_TO_SEVERITY.get(int(row["sev_rank"] or 0)),
+                api_request_count=int(row["api_request_count"] or 0),
             )
             for row in rows
         ]

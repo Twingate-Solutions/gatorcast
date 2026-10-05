@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from gatorcast.logging import get_logger
 from gatorcast.models import Session
 from gatorcast.pipeline.detect import SEVERITY_RANK, Finding
+from gatorcast.store.activity import to_requested_at_format
 from gatorcast.store.casts import CastStore
 from gatorcast.store.sessions import _SESSION_COLUMNS, _row_to_session
 
@@ -96,7 +97,14 @@ class SearchResult(BaseModel):
 
 
 class DashboardStats(BaseModel):
-    """Aggregate counts for the dashboard view."""
+    """Aggregate counts for the dashboard view.
+
+    The ``api_*`` fields cover kubectl API-request metadata (kubectl activity spec
+    §9): ``api_requests_total`` counts stored requests, ``api_flagged_requests``
+    counts requests with at least one API finding, and ``api_by_severity`` maps each
+    flagged request's highest finding severity to a request count. They are
+    windowed on ``api_requests.requested_at``.
+    """
 
     total_sessions: int
     flagged_sessions: int
@@ -104,6 +112,9 @@ class DashboardStats(BaseModel):
     by_category: dict[str, int]
     top_users: list[LabeledCount]
     top_systems: list[LabeledCount]
+    api_requests_total: int = 0
+    api_flagged_requests: int = 0
+    api_by_severity: dict[str, int] = {}
 
 
 # Columns for a FindingRow, in model field order.
@@ -147,6 +158,15 @@ _RISK_CASE = (
     "CASE max_severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
     "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
 )
+
+# Static rank of an API finding's severity, for a per-request MAX(). No user input.
+_API_FINDING_RANK_CASE = (
+    "CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
+    "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
+)
+
+# Maps a severity rank back to its label (0 / unknown → dropped).
+_RANK_TO_SEVERITY = {rank: name for name, rank in SEVERITY_RANK.items()}
 
 
 class SearchStore:
@@ -591,6 +611,10 @@ class SearchStore:
         await cursor.close()
         top_systems = [LabeledCount(label=r["label"], count=int(r["n"])) for r in sys_rows]
 
+        api_total, api_flagged, api_by_severity = await self._api_request_stats(
+            started_after
+        )
+
         return DashboardStats(
             total_sessions=total_sessions,
             flagged_sessions=flagged_sessions,
@@ -598,4 +622,64 @@ class SearchStore:
             by_category=by_category,
             top_users=top_users,
             top_systems=top_systems,
+            api_requests_total=api_total,
+            api_flagged_requests=api_flagged,
+            api_by_severity=api_by_severity,
         )
+
+    async def _api_request_stats(
+        self, started_after: str | None
+    ) -> tuple[int, int, dict[str, int]]:
+        """Aggregate kubectl API-request counts for the dashboard card.
+
+        Windowed on ``api_requests.requested_at``. That column is stored as
+        ``YYYY-MM-DDTHH:MM:SS.mmmZ`` and compared as a string, so the cutoff is
+        normalized to the same format first (a ``...SSZ`` cutoff would mis-order at
+        the boundary second). Only counts and rule-derived severities are read —
+        never a URL or header value.
+
+        Args:
+            started_after: ISO 8601 cutoff, or ``None`` for all time.
+
+        Returns:
+            ``(total_requests, flagged_requests, highest_severity → request count)``.
+        """
+        cutoff = to_requested_at_format(started_after) if started_after else None
+        r_where = " WHERE r.requested_at >= ?" if cutoff else ""
+        p: tuple[object, ...] = (cutoff,) if cutoff else ()
+
+        cursor = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM api_requests r{r_where}", p
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        total = int(row["n"]) if row is not None else 0
+
+        # One row per flagged request carrying its highest finding rank, then a
+        # count per rank.
+        cursor = await self._db.execute(
+            f"""
+            SELECT sev_rank, COUNT(*) AS n FROM (
+                SELECT r.request_id AS request_id,
+                       MAX({_API_FINDING_RANK_CASE}) AS sev_rank
+                FROM api_requests r
+                JOIN api_findings f ON f.request_id = r.request_id
+                {r_where}
+                GROUP BY r.request_id
+            )
+            GROUP BY sev_rank
+            """,
+            p,
+        )
+        rank_rows = await cursor.fetchall()
+        await cursor.close()
+
+        flagged = 0
+        by_severity: dict[str, int] = {}
+        for r in rank_rows:
+            count = int(r["n"])
+            flagged += count
+            label = _RANK_TO_SEVERITY.get(int(r["sev_rank"] or 0))
+            if label is not None:
+                by_severity[label] = by_severity.get(label, 0) + count
+        return total, flagged, by_severity

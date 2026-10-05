@@ -44,10 +44,13 @@ What the suite covers, by area:
 | Area | Tests |
 | --- | --- |
 | Ingest front doors | `test_ingest_http.py`, `test_syslog_tcp.py`, `test_normalize.py` |
-| Pipeline | `test_classify.py`, `test_assembler.py`, `test_extract.py`, `test_detect.py`, `test_backfill.py`, `test_retention.py` |
-| Storage / crypto | `test_store.py`, `test_db_schema.py`, `test_crypto.py`, `test_search_store.py` |
-| Web / config | `test_web.py`, `test_web_search.py`, `test_config_search.py`, `test_bootstrap.py` |
+| Pipeline | `test_classify.py`, `test_assembler.py`, `test_extract.py`, `test_detect.py`, `test_backfill.py`, `test_retention.py`, `test_activity.py` (kubectl activity grouping) |
+| Storage / crypto | `test_store.py`, `test_db_schema.py`, `test_crypto.py`, `test_search_store.py`, `test_activity_store.py` (connections, API requests, API findings) |
+| Web / config | `test_web.py`, `test_web_search.py`, `test_web_activity.py`, `test_config_search.py`, `test_bootstrap.py` |
 | End-to-end search | `test_e2e_search.py` |
+| Secret hygiene | `test_secret_hygiene.py` (posts planted sentinel secrets through `/ingest` and asserts none reach the database, logs, or UI) |
+
+The suite currently collects 860 tests.
 
 `test_detect.py` is the source of truth for rule behavior — it asserts both that each rule
 fires on a positive sample and that look-alike-but-safe input does not.

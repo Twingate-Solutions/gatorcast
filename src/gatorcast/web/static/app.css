@@ -18,6 +18,8 @@
   --ok: #5fd07a;
   --warn: #e6c34a;
   --err: #e66a6a;
+  --err-bg: #301a1d;
+  --warn-bg: #2f2813;
   --radius: 6px;
 }
 
@@ -573,4 +575,344 @@ a.bar-label {
 a.bar-label:hover {
   color: var(--accent);
   text-decoration: underline;
+}
+
+/* kubectl activity ------------------------------------------------------
+ * Used by sessions.html (activity table), activity.html (command table),
+ * dashboard.html (card) and systems.html (API-request count).
+ *
+ * Status vs outcome are two different signals and look different on purpose:
+ *   .status-4xx / .status-5xx  amber rectangular chip  (HTTP response code)
+ *   .outcome-failed            red pill + cross + row stripe (Gateway logged
+ *                              "API request failed"; usually no status at all)
+ * Red is reserved for the failed outcome. A 502 the Gateway logged as
+ * "completed" is amber only.
+ */
+
+.pill-kubectl {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* Horizontal scroll instead of a squashed table on narrow screens. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.table-scroll > table {
+  min-width: 620px;
+}
+
+th.num,
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-section {
+  margin-top: 2.5rem;
+}
+
+.activity-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.activity-section-head h2,
+.activity-window {
+  margin: 0;
+}
+
+.activity-window {
+  font-size: 0.82rem;
+}
+
+.activity-table td:nth-child(3),
+.activity-table td:nth-child(4) {
+  white-space: nowrap;
+}
+
+.activity-paging {
+  margin-top: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+/* Activity page header: one tile per fact, hairlines from the grid gap. */
+.activity-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.activity-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 1px;
+  margin: 0 0 1.25rem;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.activity-meta > div {
+  background: var(--bg-panel);
+  padding: 0.65rem 1rem;
+  min-width: 0;
+}
+
+.activity-meta dt {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.activity-meta dd {
+  margin: 0.1rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.activity-meta dd.mono {
+  font-size: 0.85rem;
+  font-weight: 400;
+  padding-top: 0.15rem;
+}
+
+.activity-meta .wide {
+  grid-column: 1 / -1;
+}
+
+@media (min-width: 481px) {
+  .activity-meta .wide {
+    grid-column: span 2;
+  }
+}
+
+/* Discovery toggle strip. */
+.activity-discovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.85rem;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+/* Command table: one <tbody class="command"> per command (summary row + a
+ * collapsible request list), so hover covers both rows together. */
+.command-table tbody tr:hover {
+  background: none;
+}
+
+.command-table tbody.command:hover {
+  background: var(--bg-row-hover);
+}
+
+.command-table tbody.command tr:last-child td {
+  border-bottom: 1px solid var(--border);
+}
+
+.command-table tbody.command:last-of-type tr:last-child td {
+  border-bottom: none;
+}
+
+.command-table tr.command-row td {
+  border-bottom: none;
+  padding-bottom: 0.35rem;
+}
+
+.command-label {
+  font-weight: 600;
+}
+
+.command-time,
+.command-sub {
+  font-size: 0.75rem;
+}
+
+.request-cell {
+  min-width: 14rem;
+}
+
+.method {
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-right: 0.4rem;
+}
+
+.request-url {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.status-cell {
+  white-space: nowrap;
+}
+
+.status {
+  display: inline-block;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", "Liberation Mono",
+    monospace;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0 0.35rem;
+  border-radius: 3px;
+}
+
+.status-1xx,
+.status-3xx {
+  color: var(--text);
+}
+
+.status-2xx {
+  color: var(--text-dim);
+}
+
+.status-4xx,
+.status-5xx {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.outcome-failed {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--err);
+  background: var(--err-bg);
+  color: var(--err);
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+tr.is-failed > td:first-child {
+  box-shadow: inset 3px 0 0 var(--err);
+}
+
+tr.is-discovery {
+  opacity: 0.75;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  vertical-align: 0.05em;
+}
+
+.finding-tag {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  margin-top: 0.15rem;
+}
+
+/* Per-command request list. */
+.command-requests > td {
+  padding-top: 0;
+}
+
+.command-requests summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  padding: 0.15rem 0;
+}
+
+.command-requests summary:hover {
+  color: var(--text);
+}
+
+.command-requests details[open] > summary {
+  margin-bottom: 0.5rem;
+}
+
+.command-requests table {
+  background: var(--bg);
+  min-width: 540px;
+}
+
+.command-requests thead th {
+  background: var(--bg-panel);
+}
+
+.command-requests tbody td {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.7rem;
+}
+
+/* Replay links. */
+.recording-links {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.recording-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.65rem;
+  border: 1px solid var(--accent-dim);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.recording-link:hover {
+  background: var(--accent-dim);
+  color: #ffffff;
+  text-decoration: none;
+}
+
+.activity-section a:focus-visible,
+.activity-discovery a:focus-visible,
+.command-table a:focus-visible,
+.command-requests summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Dashboard card and systems column. */
+.card-kubectl {
+  border-left: 3px solid var(--accent-dim);
+}
+
+.card-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.65rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.card-sub-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.api-count {
+  white-space: nowrap;
 }

@@ -8,17 +8,26 @@ Covers:
   - row + file deletion together
   - tolerate already-missing .cast file
   - disabled policies (0 values) are no-ops
+  - kubectl activity (spec §11/§13): the age purge also removes api_requests,
+    api_findings and connections with the same RETENTION_DAYS cutoff; the size
+    purge leaves them; counters are logged; no new retention setting exists
 """
 
 from __future__ import annotations
 
+import inspect
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from gatorcast.config import Settings
 from gatorcast.db import init_db
+from gatorcast.pipeline import retention as retention_module
 from gatorcast.pipeline.detect import Finding
 from gatorcast.pipeline.retention import RetentionPurger
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -58,6 +67,11 @@ def cast_store(casts_dir: Path) -> CastStore:
 @pytest.fixture
 def search_store(db, cast_store: CastStore) -> SearchStore:
     return SearchStore(db, cast_store)
+
+
+@pytest.fixture
+def activity_store(db) -> ActivityStore:
+    return ActivityStore(db)
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +463,413 @@ async def test_purge_without_search_still_removes_sidecar(
     assert await _count(db, conn_id) == 0
     assert not cast_store.path_for(conn_id).exists()
     assert not cast_store.has_sidecar(conn_id)
+
+
+# ---------------------------------------------------------------------------
+# kubectl activity retention (spec §11 / §13)
+# ---------------------------------------------------------------------------
+
+_RETENTION_DAYS = 10
+
+
+def _days_ago(days: float) -> datetime:
+    """Return an aware UTC datetime ``days`` before now."""
+    return datetime.now(tz=UTC) - timedelta(days=days)
+
+
+def _requested_at(dt: datetime) -> str:
+    """Format as the stored ``api_requests.requested_at`` (``…T…:….mmmZ``)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _sqlite_now_format(dt: datetime) -> str:
+    """Format as SQLite ``datetime('now')`` (``connections.created_at``)."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _session_ts(dt: datetime) -> str:
+    """Format as a session ``started_at`` (second precision, ``Z``)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _insert_request(db, request_id: str, conn_id: str, requested_at: str) -> None:
+    """Insert one ``api_requests`` row with allowlisted-shape metadata."""
+    await db.execute(
+        """
+        INSERT INTO api_requests (
+            request_id, conn_id, resource_address, user_key, username,
+            requested_at, method, url, status_code, outcome
+        )
+        VALUES (?, ?, 'cluster.example', 'u1', 'alice', ?, 'GET',
+                '/api/v1/namespaces/default/secrets', 200, 'completed')
+        """,
+        (request_id, conn_id, requested_at),
+    )
+    await db.commit()
+
+
+async def _insert_api_finding(db, request_id: str) -> None:
+    """Insert one ``api_findings`` row for ``request_id``."""
+    await db.execute(
+        """
+        INSERT INTO api_findings (request_id, rule_id, category, severity, label)
+        VALUES (?, 'kube-secrets', 'kube-api', 'high', 'Secret access')
+        """,
+        (request_id,),
+    )
+    await db.commit()
+
+
+async def _insert_connection(db, conn_id: str, created_at: str, state: str = "api") -> None:
+    """Insert one ``connections`` row with an explicit ``created_at``."""
+    await db.execute(
+        """
+        INSERT INTO connections (
+            conn_id, username, resource_address, state, has_api,
+            created_at, last_seen_at
+        )
+        VALUES (?, 'alice', 'cluster.example', ?, 1, ?, ?)
+        """,
+        (conn_id, state, created_at, created_at),
+    )
+    await db.commit()
+
+
+async def _table_count(db, table: str, column: str, value: str) -> int:
+    """Count rows in ``table`` where ``column = value`` (test-only identifiers)."""
+    cur = await db.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (value,))
+    row = await cur.fetchone()
+    await cur.close()
+    return row[0]
+
+
+async def _seed_activity(db) -> None:
+    """Seed one old (11 days) and one new (9 days) request/finding/connection.
+
+    With ``RETENTION_DAYS = 10`` the ``old-*`` rows fall before the cutoff and the
+    ``new-*`` rows after it.
+    """
+    old, new = _days_ago(_RETENTION_DAYS + 1), _days_ago(_RETENTION_DAYS - 1)
+    await _insert_connection(db, "old-conn", _sqlite_now_format(old))
+    await _insert_connection(db, "new-conn", _sqlite_now_format(new))
+    await _insert_request(db, "old-req", "old-conn", _requested_at(old))
+    await _insert_request(db, "new-req", "new-conn", _requested_at(new))
+    await _insert_api_finding(db, "old-req")
+    await _insert_api_finding(db, "new-req")
+
+
+class _LogRecorder:
+    """Stand-in for the module's structlog logger; records ``info`` calls."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self.events.append((event, kwargs))
+
+
+@pytest.fixture
+def log_recorder(monkeypatch: pytest.MonkeyPatch) -> _LogRecorder:
+    recorder = _LogRecorder()
+    monkeypatch.setattr(retention_module, "log", recorder)
+    return recorder
+
+
+async def test_age_purge_removes_old_api_rows_findings_and_connections(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    db,
+) -> None:
+    """Rows older than RETENTION_DAYS go; newer ones stay (requests, findings, conns)."""
+    await _seed_activity(db)
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _table_count(db, "api_requests", "request_id", "old-req") == 0
+    assert await _table_count(db, "api_findings", "request_id", "old-req") == 0
+    assert await _table_count(db, "connections", "conn_id", "old-conn") == 0
+
+    assert await _table_count(db, "api_requests", "request_id", "new-req") == 1
+    assert await _table_count(db, "api_findings", "request_id", "new-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "new-conn") == 1
+
+
+async def test_age_purge_uses_same_cutoff_for_sessions_and_activity(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    db,
+) -> None:
+    """Sessions and API activity on each side of the cutoff are treated alike."""
+    await _seed_activity(db)
+    await _insert(db, "old-sess", started_at=_session_ts(_days_ago(_RETENTION_DAYS + 1)))
+    await _insert(db, "new-sess", started_at=_session_ts(_days_ago(_RETENTION_DAYS - 1)))
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _count(db, "old-sess") == 0
+    assert await _table_count(db, "api_requests", "request_id", "old-req") == 0
+    assert await _table_count(db, "connections", "conn_id", "old-conn") == 0
+    assert await _count(db, "new-sess") == 1
+    assert await _table_count(db, "api_requests", "request_id", "new-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "new-conn") == 1
+
+
+async def test_age_purge_activity_disabled_when_zero(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    db,
+) -> None:
+    """RETENTION_DAYS=0 keeps API rows, findings, and connections forever."""
+    await _seed_activity(db)
+    await _insert_connection(db, "ancient-conn", "2000-01-01 00:00:00")
+    await _insert_request(db, "ancient-req", "ancient-conn", "2000-01-01T00:00:00.000Z")
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=0,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _table_count(db, "api_requests", "request_id", "ancient-req") == 1
+    assert await _table_count(db, "api_requests", "request_id", "old-req") == 1
+    assert await _table_count(db, "api_findings", "request_id", "old-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "ancient-conn") == 1
+
+
+async def test_size_purge_leaves_api_rows_and_connections(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    casts_dir: Path,
+    db,
+) -> None:
+    """RETENTION_MAX_GB counts .cast bytes only and never deletes activity rows."""
+    await _seed_activity(db)
+    path = casts_dir / "big.cast"
+    path.write_bytes(b"x" * 1000)
+    await _insert(
+        db,
+        "big",
+        status="complete",
+        started_at="2026-01-01T00:00:00Z",
+        size_bytes=1000,
+        cast_path=str(path),
+    )
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=0,
+        retention_max_gb=1 / _1_GB,  # 1 byte cap
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _count(db, "big") == 0  # the size policy still ran
+    for req in ("old-req", "new-req"):
+        assert await _table_count(db, "api_requests", "request_id", req) == 1
+        assert await _table_count(db, "api_findings", "request_id", req) == 1
+    for conn in ("old-conn", "new-conn"):
+        assert await _table_count(db, "connections", "conn_id", conn) == 1
+
+
+async def test_purger_without_activity_store_leaves_api_rows(
+    repo: SessionRepository, cast_store: CastStore, db
+) -> None:
+    """A purger built without an ActivityStore purges sessions only (back-compat)."""
+    await _seed_activity(db)
+    await _insert(db, "old-sess", started_at="2000-01-01T00:00:00Z")
+
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=_RETENTION_DAYS, retention_max_gb=0
+    )
+    await purger.run()
+
+    assert await _count(db, "old-sess") == 0
+    assert await _table_count(db, "api_requests", "request_id", "old-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "old-conn") == 1
+
+
+async def test_purge_logs_activity_counters(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    log_recorder: _LogRecorder,
+    db,
+) -> None:
+    """run() logs purged_api_requests and purged_connections (counters only)."""
+    await _seed_activity(db)
+    await _insert(db, "old-sess", started_at="2000-01-01T00:00:00Z")
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert log_recorder.events == [
+        (
+            "retention.purge",
+            {
+                "purged_age": 1,
+                "purged_size": 0,
+                "purged_api_requests": 1,
+                "purged_connections": 1,
+            },
+        )
+    ]
+
+
+async def test_purge_logs_when_only_activity_purged(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    log_recorder: _LogRecorder,
+    db,
+) -> None:
+    """A run that deletes only API rows (no sessions) still logs its counters."""
+    await _seed_activity(db)
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert len(log_recorder.events) == 1
+    event, fields = log_recorder.events[0]
+    assert event == "retention.purge"
+    assert fields["purged_age"] == 0
+    assert fields["purged_api_requests"] == 1
+    assert fields["purged_connections"] == 1
+    # Counters only: every logged value is an int, never a URL or identifier.
+    assert all(isinstance(v, int) for v in fields.values())
+
+
+async def test_purge_logs_nothing_when_nothing_purged(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    log_recorder: _LogRecorder,
+    db,
+) -> None:
+    """A no-op run (only rows newer than the cutoff) emits no summary line."""
+    fresh = _days_ago(1)
+    await _insert_connection(db, "fresh-conn", _sqlite_now_format(fresh))
+    await _insert_request(db, "fresh-req", "fresh-conn", _requested_at(fresh))
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert log_recorder.events == []
+
+
+def test_no_new_retention_setting() -> None:
+    """API retention reuses RETENTION_DAYS: no new setting, no new purger knob."""
+    retention_fields = {
+        name for name in Settings.model_fields if "retention" in name or "purge" in name
+    }
+    assert retention_fields == {"retention_days", "retention_max_gb"}
+
+    params = set(inspect.signature(RetentionPurger.__init__).parameters) - {"self"}
+    assert params == {
+        "repo",
+        "casts",
+        "retention_days",
+        "retention_max_gb",
+        "search",
+        "activity",
+    }
+
+
+async def test_session_age_purge_unchanged_with_activity_store(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    casts_dir: Path,
+    db,
+) -> None:
+    """Supplying an ActivityStore does not change session purge semantics."""
+    old_path = casts_dir / "old.cast"
+    old_path.write_text("old content", encoding="utf-8")
+    await _insert(db, "old", started_at="2000-01-01T00:00:00Z", cast_path=str(old_path))
+    await _insert(db, "recent", started_at="2099-12-31T00:00:00Z")
+    await _insert(db, "no-ts", started_at=None)
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=1,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _count(db, "old") == 0
+    assert not old_path.exists()
+    assert await _count(db, "recent") == 1
+    assert await _count(db, "no-ts") == 1
+
+
+async def test_age_purge_removes_future_dated_api_row_by_created_at(
+    repo: SessionRepository,
+    cast_store: CastStore,
+    activity_store: ActivityStore,
+    db,
+) -> None:
+    """Security F5: a request the Gateway dated 9999 is still purged once its
+    server-assigned created_at is past the cutoff (findings go with it)."""
+    await _insert_request(db, "future-req", "future-conn", "9999-01-01T00:00:00.000Z")
+    await _insert_api_finding(db, "future-req")
+    await db.execute(
+        "UPDATE api_requests SET created_at = ? WHERE request_id = ?",
+        (_sqlite_now_format(_days_ago(_RETENTION_DAYS + 1)), "future-req"),
+    )
+    # A future-dated row inserted recently is not yet due.
+    await _insert_request(db, "future-fresh", "future-conn", "9999-01-01T00:00:00.000Z")
+    await db.commit()
+
+    purger = RetentionPurger(
+        repo=repo,
+        casts=cast_store,
+        retention_days=_RETENTION_DAYS,
+        retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _table_count(db, "api_requests", "request_id", "future-req") == 0
+    assert await _table_count(db, "api_findings", "request_id", "future-req") == 0
+    assert await _table_count(db, "api_requests", "request_id", "future-fresh") == 1

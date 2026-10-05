@@ -1,0 +1,705 @@
+"""kubectl activity store: connections, API-request metadata, and API findings.
+
+Raw, parameterized SQL over three tables (see ``gatorcast.db``):
+
+  * ``connections``  — hidden per-``conn_id`` state (``pending | recording | api |
+    error``). An ``Authenticated connection`` line creates a *pending* connection
+    here instead of a visible ``sessions`` row (spec §6).
+  * ``api_requests`` — one row of allowlisted metadata per Gateway API-request audit
+    line, deduplicated by ``request_id`` (``INSERT OR IGNORE``) so at-least-once
+    redelivery never creates a duplicate request or duplicate findings.
+  * ``api_findings`` — rule findings on API requests, cascade-deleted with their
+    request.
+
+It also resolves exec/attach recordings for a set of audit ``request_id`` values
+(``recordings_for_requests``), reading ``sessions.request_id`` — the only link from
+a command to its recording (spec §3: never ``conn_id``).
+
+Security (CLAUDE.md rules 2, 5, 9):
+  * Only the fields of :class:`~gatorcast.models.ApiRequest` are stored; that model
+    is already allowlisted by the classifier (no ``Authorization``, cookies, other
+    headers, response headers, ``remote_addr``, or ``panic``).
+  * Nothing here logs. Callers log counters and ``conn_id`` only — never a URL,
+    header value, or raw audit line.
+  * All user-influenced values (``request_id``, user, bounds) are bound parameters.
+
+Timestamps: ``api_requests.requested_at`` is stored as ``YYYY-MM-DDTHH:MM:SS.mmmZ``
+and compared lexicographically, so every time bound passed in is first normalized
+to that exact format by :func:`to_requested_at_format`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import aiosqlite
+
+from gatorcast.models import ApiRequest
+from gatorcast.pipeline.detect import Finding
+
+# Valid ``connections.state`` values (spec §5/§6).
+CONNECTION_STATES: frozenset[str] = frozenset({"pending", "recording", "api", "error"})
+
+# SQLite's default bound-parameter limit is 999 on older builds; stay well under it.
+_IN_CHUNK = 500
+
+# Default row cap for bounded reads; matches the route's ``_ACTIVITY_MAX_ROWS``.
+DEFAULT_MAX_ROWS = 20000
+
+
+# --- row types -----------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionRow:
+    """One ``connections`` row: hidden per-connection lifecycle state."""
+
+    conn_id: str
+    user_id: str | None
+    username: str | None
+    resource_address: str | None
+    started_at: str | None
+    state: str
+    has_api: bool
+    created_at: str | None
+    last_seen_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ApiRequestRow:
+    """One ``api_requests`` row: allowlisted metadata for a single API request."""
+
+    request_id: str
+    conn_id: str
+    resource_address: str | None
+    user_key: str | None
+    user_id: str | None
+    username: str | None
+    requested_at: str
+    method: str
+    url: str
+    status_code: int | None
+    outcome: str
+    kubectl_command: str | None
+    kubectl_session: str | None
+    user_agent: str | None
+    created_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ApiFindingRow:
+    """One ``api_findings`` row: rule metadata only, never request content."""
+
+    id: int
+    request_id: str
+    rule_id: str
+    category: str
+    severity: str
+    label: str
+    created_at: str | None
+
+
+_CONNECTION_COLUMNS = (
+    "conn_id, user_id, username, resource_address, started_at, state, has_api, "
+    "created_at, last_seen_at"
+)
+
+_REQUEST_COLUMNS = (
+    "request_id, conn_id, resource_address, user_key, user_id, username, "
+    "requested_at, method, url, status_code, outcome, kubectl_command, "
+    "kubectl_session, user_agent, created_at"
+)
+
+_FINDING_COLUMNS = "id, request_id, rule_id, category, severity, label, created_at"
+
+
+def _row_to_connection(row: aiosqlite.Row) -> ConnectionRow:
+    """Map a ``connections`` row to a :class:`ConnectionRow`."""
+    return ConnectionRow(
+        conn_id=row["conn_id"],
+        user_id=row["user_id"],
+        username=row["username"],
+        resource_address=row["resource_address"],
+        started_at=row["started_at"],
+        state=row["state"],
+        has_api=bool(row["has_api"]),
+        created_at=row["created_at"],
+        last_seen_at=row["last_seen_at"],
+    )
+
+
+def _row_to_request(row: aiosqlite.Row) -> ApiRequestRow:
+    """Map an ``api_requests`` row to an :class:`ApiRequestRow`."""
+    return ApiRequestRow(
+        request_id=row["request_id"],
+        conn_id=row["conn_id"],
+        resource_address=row["resource_address"],
+        user_key=row["user_key"],
+        user_id=row["user_id"],
+        username=row["username"],
+        requested_at=row["requested_at"],
+        method=row["method"],
+        url=row["url"],
+        status_code=row["status_code"],
+        outcome=row["outcome"],
+        kubectl_command=row["kubectl_command"],
+        kubectl_session=row["kubectl_session"],
+        user_agent=row["user_agent"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_finding(row: aiosqlite.Row) -> ApiFindingRow:
+    """Map an ``api_findings`` row to an :class:`ApiFindingRow`."""
+    return ApiFindingRow(
+        id=row["id"],
+        request_id=row["request_id"],
+        rule_id=row["rule_id"],
+        category=row["category"],
+        severity=row["severity"],
+        label=row["label"],
+        created_at=row["created_at"],
+    )
+
+
+def to_requested_at_format(value: str | datetime) -> str:
+    """Normalize a time bound to the stored ``YYYY-MM-DDTHH:MM:SS.mmmZ`` format.
+
+    ``api_requests.requested_at`` is compared as a string, so a bound in any other
+    ISO 8601 shape (``+00:00`` offset, no fraction, microseconds) would compare
+    wrongly at the boundary. Naive values are taken as UTC; aware values are
+    converted to UTC. Sub-millisecond precision is truncated.
+
+    Args:
+        value: An ISO 8601 string (``Z`` or offset suffix accepted) or a datetime.
+
+    Returns:
+        The UTC timestamp in the stored millisecond ``Z`` format.
+
+    Raises:
+        ValueError: If ``value`` is a string that is not parseable ISO 8601.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(value.strip())
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+    # Explicit zero-padding: ``%Y`` does not pad years below 1000 on glibc, which
+    # would break both the lexicographic compare and SQLite's ``datetime()``.
+    return (
+        f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T"
+        f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}."
+        f"{dt.microsecond // 1000:03d}Z"
+    )
+
+
+def _chunks(values: Sequence[str], size: int = _IN_CHUNK) -> Iterable[Sequence[str]]:
+    """Yield consecutive slices of ``values`` of at most ``size`` items."""
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _unique(values: Iterable[str]) -> list[str]:
+    """Return ``values`` de-duplicated, preserving first-seen order."""
+    return list(dict.fromkeys(values))
+
+
+class ActivityStore:
+    """Async repository over ``connections``, ``api_requests`` and ``api_findings``."""
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        """Initialize the store.
+
+        Args:
+            db: An open aiosqlite connection (WAL, ``aiosqlite.Row`` factory,
+                ``foreign_keys=ON`` as set by :func:`gatorcast.db.connect`).
+        """
+        self._db = db
+
+    # --- connections -----------------------------------------------------------
+
+    async def upsert_connection_start(
+        self,
+        conn_id: str,
+        user_id: str | None,
+        username: str | None,
+        resource_address: str | None,
+        started_at: str | None,
+    ) -> None:
+        """Record an ``Authenticated connection`` line as a pending connection.
+
+        Inserts a ``pending`` row, or refreshes an existing one: identity and
+        cluster fields take the incoming non-null value (``COALESCE``),
+        ``started_at`` keeps its first value, ``last_seen_at`` is bumped, and
+        ``state``/``has_api`` are never changed on conflict (a connection already
+        promoted to ``recording``/``api`` stays there).
+
+        Then backfills ``resource_address`` onto any of this connection's API
+        requests that arrived before the start line (stored with a NULL cluster).
+
+        Args:
+            conn_id: The connection id (primary key).
+            user_id: Gateway ``user.id``, if present.
+            username: Envelope ``user.username`` (identity), if present.
+            resource_address: Target system / cluster, if present.
+            started_at: Start-line timestamp, if present.
+        """
+        await self._db.execute(
+            """
+            INSERT INTO connections (
+                conn_id, user_id, username, resource_address, started_at,
+                state, has_api, created_at, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'pending', 0, datetime('now'), datetime('now'))
+            ON CONFLICT(conn_id) DO UPDATE SET
+                user_id          = COALESCE(excluded.user_id, connections.user_id),
+                username         = COALESCE(excluded.username, connections.username),
+                resource_address = COALESCE(excluded.resource_address, connections.resource_address),
+                started_at       = COALESCE(connections.started_at, excluded.started_at),
+                last_seen_at     = datetime('now')
+            """,
+            (conn_id, user_id, username, resource_address, started_at),
+        )
+        if resource_address is not None:
+            await self._db.execute(
+                "UPDATE api_requests SET resource_address = ? "
+                "WHERE conn_id = ? AND resource_address IS NULL",
+                (resource_address, conn_id),
+            )
+        await self._db.commit()
+
+    async def get_connection(self, conn_id: str) -> ConnectionRow | None:
+        """Fetch one connection by id.
+
+        Args:
+            conn_id: The connection id to look up.
+
+        Returns:
+            The :class:`ConnectionRow`, or ``None`` if the connection is unknown.
+        """
+        cursor = await self._db.execute(
+            f"SELECT {_CONNECTION_COLUMNS} FROM connections WHERE conn_id = ?",
+            (conn_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return _row_to_connection(row) if row is not None else None
+
+    async def set_state(self, conn_id: str, state: str, *, has_api: bool = False) -> None:
+        """Set a connection's lifecycle state (upsert).
+
+        Inserts a minimal row (no identity, no cluster) when the start line was
+        never seen, e.g. an audit line that arrived first. ``has_api`` is sticky:
+        passing ``True`` sets it, passing ``False`` never clears it. ``last_seen_at``
+        is bumped.
+
+        Args:
+            conn_id: The connection id.
+            state: One of ``pending``, ``recording``, ``api``, ``error``.
+            has_api: True when an API audit line has arrived on this connection.
+
+        Raises:
+            ValueError: If ``state`` is not a known connection state.
+        """
+        if state not in CONNECTION_STATES:
+            raise ValueError(f"unknown connection state: {state!r}")
+        await self._db.execute(
+            """
+            INSERT INTO connections (conn_id, state, has_api, created_at, last_seen_at)
+            VALUES (?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(conn_id) DO UPDATE SET
+                state        = excluded.state,
+                has_api      = MAX(connections.has_api, excluded.has_api),
+                last_seen_at = datetime('now')
+            """,
+            (conn_id, state, 1 if has_api else 0),
+        )
+        await self._db.commit()
+
+    async def expire_pending(self, max_idle_seconds: int) -> list[ConnectionRow]:
+        """Move pending connections idle longer than the backstop to ``error``.
+
+        Selects ``state = 'pending' AND last_seen_at < datetime('now', '-N seconds')``
+        and flips them to ``error`` in one atomic ``UPDATE … RETURNING``, so a
+        connection touched concurrently is never expired by a stale read. Uses
+        SQLite wall-clock time, so it is correct across restarts.
+
+        Args:
+            max_idle_seconds: The backstop window (``SESSION_MAX_IDLE_SECONDS``).
+
+        Returns:
+            The expired connections (with ``state == 'error'``), oldest first. The
+            caller surfaces each as a visible ``error`` session row.
+        """
+        modifier = f"-{max(0, int(max_idle_seconds))} seconds"
+        cursor = await self._db.execute(
+            f"""
+            UPDATE connections SET state = 'error'
+            WHERE state = 'pending' AND last_seen_at < datetime('now', ?)
+            RETURNING {_CONNECTION_COLUMNS}
+            """,
+            (modifier,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        await self._db.commit()
+        expired = [_row_to_connection(row) for row in rows]
+        expired.sort(key=lambda c: (c.last_seen_at or "", c.conn_id))
+        return expired
+
+    # --- API requests + findings ------------------------------------------------
+
+    async def insert_request(self, req: ApiRequest, resource_address: str | None) -> bool:
+        """Store one API request with no findings, ignoring a redelivered duplicate.
+
+        Equivalent to :meth:`insert_request_with_findings` with an empty findings
+        list. ``INSERT OR IGNORE`` keyed on ``request_id``. ``user_key`` is
+        ``user_id``, else ``username``. Only the allowlisted :class:`ApiRequest`
+        fields are written.
+
+        Args:
+            req: The classified, allowlisted API request.
+            resource_address: The cluster, from the connection (``None`` until the
+                start line is seen; :meth:`upsert_connection_start` backfills it).
+
+        Returns:
+            True if a new row was inserted; False if ``request_id`` already existed.
+        """
+        return await self.insert_request_with_findings(req, resource_address, ())
+
+    async def insert_request_with_findings(
+        self,
+        req: ApiRequest,
+        resource_address: str | None,
+        findings: Sequence[Finding],
+    ) -> bool:
+        """Store one API request and its findings atomically (one transaction).
+
+        The request row (``INSERT OR IGNORE`` keyed on ``request_id``) and, only if
+        that row is new, its findings are written in a single transaction with a
+        single commit. So either both land or neither does:
+
+          * a redelivered line (``request_id`` already stored) inserts nothing — no
+            duplicate request, no duplicate findings;
+          * if anything fails between the two inserts the whole unit is rolled
+            back and the error propagates, so a redelivery of the same line retries
+            the request *and* its findings (they can never be lost to a dedup hit).
+
+        Only the allowlisted :class:`ApiRequest` fields and rule metadata are
+        written; ``offset_seconds`` is not stored (API findings have none).
+
+        Args:
+            req: The classified, allowlisted API request.
+            resource_address: The cluster, from the connection (``None`` until the
+                start line is seen; :meth:`upsert_connection_start` backfills it).
+            findings: The findings from ``detect_api`` (computed by the caller
+                before this call); empty stores the request alone.
+
+        Returns:
+            True if a new request row was inserted (with its findings); False if
+            ``request_id`` already existed (nothing written).
+
+        Raises:
+            Exception: Any database error, after the transaction is rolled back.
+        """
+        try:
+            inserted = await self._insert_request_row(req, resource_address)
+            if inserted:
+                await self._insert_finding_rows(req.request_id, findings)
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
+        return inserted
+
+    async def _insert_request_row(self, req: ApiRequest, resource_address: str | None) -> bool:
+        """Execute the ``INSERT OR IGNORE`` for one request (no commit).
+
+        Returns:
+            True if a new row was inserted; False if ``request_id`` already existed.
+        """
+        cursor = await self._db.execute(
+            """
+            INSERT OR IGNORE INTO api_requests (
+                request_id, conn_id, resource_address, user_key, user_id, username,
+                requested_at, method, url, status_code, outcome,
+                kubectl_command, kubectl_session, user_agent
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                req.request_id,
+                req.conn_id,
+                resource_address,
+                req.user_id or req.username,
+                req.user_id,
+                req.username,
+                req.requested_at,
+                req.method,
+                req.url,
+                req.status_code,
+                req.outcome,
+                req.kubectl_command,
+                req.kubectl_session,
+                req.user_agent,
+            ),
+        )
+        inserted = cursor.rowcount == 1
+        await cursor.close()
+        return inserted
+
+    async def _insert_finding_rows(self, request_id: str, findings: Sequence[Finding]) -> None:
+        """Execute the ``api_findings`` inserts for one request (no commit).
+
+        Args:
+            request_id: The request the findings belong to (must exist).
+            findings: The findings to store; empty is a no-op.
+        """
+        if not findings:
+            return
+        await self._db.executemany(
+            """
+            INSERT INTO api_findings (request_id, rule_id, category, severity, label)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [(request_id, f.rule_id, f.category, f.severity, f.label) for f in findings],
+        )
+
+    async def insert_api_findings(self, request_id: str, findings: Sequence[Finding]) -> None:
+        """Store rule findings for an already-stored API request (own transaction).
+
+        The ingest path uses :meth:`insert_request_with_findings` instead, so a
+        request and its findings commit together. This stays for direct use (tests,
+        seeding). ``offset_seconds`` is not stored (API findings have none). No
+        matched text exists to store.
+
+        Args:
+            request_id: The request the findings belong to (must exist).
+            findings: The findings from ``detect_api``; empty is a no-op.
+        """
+        if not findings:
+            return
+        try:
+            await self._insert_finding_rows(request_id, findings)
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
+
+    async def requests_for_system(
+        self,
+        resource_address: str | None,
+        since: str | datetime,
+        until: str | datetime,
+        limit: int = DEFAULT_MAX_ROWS,
+    ) -> list[ApiRequestRow]:
+        """List a cluster's API requests in a time window, for activity grouping.
+
+        The window is half-open, ``since <= requested_at < until``, so adjacent
+        pages (``until`` of one = ``since`` of the next) never repeat a request.
+        ``resource_address IS ?`` matches the NULL (unknown cluster) bucket too.
+        Ordered ``user_key, requested_at`` as ``group_activity`` requires.
+
+        Args:
+            resource_address: The cluster, or ``None`` for the unknown bucket.
+            since: Inclusive lower bound (ISO 8601 string or datetime).
+            until: Exclusive upper bound (ISO 8601 string or datetime).
+            limit: Maximum rows returned. A result of exactly ``limit`` rows means
+                the window may be truncated.
+
+        Returns:
+            The matching :class:`ApiRequestRow` list.
+
+        Raises:
+            ValueError: If a string bound is not parseable ISO 8601.
+        """
+        cursor = await self._db.execute(
+            f"""
+            SELECT {_REQUEST_COLUMNS}
+            FROM api_requests
+            WHERE resource_address IS ? AND requested_at >= ? AND requested_at < ?
+            ORDER BY user_key, requested_at, request_id
+            LIMIT ?
+            """,
+            (
+                resource_address,
+                to_requested_at_format(since),
+                to_requested_at_format(until),
+                max(1, int(limit)),
+            ),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [_row_to_request(row) for row in rows]
+
+    async def requests_in_bounds(
+        self,
+        resource_address: str | None,
+        user_key: str | None,
+        from_: str | datetime,
+        to: str | datetime,
+        limit: int = DEFAULT_MAX_ROWS,
+    ) -> list[ApiRequestRow]:
+        """List one user's requests on one cluster within an activity session's bounds.
+
+        Bounds are inclusive (``from_ <= requested_at <= to``) because they are an
+        activity session's own first and last ``requested_at``. ``IS ?`` matches the
+        NULL cluster and NULL user buckets.
+
+        Args:
+            resource_address: The cluster, or ``None`` for the unknown bucket.
+            user_key: The ``user_key`` (user id, else username), or ``None``.
+            from_: Inclusive lower bound (ISO 8601 string or datetime).
+            to: Inclusive upper bound (ISO 8601 string or datetime).
+            limit: Maximum rows returned.
+
+        Returns:
+            The matching :class:`ApiRequestRow` list, ordered by ``requested_at``.
+
+        Raises:
+            ValueError: If a string bound is not parseable ISO 8601.
+        """
+        cursor = await self._db.execute(
+            f"""
+            SELECT {_REQUEST_COLUMNS}
+            FROM api_requests
+            WHERE resource_address IS ? AND user_key IS ?
+              AND requested_at >= ? AND requested_at <= ?
+            ORDER BY requested_at, request_id
+            LIMIT ?
+            """,
+            (
+                resource_address,
+                user_key,
+                to_requested_at_format(from_),
+                to_requested_at_format(to),
+                max(1, int(limit)),
+            ),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [_row_to_request(row) for row in rows]
+
+    async def findings_for_requests(
+        self, request_ids: Iterable[str]
+    ) -> dict[str, list[ApiFindingRow]]:
+        """Fetch the findings for a set of requests, grouped by ``request_id``.
+
+        Queried with ``IN (…)`` in chunks of 500 bound parameters.
+
+        Args:
+            request_ids: Request ids to look up (duplicates are ignored).
+
+        Returns:
+            ``request_id → findings`` (in insertion order). Requests with no
+            findings are absent from the mapping.
+        """
+        ids = _unique(request_ids)
+        result: dict[str, list[ApiFindingRow]] = {}
+        for chunk in _chunks(ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"SELECT {_FINDING_COLUMNS} FROM api_findings "
+                f"WHERE request_id IN ({placeholders}) ORDER BY id",
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                finding = _row_to_finding(row)
+                result.setdefault(finding.request_id, []).append(finding)
+        return result
+
+    async def recordings_for_requests(self, request_ids: Iterable[str]) -> dict[str, str]:
+        """Map audit ``request_id`` values to the ``conn_id`` of their recording.
+
+        Reads ``sessions.request_id`` (set from k8s exec/attach chunk lines), which
+        equals the exec's status-101 audit line ``request_id``. This is the only
+        recording link: one exec run can span two connections, so ``conn_id`` is
+        never used to join. Queried in chunks of 500 bound parameters. If more than
+        one session carries the same ``request_id``, the earliest-started wins.
+
+        Args:
+            request_ids: Audit request ids to resolve (duplicates are ignored).
+
+        Returns:
+            ``request_id → recording conn_id`` for every id that has a recording.
+        """
+        ids = _unique(request_ids)
+        result: dict[str, str] = {}
+        for chunk in _chunks(ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"""
+                SELECT request_id, conn_id
+                FROM sessions
+                WHERE request_id IN ({placeholders})
+                ORDER BY COALESCE(started_at, created_at), conn_id
+                """,
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                result.setdefault(row["request_id"], row["conn_id"])
+        return result
+
+    # --- retention -------------------------------------------------------------
+
+    async def purge_before(self, iso_cutoff: str | datetime) -> tuple[int, int]:
+        """Delete API requests and connections older than the retention cutoff.
+
+        An ``api_requests`` row is purged when *either* clock says it is old:
+        ``requested_at < cutoff`` (the Gateway's timestamp) OR
+        ``datetime(created_at) < datetime(cutoff)`` (the server's own insert time).
+        ``requested_at`` is Gateway-supplied, so a row dated in the future (e.g.
+        ``9999-01-01T…Z``) would otherwise survive every purge; ``created_at`` is
+        always server-assigned and bounds it. The row's ``api_findings`` go with it
+        under the same condition — deleted explicitly as well as by the FK cascade,
+        so the purge is correct even on a connection without ``foreign_keys=ON``.
+
+        ``connections`` rows are purged on server time only:
+        ``COALESCE(datetime(created_at), datetime(last_seen_at)) < datetime(cutoff)``.
+        Both columns are server-assigned (``datetime('now')``), never Gateway-supplied
+        (``started_at`` is not consulted), so a forged future timestamp cannot pin a
+        connection; ``last_seen_at`` covers a row whose ``created_at`` is missing.
+
+        One transaction; rolled back on error.
+
+        Args:
+            iso_cutoff: The retention cutoff (ISO 8601 string or datetime), the
+                same one used for sessions.
+
+        Returns:
+            ``(api_requests_deleted, connections_deleted)``.
+
+        Raises:
+            ValueError: If ``iso_cutoff`` is a string that is not parseable ISO 8601.
+        """
+        cutoff = to_requested_at_format(iso_cutoff)
+        request_is_old = "requested_at < ? OR datetime(created_at) < datetime(?)"
+        try:
+            await self._db.execute(
+                "DELETE FROM api_findings WHERE request_id IN "
+                f"(SELECT request_id FROM api_requests WHERE {request_is_old})",
+                (cutoff, cutoff),
+            )
+            cursor = await self._db.execute(
+                f"DELETE FROM api_requests WHERE {request_is_old}", (cutoff, cutoff)
+            )
+            requests_deleted = max(cursor.rowcount, 0)
+            await cursor.close()
+            cursor = await self._db.execute(
+                "DELETE FROM connections WHERE "
+                "COALESCE(datetime(created_at), datetime(last_seen_at)) < datetime(?)",
+                (cutoff,),
+            )
+            connections_deleted = max(cursor.rowcount, 0)
+            await cursor.close()
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
+        return requests_deleted, connections_deleted

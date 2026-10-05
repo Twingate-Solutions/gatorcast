@@ -758,3 +758,225 @@ async def test_sidecar_key_separation_fails_with_cast_info(
     reader = CastStore(casts_dir, sidecar_cryptor=Cryptor(key))
     with pytest.raises(InvalidTag):
         await reader.read_sidecar("conn-sep")
+
+
+# ---------------------------------------------------------------------------
+# SessionRepository — request_id (Session 9, kubectl activity)
+# ---------------------------------------------------------------------------
+
+
+async def _request_id_of(db, conn_id: str) -> str | None:
+    """Helper: read sessions.request_id straight from the table."""
+    cur = await db.execute("SELECT request_id FROM sessions WHERE conn_id = ?", (conn_id,))
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    return row["request_id"]
+
+
+async def _progress(repo: SessionRepository, conn_id: str, **kwargs) -> None:
+    """Helper: call update_progress with fixed boilerplate metadata."""
+    await repo.update_progress(
+        conn_id,
+        username="u@x",
+        shell_user=None,
+        started_at=None,
+        ended_at=None,
+        duration_seconds=1.0,
+        width=80,
+        height=24,
+        chunk_count=1,
+        size_bytes=10,
+        cast_path="/data/casts/x.cast",
+        **kwargs,
+    )
+
+
+async def test_add_chunk_meta_stores_request_id(repo: SessionRepository, db) -> None:
+    """add_chunk_meta writes the k8s request_id on the new provisional row."""
+    await repo.add_chunk_meta("rid-1", "u@x", "2026-10-01T10:00:00Z", request_id="R1")
+    assert await _request_id_of(db, "rid-1") == "R1"
+
+
+async def test_add_chunk_meta_request_id_defaults_to_null(repo: SessionRepository, db) -> None:
+    """An SSH chunk (no request_id) leaves the column NULL."""
+    await repo.add_chunk_meta("rid-ssh", "u@x", "2026-10-01T10:00:00Z")
+    assert await _request_id_of(db, "rid-ssh") is None
+
+
+async def test_add_chunk_meta_request_id_keeps_first_value(
+    repo: SessionRepository, db
+) -> None:
+    """A later chunk with a different request_id never overwrites the first."""
+    await repo.add_chunk_meta("rid-2", "u@x", None, request_id="FIRST")
+    await repo.add_chunk_meta("rid-2", "u@x", None, request_id="SECOND")
+    assert await _request_id_of(db, "rid-2") == "FIRST"
+
+
+async def test_add_chunk_meta_request_id_none_does_not_clear(
+    repo: SessionRepository, db
+) -> None:
+    """A later chunk without a request_id keeps the stored one."""
+    await repo.add_chunk_meta("rid-3", "u@x", None, request_id="FIRST")
+    await repo.add_chunk_meta("rid-3", "u@x", None)
+    assert await _request_id_of(db, "rid-3") == "FIRST"
+
+
+async def test_add_chunk_meta_request_id_backfills_null(repo: SessionRepository, db) -> None:
+    """A row created without a request_id gains one from a later chunk."""
+    await repo.add_chunk_meta("rid-4", "u@x", None)
+    assert await _request_id_of(db, "rid-4") is None
+    await repo.add_chunk_meta("rid-4", "u@x", None, request_id="LATE")
+    assert await _request_id_of(db, "rid-4") == "LATE"
+
+
+async def test_upsert_start_does_not_set_or_clear_request_id(
+    repo: SessionRepository, db
+) -> None:
+    """upsert_start carries no request_id: it leaves NULL as NULL and a set value intact."""
+    await repo.upsert_start("rid-5", "u@x", "host", None)
+    assert await _request_id_of(db, "rid-5") is None
+    await repo.add_chunk_meta("rid-5", "u@x", None, request_id="KEEP")
+    await repo.upsert_start("rid-5", "u@x", "host", None)
+    assert await _request_id_of(db, "rid-5") == "KEEP"
+
+
+async def test_update_progress_request_id_keeps_first_value(
+    repo: SessionRepository, db
+) -> None:
+    """update_progress COALESCEs: an existing request_id is not replaced."""
+    await repo.add_chunk_meta("rid-6", "u@x", None, request_id="FIRST")
+    await _progress(repo, "rid-6", request_id="SECOND")
+    assert await _request_id_of(db, "rid-6") == "FIRST"
+
+
+async def test_update_progress_request_id_backfills_null(repo: SessionRepository, db) -> None:
+    """update_progress sets request_id when the row has none."""
+    await repo.add_chunk_meta("rid-7", "u@x", None)
+    await _progress(repo, "rid-7", request_id="FROM-PROGRESS")
+    assert await _request_id_of(db, "rid-7") == "FROM-PROGRESS"
+
+
+async def test_update_progress_without_request_id_keeps_existing(
+    repo: SessionRepository, db
+) -> None:
+    """Omitting request_id (default None) does not clear a stored value."""
+    await repo.add_chunk_meta("rid-8", "u@x", None, request_id="KEEP")
+    await _progress(repo, "rid-8")
+    assert await _request_id_of(db, "rid-8") == "KEEP"
+
+
+async def test_update_progress_request_id_ignored_on_sealed_row(
+    repo: SessionRepository, db
+) -> None:
+    """update_progress only touches provisional rows; a complete row's request_id is fixed."""
+    await db.execute(
+        "INSERT INTO sessions (conn_id, status, request_id) VALUES ('rid-9', 'complete', NULL)"
+    )
+    await db.commit()
+    await _progress(repo, "rid-9", request_id="TOO-LATE")
+    assert await _request_id_of(db, "rid-9") is None
+
+
+async def test_session_model_exposes_request_id(repo: SessionRepository) -> None:
+    """get() and list_sessions() return request_id on the Session model."""
+    await repo.add_chunk_meta("rid-10", "u@x", "2026-10-01T10:00:00Z", request_id="R10")
+    await repo.upsert_start("rid-11", "u@x", "host", "2026-10-01T10:00:01Z")  # no request_id
+
+    got = await repo.get("rid-10")
+    assert got is not None and got.request_id == "R10"
+    ssh = await repo.get("rid-11")
+    assert ssh is not None and ssh.request_id is None
+
+
+# ---------------------------------------------------------------------------
+# SessionRepository — delete_start_only_error (Session 9)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_raw_session(db, conn_id: str, status: str, **cols) -> None:
+    """Helper: insert a sessions row with explicit status and extra columns."""
+    names = ["conn_id", "status", *cols]
+    placeholders = ", ".join("?" for _ in names)
+    await db.execute(
+        f"INSERT INTO sessions ({', '.join(names)}) VALUES ({placeholders})",
+        (conn_id, status, *cols.values()),
+    )
+    await db.commit()
+
+
+async def _session_exists(db, conn_id: str) -> bool:
+    """Helper: True if a sessions row exists."""
+    cur = await db.execute("SELECT 1 FROM sessions WHERE conn_id = ?", (conn_id,))
+    row = await cur.fetchone()
+    await cur.close()
+    return row is not None
+
+
+async def test_delete_start_only_error_true_deletes_row(repo: SessionRepository, db) -> None:
+    """A chunkless, cast-less error row is deleted and True is returned."""
+    await _insert_raw_session(db, "dse-1", "error", chunk_count=0)
+    assert await repo.delete_start_only_error("dse-1") is True
+    assert not await _session_exists(db, "dse-1")
+
+
+async def test_delete_start_only_error_null_chunk_count_counts_as_zero(
+    repo: SessionRepository, db
+) -> None:
+    """A NULL chunk_count is treated as zero chunks."""
+    await _insert_raw_session(db, "dse-2", "error", chunk_count=None)
+    assert await repo.delete_start_only_error("dse-2") is True
+    assert not await _session_exists(db, "dse-2")
+
+
+async def test_delete_start_only_error_false_for_missing_row(repo: SessionRepository) -> None:
+    """An unknown conn_id returns False."""
+    assert await repo.delete_start_only_error("no-such-conn") is False
+
+
+async def test_delete_start_only_error_false_when_row_has_chunks(
+    repo: SessionRepository, db
+) -> None:
+    """An error row that received chunks is kept."""
+    await _insert_raw_session(db, "dse-3", "error", chunk_count=3)
+    assert await repo.delete_start_only_error("dse-3") is False
+    assert await _session_exists(db, "dse-3")
+
+
+async def test_delete_start_only_error_false_when_row_has_cast_path(
+    repo: SessionRepository, db
+) -> None:
+    """An error row pointing at a .cast file is kept even with chunk_count 0."""
+    await _insert_raw_session(
+        db, "dse-4", "error", chunk_count=0, cast_path="/data/casts/dse-4.cast"
+    )
+    assert await repo.delete_start_only_error("dse-4") is False
+    assert await _session_exists(db, "dse-4")
+
+
+@pytest.mark.parametrize("status", ["provisional", "complete"])
+async def test_delete_start_only_error_false_for_non_error_status(
+    repo: SessionRepository, db, status: str
+) -> None:
+    """Only error rows are deletable; provisional and complete rows are never removed."""
+    await _insert_raw_session(db, "dse-5", status, chunk_count=0)
+    assert await repo.delete_start_only_error("dse-5") is False
+    assert await _session_exists(db, "dse-5")
+
+
+async def test_delete_start_only_error_only_targets_given_conn_id(
+    repo: SessionRepository, db
+) -> None:
+    """Other start-only error rows are untouched."""
+    await _insert_raw_session(db, "dse-a", "error", chunk_count=0)
+    await _insert_raw_session(db, "dse-b", "error", chunk_count=0)
+    assert await repo.delete_start_only_error("dse-a") is True
+    assert not await _session_exists(db, "dse-a")
+    assert await _session_exists(db, "dse-b")
+
+
+async def test_delete_start_only_error_second_call_false(repo: SessionRepository, db) -> None:
+    """Deleting twice returns True then False."""
+    await _insert_raw_session(db, "dse-6", "error", chunk_count=0)
+    assert await repo.delete_start_only_error("dse-6") is True
+    assert await repo.delete_start_only_error("dse-6") is False

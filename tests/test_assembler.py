@@ -1,4 +1,5 @@
-"""Tests for pipeline.assembler: parsing, reassembly, finalize, idle, sweep."""
+"""Tests for pipeline.assembler: parsing, reassembly, finalize, idle, sweep, and the
+connection lifecycle (pending → recording / api / error, kubectl activity spec §6)."""
 
 from __future__ import annotations
 
@@ -12,12 +13,13 @@ import pytest
 from gatorcast.crypto import Cryptor
 
 from gatorcast.db import init_db
-from gatorcast.models import RecordingChunk, SessionEnd, SessionStart
+from gatorcast.models import ApiRequest, RecordingChunk, SessionEnd, SessionStart
 from gatorcast.pipeline.assembler import (
     Assembler,
     parse_asciicast,
     reassemble_asciicast,
 )
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -65,6 +67,7 @@ async def _make(
         idle_timeout_seconds=idle,
         session_max_idle_seconds=max_idle,
         clock=clock or (lambda: 0.0),
+        activity=ActivityStore(db),
     )
     return asm, db
 
@@ -82,6 +85,7 @@ async def _make_with_search(
         casts=casts,
         idle_timeout_seconds=idle,
         clock=lambda: 0.0,
+        activity=ActivityStore(db),
         search=search,
         detection_enabled=detection_enabled,
     )
@@ -100,6 +104,69 @@ async def _row(db: aiosqlite.Connection, conn_id: str) -> aiosqlite.Row | None:
     row = await cur.fetchone()
     await cur.close()
     return row
+
+
+async def _conn(db: aiosqlite.Connection, conn_id: str) -> aiosqlite.Row | None:
+    """Fetch one ``connections`` row (hidden per-connection lifecycle state)."""
+    cur = await db.execute("SELECT * FROM connections WHERE conn_id = ?", (conn_id,))
+    row = await cur.fetchone()
+    await cur.close()
+    return row
+
+
+async def _count(db: aiosqlite.Connection, sql: str, params: tuple = ()) -> int:
+    """Run a ``COUNT(*)`` query and return the number."""
+    cur = await db.execute(sql, params)
+    row = await cur.fetchone()
+    await cur.close()
+    return int(row[0])
+
+
+async def _age_connection(db: aiosqlite.Connection, conn_id: str) -> None:
+    """Backdate a connection's ``last_seen_at`` past any backstop window.
+
+    The pending backstop ages connections on SQLite wall-clock time (so it
+    survives restarts), not on the assembler's injectable monotonic clock.
+    """
+    await db.execute(
+        "UPDATE connections SET last_seen_at = '2000-01-01 00:00:00' WHERE conn_id = ?",
+        (conn_id,),
+    )
+    await db.commit()
+
+
+def _api(
+    conn_id: str,
+    request_id: str,
+    *,
+    method: str = "GET",
+    url: str = "/api/v1/namespaces/default/pods",
+) -> ApiRequest:
+    """Build an allowlisted API audit event (as ``classify`` would emit it)."""
+    return ApiRequest(
+        conn_id=conn_id,
+        request_id=request_id,
+        requested_at="2026-10-01T10:00:01.200Z",
+        user_id="VXNlcjox",
+        username="user@example.com",
+        method=method,
+        url=url,
+        status_code=200,
+        kubectl_command="kubectl get",
+        kubectl_session="5e55e55e-0000-4000-8000-000000000001",
+        user_agent="kubectl/v1.33.0 (linux/amd64)",
+    )
+
+
+def _start(conn_id: str, address: str = "k8s.example.internal") -> SessionStart:
+    """Build an ``Authenticated connection`` event."""
+    return SessionStart(
+        conn_id=conn_id,
+        resource_address=address,
+        username="user@example.com",
+        user_id="VXNlcjox",
+        ts="2026-10-01T10:00:00.100Z",
+    )
 
 
 # --- parse_asciicast --------------------------------------------------------
@@ -407,7 +474,13 @@ async def test_encryption_plaintext_while_in_progress_then_sealed(tmp_path: Path
     db = await init_db(tmp_path / "gatorcast.db")
     repo = SessionRepository(db)
     casts = CastStore(tmp_path / "casts", cryptor=Cryptor(_key()))
-    asm = Assembler(repo=repo, casts=casts, idle_timeout_seconds=120, clock=lambda: 0.0)
+    asm = Assembler(
+        repo=repo,
+        casts=casts,
+        idle_timeout_seconds=120,
+        clock=lambda: 0.0,
+        activity=ActivityStore(db),
+    )
     cid = "conn-enc"
 
     # In progress: the on-disk file is PLAINTEXT even though encryption is enabled.
@@ -434,22 +507,27 @@ async def test_idle_does_not_error_chunkless_start(tmp_path: Path) -> None:
     with ZERO chunks when the idle sweep fires. It must NOT be finalized as
     ``error`` and must NOT be marked finalized — otherwise the real recording that
     arrives later is discarded and the row is stuck at ``error``.
+
+    A start creates only a hidden pending connection (no session row) until the
+    first chunk promotes it.
     """
     clock = FakeClock()
     asm, db = await _make(tmp_path, idle=120, clock=clock)
     cid = "conn-late-record"
 
-    # Session start arrives; no recording chunks yet.
+    # Session start arrives; no recording chunks yet → pending connection, no row.
     await asm.handle(
         SessionStart(conn_id=cid, resource_address="10.0.0.30", username="u@x")
     )
-    assert (await _row(db, cid))["status"] == "provisional"
+    assert await _row(db, cid) is None
+    assert (await _conn(db, cid))["state"] == "pending"
 
-    # Idle window elapses with zero chunks. The sweep must leave it pending, not error it.
+    # Idle window elapses with zero chunks (under the backstop). The sweep must
+    # leave it pending, not error it.
     clock.advance(121)
     await asm.finalize_idle()
-    row = await _row(db, cid)
-    assert row["status"] == "provisional", "chunkless start must not be errored by idle sweep"
+    assert await _row(db, cid) is None, "chunkless start must not be errored by idle sweep"
+    assert (await _conn(db, cid))["state"] == "pending"
     assert (tmp_path / "casts" / f"{cid}.cast").exists() is False, "no .cast for a chunkless session"
 
     # The real recording finally ships (with its final flush). It must be accepted
@@ -468,9 +546,10 @@ async def test_chunkless_session_errors_at_backstop_then_recovers(tmp_path: Path
     """A session that starts but never records is marked error at the backstop.
 
     This is the "unparseable data / broken shipper" case: the start event created a
-    row but no valid chunk ever arrived. Below the backstop it stays provisional
-    (a quiet session may just not have flushed yet); past the backstop it flips to
-    error so it stops showing "in progress". A genuinely-late chunk still recovers it.
+    pending connection but no valid chunk (and no API audit) ever arrived. Below the
+    backstop it stays pending with no row (a quiet session may just not have flushed
+    yet); past the backstop it becomes a visible ``error`` row. A genuinely-late
+    chunk still recovers it.
     """
     clock = FakeClock()
     asm, db = await _make(tmp_path, idle=120, clock=clock, max_idle=1800)
@@ -479,14 +558,20 @@ async def test_chunkless_session_errors_at_backstop_then_recovers(tmp_path: Path
         SessionStart(conn_id=cid, resource_address="10.0.0.30", username="u@x")
     )
 
-    clock.advance(600)  # past idle, under backstop → still provisional (waiting)
+    clock.advance(600)  # under the backstop → still pending, no visible row
     await asm.finalize_idle()
-    assert (await _row(db, cid))["status"] == "provisional"
+    assert await _row(db, cid) is None
+    assert (await _conn(db, cid))["state"] == "pending"
 
-    clock.advance(1300)  # now past max_idle (1800) with still no chunk → error
+    # Past the backstop (aged on SQLite wall-clock last_seen_at) → visible error row.
+    await _age_connection(db, cid)
     await asm.finalize_idle()
     assert asm.active_count == 0
-    assert (await _row(db, cid))["status"] == "error"
+    row = await _row(db, cid)
+    assert row["status"] == "error"
+    assert row["resource_address"] == "10.0.0.30"
+    assert row["username"] == "u@x"
+    assert (await _conn(db, cid))["state"] == "error"
 
     # A genuinely-late chunk recovers it: error → provisional → complete.
     await asm.handle(
@@ -495,6 +580,7 @@ async def test_chunkless_session_errors_at_backstop_then_recovers(tmp_path: Path
     row = await _row(db, cid)
     assert row["status"] == "complete", "late chunk must recover an errored empty session"
     assert row["resource_address"] == "10.0.0.30"  # start-event identity preserved
+    assert (await _conn(db, cid))["state"] == "recording"
     await db.close()
 
 
@@ -615,19 +701,23 @@ async def test_sweep_leaves_recent_provisional(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_provisional_to_complete_transition(tmp_path: Path) -> None:
-    """SessionStart creates a provisional row; finalize transitions it to complete."""
+async def test_pending_to_provisional_to_complete_transition(tmp_path: Path) -> None:
+    """SessionStart creates a pending connection; the first chunk promotes it to a
+    provisional row carrying the start's identity; finalize completes it."""
     asm, db = await _make(tmp_path)
     cid = "conn-trans"
     await asm.handle(
         SessionStart(conn_id=cid, resource_address="srv.example.com", username="alice@x")
     )
+    assert await _row(db, cid) is None
+    assert (await _conn(db, cid))["state"] == "pending"
+
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=HEADER))
     row = await _row(db, cid)
     assert row["status"] == "provisional"
     assert row["resource_address"] == "srv.example.com"
     assert row["username"] == "alice@x"
 
-    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=HEADER))
     await asm.finalize(cid)
     row = await _row(db, cid)
     assert row["status"] == "complete"
@@ -814,4 +904,424 @@ async def test_no_search_means_no_scan(tmp_path: Path) -> None:
     row = await _row(db, cid)
     assert row["status"] == "complete"
     assert casts.has_sidecar(cid) is False
+    await db.close()
+
+
+# --- connection lifecycle: pending / recording / api / error (spec §6) -------
+
+K8S_ADDR = "k8s.example.internal"
+REQ_EXEC = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.mark.asyncio
+async def test_start_creates_pending_connection_only(tmp_path: Path) -> None:
+    """An Authenticated connection writes a pending connection and no session row."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-pending"
+    await asm.handle(_start(cid))
+
+    assert await _row(db, cid) is None
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+    assert asm.active_count == 0  # no in-memory buffer for a bare start
+    conn = await _conn(db, cid)
+    assert conn["state"] == "pending"
+    assert conn["has_api"] == 0
+    assert conn["resource_address"] == K8S_ADDR
+    assert conn["username"] == "user@example.com"
+    assert conn["user_id"] == "VXNlcjox"
+    assert conn["started_at"] == "2026-10-01T10:00:00.100Z"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_chunk_promotes_and_records_request_id(tmp_path: Path) -> None:
+    """The first k8s chunk promotes the pending connection with the start line's
+    identity and cluster, and its request_id lands on the session row (first wins)."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-exec"
+    await asm.handle(_start(cid))
+
+    # k8s chunk lines carry request_id but no resource_address and no headers.
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, request_id=REQ_EXEC)
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    assert row["resource_address"] == K8S_ADDR
+    assert row["username"] == "user@example.com"
+    assert row["started_at"] == "2026-10-01T10:00:00.100Z"
+    assert row["request_id"] == REQ_EXEC
+    assert (await _conn(db, cid))["state"] == "recording"
+
+    # A later chunk with a different request_id never overwrites the first.
+    await asm.handle(
+        RecordingChunk(
+            conn_id=cid,
+            seq=1,
+            asciicast=CHUNK_2,
+            request_id="22222222-2222-4222-8222-222222222222",
+            is_final=True,
+        )
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["request_id"] == REQ_EXEC
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ssh_chunk_leaves_request_id_null(tmp_path: Path) -> None:
+    """SSH recordings carry no request_id: the column stays NULL, behaviour unchanged."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-ssh"
+    await asm.handle(_start(cid, address="10.0.0.30"))
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC, is_final=True)
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["resource_address"] == "10.0.0.30"
+    assert row["request_id"] is None
+    assert (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8") == FULL_DOC
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_without_start_inserts_recording_connection(tmp_path: Path) -> None:
+    """A chunk-first connection is marked recording, so a late start line never
+    leaves it pending (and the backstop can never error a live recording)."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-chunk-first"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    assert (await _conn(db, cid))["state"] == "recording"
+
+    # The start line arrives late: identity/cluster land, state stays recording.
+    await asm.handle(_start(cid))
+    conn = await _conn(db, cid)
+    assert conn["state"] == "recording"
+    assert conn["resource_address"] == K8S_ADDR
+    assert (await _row(db, cid))["resource_address"] == K8S_ADDR
+
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _row(db, cid))["status"] == "provisional"  # still recording
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_only_connection_never_creates_session(tmp_path: Path) -> None:
+    """An audit line marks the connection api; it never gets a row, even after the
+    backstop window, and the request is stored with the start line's cluster."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-api"
+    await asm.handle(_start(cid))
+    await asm.handle(_api(cid, "req-get-1"))
+
+    assert await _row(db, cid) is None
+    conn = await _conn(db, cid)
+    assert conn["state"] == "api"
+    assert conn["has_api"] == 1
+    assert (
+        await _count(db, "SELECT COUNT(*) FROM api_requests WHERE conn_id = ?", (cid,))
+        == 1
+    )
+    cur = await db.execute(
+        "SELECT resource_address, user_key FROM api_requests WHERE request_id = ?",
+        ("req-get-1",),
+    )
+    req = await cur.fetchone()
+    await cur.close()
+    assert req["resource_address"] == K8S_ADDR
+    assert req["user_key"] == "VXNlcjox"
+
+    # The pending backstop ignores api connections: still no visible row.
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert await _row(db, cid) is None
+    assert (await _conn(db, cid))["state"] == "api"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_backstop_creates_visible_error_row(tmp_path: Path) -> None:
+    """A connection with neither chunks nor audits becomes a visible error row."""
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = "conn-neither"
+    await asm.handle(_start(cid, address="10.0.0.31"))
+
+    # Not yet past the backstop: nothing happens.
+    await asm.finalize_idle()
+    assert await _row(db, cid) is None
+
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row is not None
+    assert row["status"] == "error"
+    assert row["resource_address"] == "10.0.0.31"
+    assert row["username"] == "user@example.com"
+    assert row["started_at"] == "2026-10-01T10:00:00.100Z"
+    assert (await _conn(db, cid))["state"] == "error"
+
+    # A second sweep is a no-op (already expired).
+    await asm.finalize_idle()
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_connection_survives_restart(tmp_path: Path) -> None:
+    """Pending connections live in SQLite: a new Assembler over the same DB still
+    sees and expires them."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-restart"
+    await asm.handle(_start(cid))
+
+    # "Restart": a fresh assembler (empty in-memory state) over the same database.
+    asm2 = Assembler(
+        repo=SessionRepository(db),
+        casts=CastStore(tmp_path / "casts"),
+        idle_timeout_seconds=120,
+        clock=lambda: 0.0,
+        activity=ActivityStore(db),
+    )
+    await asm2.sweep_startup()
+    assert await _row(db, cid) is None
+    assert (await _conn(db, cid))["state"] == "pending"
+
+    await _age_connection(db, cid)
+    await asm2.finalize_idle()
+    assert (await _row(db, cid))["status"] == "error"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_late_audit_on_error_deletes_row_and_marks_api(tmp_path: Path) -> None:
+    """A late audit (e.g. a long watch) on an expired connection removes the
+    phantom start-only error row and marks the connection api."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-watch"
+    await asm.handle(_start(cid))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _row(db, cid))["status"] == "error"
+
+    await asm.handle(_api(cid, "req-watch-1"))
+    assert await _row(db, cid) is None
+    conn = await _conn(db, cid)
+    assert conn["state"] == "api"
+    assert conn["has_api"] == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_then_chunk_promotes_to_recording(tmp_path: Path) -> None:
+    """An api connection that later records is promoted; has_api stays set."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-api-rec"
+    await asm.handle(_start(cid))
+    await asm.handle(_api(cid, "req-pre-1"))
+    assert (await _conn(db, cid))["state"] == "api"
+
+    await asm.handle(
+        RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, request_id=REQ_EXEC)
+    )
+    conn = await _conn(db, cid)
+    assert conn["state"] == "recording"
+    assert conn["has_api"] == 1
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    assert row["resource_address"] == K8S_ADDR
+    assert row["request_id"] == REQ_EXEC
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_exec_audit_on_recording_connection_keeps_recording(tmp_path: Path) -> None:
+    """The exec's status-101 audit line (same request_id, arriving at exec end)
+    sets has_api but leaves the recording connection and its row intact."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-exec-b"
+    await asm.handle(_start(cid))
+    await asm.handle(
+        RecordingChunk(
+            conn_id=cid, seq=0, asciicast=FULL_DOC, request_id=REQ_EXEC, is_final=True
+        )
+    )
+    await asm.handle(
+        _api(
+            cid,
+            REQ_EXEC,
+            url="/api/v1/namespaces/default/pods/web-1/exec?container=nginx&stdin=true",
+        )
+    )
+    conn = await _conn(db, cid)
+    assert conn["state"] == "recording"
+    assert conn["has_api"] == 1
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["request_id"] == REQ_EXEC
+    # The audit line is linked to the recording through request_id.
+    links = await ActivityStore(db).recordings_for_requests([REQ_EXEC])
+    assert links == {REQ_EXEC: cid}
+    # The exec rule fired once on the request.
+    assert (
+        await _count(
+            db,
+            "SELECT COUNT(*) FROM api_findings "
+            "WHERE request_id = ? AND rule_id = 'kube-exec'",
+            (REQ_EXEC,),
+        )
+        == 1
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_audit_line_is_not_duplicated(tmp_path: Path) -> None:
+    """At-least-once redelivery: the same request_id yields one row and one set of
+    findings."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-dedup"
+    await asm.handle(_start(cid))
+    delete = _api(
+        cid, "req-del-1", method="DELETE", url="/api/v1/namespaces/default/pods/web-1"
+    )
+    await asm.handle(delete)
+    await asm.handle(delete)  # redelivered
+    await asm.handle(delete)  # and again
+
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 1
+    assert (
+        await _count(
+            db, "SELECT COUNT(*) FROM api_findings WHERE request_id = ?", ("req-del-1",)
+        )
+        == 1
+    )
+    assert (
+        await _count(db, "SELECT COUNT(*) FROM api_findings WHERE rule_id = 'kube-delete'")
+        == 1
+    )
+    assert (await _conn(db, cid))["state"] == "api"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_before_start_is_backfilled(tmp_path: Path) -> None:
+    """An audit line arriving before its start line creates a minimal api
+    connection; the start line then backfills the request's cluster."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-audit-first"
+    await asm.handle(_api(cid, "req-early-1"))
+    conn = await _conn(db, cid)
+    assert conn["state"] == "api"
+    assert conn["resource_address"] is None
+
+    await asm.handle(_start(cid))
+    conn = await _conn(db, cid)
+    assert conn["state"] == "api"  # the start line never demotes it to pending
+    assert conn["resource_address"] == K8S_ADDR
+    cur = await db.execute(
+        "SELECT resource_address FROM api_requests WHERE request_id = ?",
+        ("req-early-1",),
+    )
+    req = await cur.fetchone()
+    await cur.close()
+    assert req["resource_address"] == K8S_ADDR
+    assert await _row(db, cid) is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_detection_disabled_skips_api_findings(tmp_path: Path) -> None:
+    """DETECTION_ENABLED=false stores the request but runs no API rules."""
+    asm, repo, casts, search, db = await _make_with_search(
+        tmp_path, detection_enabled=False
+    )
+    cid = "conn-nodetect"
+    await asm.handle(_start(cid))
+    await asm.handle(
+        _api(cid, "req-nd-1", method="DELETE", url="/api/v1/namespaces/default/pods/x")
+    )
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 1
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_findings_survive_failure_between_request_and_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security P1: request + findings are one transaction. A failure after the
+    request insert rolls the request back too, so the redelivered line is not a
+    dedup hit and stores the request *with* its findings."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-atomic"
+    await asm.handle(_start(cid))
+    delete = _api(cid, "req-atomic-1", method="DELETE", url="/api/v1/namespaces/default/pods/web-1")
+
+    async def boom(request_id: str, findings) -> None:
+        raise RuntimeError("simulated crash between the request and its findings")
+
+    monkeypatch.setattr(asm._activity, "_insert_finding_rows", boom)
+    with pytest.raises(RuntimeError):
+        await asm.handle(delete)
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 0
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert (await _conn(db, cid))["state"] == "pending"  # no state change either
+
+    monkeypatch.undo()
+    await asm.handle(delete)  # at-least-once redelivery
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 1
+    assert (
+        await _count(
+            db,
+            "SELECT COUNT(*) FROM api_findings WHERE request_id = ? AND rule_id = 'kube-delete'",
+            ("req-atomic-1",),
+        )
+        == 1
+    )
+    assert (await _conn(db, cid))["state"] == "api"
+
+    await asm.handle(delete)  # a further redelivery still duplicates nothing
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 1
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_detection_error_still_stores_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If detect_api raises, the request is still stored (without findings) and the
+    connection still advances; the failure is logged by exception type only."""
+    import gatorcast.pipeline.assembler as assembler_module
+
+    def broken_detect(method: str, url: str):
+        raise ValueError("rule engine failure")
+
+    warnings: list[tuple[str, dict]] = []
+
+    class _Log:
+        def warning(self, event: str, **kw) -> None:
+            warnings.append((event, kw))
+
+        def __getattr__(self, name: str):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(assembler_module, "detect_api", broken_detect)
+    monkeypatch.setattr(assembler_module, "log", _Log())
+    asm, db = await _make(tmp_path)
+    cid = "conn-detect-err"
+    await asm.handle(_start(cid))
+    await asm.handle(
+        _api(cid, "req-de-1", method="DELETE", url="/api/v1/namespaces/default/pods/x")
+    )
+
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 1
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert (await _conn(db, cid))["state"] == "api"
+    assert warnings == [
+        ("assembler.api_detect_error", {"conn_id": cid, "error": "ValueError"})
+    ]
     await db.close()
