@@ -5,9 +5,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 # Install dependencies first for better layer caching.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY src/ ./src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir -c constraints.txt .
 
 # Run as an unprivileged, non-root system user. Pre-create the data volume mount
 # point and hand both /data and /app to the runtime user so config.data_dir.mkdir

@@ -716,7 +716,12 @@ async def test_flagged_command_stats_plan(db, windowed: bool) -> None:
         d.startswith("SEARCH r USING") and "request_id=?" in d for d in details
     ), plan
     # Every per-command subquery uses the command-key expression index. Unwindowed,
-    # start_at is unused and SQLite drops its subquery, leaving only max_rank.
+    # start_at is unused and SQLite drops its subquery, leaving only max_rank. Older
+    # SQLite builds list a correlated subquery once per reference, so the probe lines
+    # can repeat: require at least one per subquery and that every probe of q is an
+    # idx_api_req_cmd seek.
     expected = 2 if windowed else 1
-    assert sum("SEARCH q USING INDEX idx_api_req_cmd" in d for d in details) == expected, plan
+    q_access = [d for d in details if d.startswith(("SEARCH q ", "SCAN q "))]
+    assert len(q_access) >= expected, plan
+    assert all(d.startswith("SEARCH q USING INDEX idx_api_req_cmd") for d in q_access), plan
     assert "idx_api_req_sys_user_time" not in plan

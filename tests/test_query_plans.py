@@ -249,10 +249,15 @@ _SESSION_10_INDEXES = (
 
 async def test_q12_list_systems_needs_no_new_index(db: aiosqlite.Connection) -> None:
     rows = await plan(db, LIST_SYSTEMS_SQL, ())
-    # API arm: one covering scan of idx_api_req_sys_time (no per-row table lookup).
+    # API arm: one covering scan of a pre-Session-10 index led by resource_address (no
+    # per-row table lookup). Which one varies by SQLite version: 3.49 picks
+    # idx_api_req_sys_time, older builds (CI's Ubuntu libsqlite3) idx_api_req_sys_user_time.
     (api_access,) = lines_for(rows, "r")
     assert api_access.startswith("SCAN r "), api_access
-    assert "COVERING INDEX idx_api_req_sys_time" in api_access
+    assert any(
+        f"COVERING INDEX {name}" in api_access
+        for name in ("idx_api_req_sys_time", "idx_api_req_sys_user_time")
+    ), api_access
     # Sessions arm: a full scan of the small sessions table (in address order through
     # idx_sessions_resource when the planner picks it), never a Session 10 index.
     (sessions_access,) = lines_for(rows, "s")
