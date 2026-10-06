@@ -6,15 +6,25 @@
 
   The client-side search box is a small Alpine.js filter over the already-rendered
   rows (Light tier: no server round-trip). Everything is autoescaped.
+
+  Cross-links (unified search spec §8.5): "Search this system" in the header,
+  "kubectl commands in search" by the activity heading, and a trailing ⌕ link per
+  user in both tables (the user's name keeps linking to replay / the activity page).
+  Every /search URL is built by the route; the NULL-user bucket gets no ⌕ link.
 #}
 {% block title %}{{ system_label }} · Gatorcast{% endblock %}
+
+{% from "_macros.html" import user_link %}
 
 {% block content %}
   <div class="breadcrumb">
     <a href="/systems">Systems</a> / <span class="mono">{{ system_label }}</span>
   </div>
 
-  <h1 class="mono">{{ system_label }}</h1>
+  <div class="page-head">
+    <h1 class="mono">{{ system_label }}</h1>
+    <a href="{{ search_system_url }}">Search this system <span aria-hidden="true">›</span></a>
+  </div>
 
   {% if sessions %}
     <div class="filter-bar" x-data="{ q: '' }">
@@ -45,6 +55,7 @@
                 <a href="/sessions/{{ session.conn_id }}">
                   {{ session.username or "(unknown user)" }}
                 </a>
+                {{ user_link(session.username, session.user_url, icon=true) }}
               </td>
               <td class="dim mono">{{ session.shell_user or "—" }}</td>
               <td class="dim">{{ session.started_at or "—" }}</td>
@@ -78,6 +89,7 @@
   <section class="activity-section" aria-labelledby="activity-heading">
     <div class="activity-section-head">
       <h2 id="activity-heading">kubectl activity</h2>
+      <a href="{{ kubectl_search_url }}">kubectl commands in search <span aria-hidden="true">›</span></a>
       <p class="activity-window dim">
         Window <span class="mono">{{ activity_window_since }}</span>
         → <span class="mono">{{ activity_window_until }}</span>
@@ -111,7 +123,10 @@
             {% for a in activity_sessions %}
               <tr>
                 <td><span class="pill pill-kubectl">kubectl</span></td>
-                <td><a href="{{ a.url }}">{{ a.user_label }}</a></td>
+                <td>
+                  <a href="{{ a.url }}">{{ a.user_label }}</a>
+                  {{ user_link(a.user_label, a.user_search_url, icon=true) }}
+                </td>
                 <td class="dim mono">{{ a.started_at }}</td>
                 <td class="dim mono">{{ a.ended_at }}</td>
                 <td class="dim">{{ a.duration_display }}</td>

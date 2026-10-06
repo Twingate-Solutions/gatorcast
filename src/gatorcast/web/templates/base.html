@@ -12,6 +12,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    {# htmx 2.0.4: swap a 400 body (the /search validation partial) into the target;
+       other 4xx/5xx keep htmx's default of no swap. 204 never swaps. #}
+    <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"400","swap":true,"error":false},{"code":"[45]..","swap":false,"error":true}]}' />
     <title>{% block title %}Gatorcast{% endblock %}</title>
     <link rel="icon" type="image/png" href="/static/favicon.png" />
     <link rel="stylesheet" href="/static/app.css" />

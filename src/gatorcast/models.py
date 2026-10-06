@@ -38,6 +38,11 @@ class Session(BaseModel):
     Equals the ``request_id`` of the exec's status-101 API audit line, which is how
     kubectl activity links a command to this recording.
     """
+    sealed_terminal: bool | None = None
+    """How the row was last sealed: ``True`` terminally ("session finished" / close),
+    ``False`` reopenably (idle backstop). ``None`` when not sealed, or sealed before
+    this column existed (legacy; the assembler treats a sealed ``None`` as terminal).
+    """
 
 
 class RecordingChunk(BaseModel):

@@ -646,6 +646,33 @@ class ActivityStore:
                 result.setdefault(row["request_id"], row["conn_id"])
         return result
 
+    async def known_request_ids(self, request_ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``request_ids`` that have an ``api_requests`` row.
+
+        The batched form of Q13 (unified search spec §7.4): an exec recording's
+        ``sessions.request_id`` links to its kubectl command only when the exec's
+        audit line has been stored. Primary-key probes, in chunks of 500 bound
+        parameters.
+
+        Args:
+            request_ids: Candidate request ids (duplicates are ignored).
+
+        Returns:
+            The ids that exist in ``api_requests``.
+        """
+        ids = _unique(request_ids)
+        found: set[str] = set()
+        for chunk in _chunks(ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"SELECT request_id FROM api_requests WHERE request_id IN ({placeholders})",
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            found.update(row["request_id"] for row in rows)
+        return found
+
     # --- retention -------------------------------------------------------------
 
     async def purge_before(self, iso_cutoff: str | datetime) -> tuple[int, int]:

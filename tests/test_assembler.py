@@ -4,12 +4,16 @@ connection lifecycle (pending → recording / api / error, kubectl activity spec
 from __future__ import annotations
 
 import base64
+import io
 import json
+import logging
 from pathlib import Path
 
 import aiosqlite
 import pytest
+import structlog
 
+import gatorcast.pipeline.assembler as assembler_module
 from gatorcast.crypto import Cryptor
 
 from gatorcast.db import init_db
@@ -1324,4 +1328,409 @@ async def test_api_detection_error_still_stores_request(
     assert warnings == [
         ("assembler.api_detect_error", {"conn_id": cid, "error": "ValueError"})
     ]
+    await db.close()
+
+
+# --- Session 10 T11: a late chunk never replaces a sealed recording ------------
+#
+# The seal mode is persisted on the session row (``sealed_terminal``), so after a
+# restart or a ``_sealed`` cache eviction the row decides: ignore (terminal or
+# legacy NULL), reopen (reopenable), adopt (provisional with a file), or promote
+# (no recording yet). Each scenario runs with encryption off and on.
+
+SENTINEL = "GC_SENTINEL_LATE_CHUNK"
+LATE_EVENT = f'[9.0,"o","{SENTINEL}"]'
+LATE_CHUNK = HEADER + LATE_EVENT + "\n"
+
+
+@pytest.fixture(params=[False, True], ids=["plaintext", "encrypted"])
+def encrypted(request: pytest.FixtureRequest) -> bool:
+    """Run a T11 scenario once without and once with ``.cast`` encryption."""
+    return bool(request.param)
+
+
+@pytest.fixture
+def asm_log(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
+    """Swap the assembler's logger for one rendering JSON lines (all levels) to a buffer.
+
+    structlog caches loggers on first use, so its test capture is unreliable across
+    a suite; replacing the module logger is how ``test_secret_hygiene`` does it.
+    """
+    buffer = io.StringIO()
+    logger = structlog.wrap_logger(
+        structlog.PrintLogger(file=buffer),
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+    )
+    monkeypatch.setattr(assembler_module, "log", logger)
+    return buffer
+
+
+def _log_events(buffer: io.StringIO) -> list[dict]:
+    """Parse the captured assembler log lines."""
+    return [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+
+
+def _assert_no_sentinel(buffer: io.StringIO) -> None:
+    """The capture is live, and no chunk content reached any log line."""
+    text = buffer.getvalue()
+    assert text.strip(), "log capture recorded nothing (vacuous check)"
+    assert SENTINEL not in text, "chunk content leaked into the logs"
+
+
+async def _boot(
+    tmp_path: Path,
+    *,
+    encrypted: bool,
+    clock=None,
+    max_idle: int = 3600,
+) -> tuple[Assembler, aiosqlite.Connection, CastStore]:
+    """(Re)start the service: same DB + casts dir, fresh Assembler, startup sweep.
+
+    Calling this twice on one ``tmp_path`` (after closing the first DB) simulates a
+    restart: every in-memory map, including ``_sealed``, starts empty.
+    """
+    casts_dir = tmp_path / "casts"
+    db = await init_db(tmp_path / "gatorcast.db", casts_dir)
+    casts = CastStore(casts_dir, cryptor=Cryptor(_key()) if encrypted else None)
+    asm = Assembler(
+        repo=SessionRepository(db),
+        casts=casts,
+        idle_timeout_seconds=120,
+        session_max_idle_seconds=max_idle,
+        clock=clock or (lambda: 0.0),
+        activity=ActivityStore(db),
+    )
+    await asm.sweep_startup()
+    return asm, db, casts
+
+
+def _cast_bytes(tmp_path: Path, conn_id: str) -> bytes:
+    """Raw on-disk bytes of a ``.cast`` (ciphertext when sealed under encryption)."""
+    return (tmp_path / "casts" / f"{conn_id}.cast").read_bytes()
+
+
+async def _seal_state(db: aiosqlite.Connection, conn_id: str) -> dict:
+    """The row fields a late chunk must not change on a sealed session."""
+    row = await _row(db, conn_id)
+    assert row is not None
+    return {
+        k: row[k]
+        for k in (
+            "status",
+            "size_bytes",
+            "chunk_count",
+            "ended_at",
+            "cast_path",
+            "sealed_terminal",
+        )
+    }
+
+
+@pytest.mark.asyncio
+async def test_t11_restart_terminal_seal_ignores_late_chunks(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """Terminal seal → restart → redelivered and new-seq chunks are ignored."""
+    cid = "conn-t11-terminal"
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(_start(cid))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2, is_final=True))
+    before = _cast_bytes(tmp_path, cid)
+    state = await _seal_state(db, cid)
+    assert state["status"] == "complete"
+    assert state["sealed_terminal"] == 1
+    await db.close()
+
+    asm, db, casts = await _boot(tmp_path, encrypted=encrypted)  # restart
+    # (i) a redelivered chunk with an existing seq (the final flush, redelivered)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=LATE_CHUNK, is_final=True))
+    # (ii) a chunk with a new seq
+    await asm.handle(RecordingChunk(conn_id=cid, seq=2, asciicast=LATE_CHUNK))
+
+    assert _cast_bytes(tmp_path, cid) == before, "sealed .cast must be byte-identical"
+    assert await _seal_state(db, cid) == state, "sealed row must be unchanged"
+    assert asm._ignored_finalized == 2
+    assert asm.active_count == 0
+    assert await casts.read_cast(cid) == FULL_DOC  # still decrypts to the original
+    events = _log_events(asm_log)
+    assert {
+        "event": "assembler.ignore_sealed",
+        "phase": "chunk",
+        "source": "db",
+        "level": "debug",
+    } in events
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_restart_reopenable_seal_reopens_and_appends(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """Backstop seal → restart → a new chunk reopens it and appends after the original."""
+    cid = "conn-t11-reopen"
+    clock = FakeClock()
+    asm, db, casts = await _boot(tmp_path, encrypted=encrypted, clock=clock, max_idle=1800)
+    await asm.handle(_start(cid))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_2))
+    clock.advance(1801)
+    await asm.finalize_idle()
+    state = await _seal_state(db, cid)
+    assert state["status"] == "complete"
+    assert state["sealed_terminal"] == 0
+    assert await casts.read_cast(cid) == FULL_DOC
+    await db.close()
+
+    asm, db, casts = await _boot(
+        tmp_path, encrypted=encrypted, clock=FakeClock(), max_idle=1800
+    )
+    await asm.handle(RecordingChunk(conn_id=cid, seq=2, asciicast=LATE_CHUNK))
+
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    assert row["sealed_terminal"] is None  # cleared by reopen
+    in_progress = _cast_bytes(tmp_path, cid).decode("utf-8")  # plaintext while open
+    assert _nonblank(in_progress) == _nonblank(FULL_DOC) + [LATE_EVENT]
+
+    # A final flush re-seals it terminally (encrypted when encryption is on).
+    await asm.handle(
+        RecordingChunk(
+            conn_id=cid, seq=3, asciicast=HEADER + '[10.0,"o","end"]\n', is_final=True
+        )
+    )
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["sealed_terminal"] == 1
+    sealed = _cast_bytes(tmp_path, cid)
+    assert sealed.startswith(b'{"version":2') is (not encrypted)
+    final = await casts.read_cast(cid)
+    assert _nonblank(final) == _nonblank(FULL_DOC) + [LATE_EVENT, '[10.0,"o","end"]']
+    reopens = [e for e in _log_events(asm_log) if e["event"] == "assembler.reopen"]
+    assert reopens == [
+        {"event": "assembler.reopen", "conn_id": cid, "source": "db", "level": "info"}
+    ]
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_eviction_without_restart_ignores_late_chunk(
+    tmp_path: Path,
+    encrypted: bool,
+    asm_log: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``_sealed`` is cleared at ``_FINALIZED_MAX``, the row still blocks a late chunk."""
+    monkeypatch.setattr(assembler_module, "_FINALIZED_MAX", 2)
+    asm, db, casts = await _boot(tmp_path, encrypted=encrypted)
+    cids = ["conn-evict-a", "conn-evict-b", "conn-evict-c"]
+    for cid in cids:
+        await asm.handle(
+            RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC, is_final=True)
+        )
+    assert cids[0] not in asm._sealed, "the first seal must have been evicted"
+    before = _cast_bytes(tmp_path, cids[0])
+    state = await _seal_state(db, cids[0])
+
+    await asm.handle(RecordingChunk(conn_id=cids[0], seq=1, asciicast=LATE_CHUNK))
+
+    assert _cast_bytes(tmp_path, cids[0]) == before
+    assert await _seal_state(db, cids[0]) == state
+    assert asm._ignored_finalized == 1
+    assert asm.active_count == 0
+    assert await casts.read_cast(cids[0]) == FULL_DOC
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_failed_connection_still_recovers_after_restart(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """A pending connection expired to ``error`` (no cast) recovers on a later chunk."""
+    cid = "conn-t11-failed"
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(_start(cid))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row["status"] == "error"
+    assert row["cast_path"] is None
+    await db.close()
+
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=LATE_CHUNK))
+
+    row = await _row(db, cid)
+    assert row["status"] == "provisional"
+    assert row["resource_address"] == "k8s.example.internal"  # start-line identity kept
+    written = _cast_bytes(tmp_path, cid).decode("utf-8")
+    assert _nonblank(written) == _nonblank(LATE_CHUNK)
+    assert (await _conn(db, cid))["state"] == "recording"
+    assert "assembler.promote" in [e["event"] for e in _log_events(asm_log)]
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_legacy_null_flag_is_treated_as_terminal(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """A sealed row from before the column existed (NULL) ignores a late chunk."""
+    cid = "conn-t11-legacy"
+    clock = FakeClock()
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted, clock=clock, max_idle=1800)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC))
+    clock.advance(1801)
+    await asm.finalize_idle()  # sealed reopenably ...
+    # ... but as if written before T11, when no seal mode was recorded.
+    await db.execute(
+        "UPDATE sessions SET sealed_terminal = NULL WHERE conn_id = ?", (cid,)
+    )
+    await db.commit()
+    before = _cast_bytes(tmp_path, cid)
+    state = await _seal_state(db, cid)
+    await db.close()
+
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=LATE_CHUNK))
+
+    assert _cast_bytes(tmp_path, cid) == before
+    assert await _seal_state(db, cid) == state
+    assert asm._ignored_finalized == 1
+    assert asm._sealed[cid] is False  # re-cached as terminal
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_sealed_error_row_reopens(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """A backstop-sealed ``error`` row (no header, cast set) reopens on a late chunk."""
+    cid = "conn-t11-error"
+    clock = FakeClock()
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted, clock=clock, max_idle=1800)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast='[0.0,"o","x"]\n'))
+    clock.advance(1801)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row["status"] == "error"
+    assert row["cast_path"] is not None
+    assert row["sealed_terminal"] == 0
+    await db.close()
+
+    asm, db, casts = await _boot(
+        tmp_path, encrypted=encrypted, clock=FakeClock(), max_idle=1800
+    )
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=LATE_CHUNK))
+    row = await _row(db, cid)
+    assert row["status"] == "provisional", "repo.reopen must accept a sealed error row"
+    assert row["sealed_terminal"] is None
+    assert row["chunk_count"] == 1  # update_progress no longer skips the row
+
+    # The late chunk carried a header, so the re-seal is a valid recording.
+    await asm.handle(RecordingChunk(conn_id=cid, seq=2, asciicast=HEADER, is_final=True))
+    row = await _row(db, cid)
+    assert row["status"] == "complete"
+    assert row["sealed_terminal"] == 1
+    assert parse_asciicast(await casts.read_cast(cid)).event_count == 2
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_orphan_cast_without_row_is_never_overwritten(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """No session row but a non-empty ``.cast`` on disk: the chunk is ignored."""
+    cid = "conn-t11-orphan"
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    orphan = tmp_path / "casts" / f"{cid}.cast"
+    orphan.write_bytes(b"orphaned recording bytes\n")
+
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=LATE_CHUNK))
+
+    assert orphan.read_bytes() == b"orphaned recording bytes\n"
+    assert await _row(db, cid) is None
+    assert asm.active_count == 0
+    events = _log_events(asm_log)
+    assert {
+        "event": "assembler.orphan_cast_skip",
+        "conn_id": cid,
+        "level": "warning",
+    } in events
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_sealed_row_with_missing_cast_writes_nothing(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """A sealed row whose ``.cast`` is gone: the chunk is ignored and no file appears."""
+    cid = "conn-t11-missing"
+    clock = FakeClock()
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted, clock=clock, max_idle=1800)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=FULL_DOC))
+    clock.advance(1801)
+    await asm.finalize_idle()  # reopenable: the most permissive seal mode
+    state = await _seal_state(db, cid)
+    (tmp_path / "casts" / f"{cid}.cast").unlink()
+    await db.close()
+
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=LATE_CHUNK))
+
+    assert not (tmp_path / "casts" / f"{cid}.cast").exists()
+    assert await _seal_state(db, cid) == state
+    events = _log_events(asm_log)
+    assert {
+        "event": "assembler.sealed_cast_missing",
+        "conn_id": cid,
+        "level": "warning",
+    } in events
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_provisional_row_with_cast_is_adopted_on_buffer_miss(
+    tmp_path: Path, encrypted: bool, asm_log: io.StringIO
+) -> None:
+    """A provisional row with a plaintext ``.cast`` but no buffer is adopted, not replaced."""
+    cid = "conn-t11-adopt"
+    asm, db, _ = await _boot(tmp_path, encrypted=encrypted)
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1))
+    asm._buffers.clear()  # lose the buffer without sealing
+
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=LATE_CHUNK))
+
+    text = _cast_bytes(tmp_path, cid).decode("utf-8")
+    assert _nonblank(text) == _nonblank(CHUNK_1) + [LATE_EVENT]
+    assert (await _row(db, cid))["status"] == "provisional"
+    assert "assembler.adopt" in [e["event"] for e in _log_events(asm_log)]
+    _assert_no_sentinel(asm_log)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_t11_seal_persists_mode(tmp_path: Path) -> None:
+    """Every seal writes ``sealed_terminal``: 1 on the final flush, 0 on the backstop."""
+    clock = FakeClock()
+    asm, db = await _make(tmp_path, clock=clock, max_idle=1800)
+    await asm.handle(
+        RecordingChunk(conn_id="term", seq=0, asciicast=FULL_DOC, is_final=True)
+    )
+    await asm.handle(RecordingChunk(conn_id="idle", seq=0, asciicast=FULL_DOC))
+    clock.advance(1801)
+    await asm.finalize_idle()
+    assert (await _row(db, "term"))["sealed_terminal"] == 1
+    assert (await _row(db, "idle"))["sealed_terminal"] == 0
     await db.close()

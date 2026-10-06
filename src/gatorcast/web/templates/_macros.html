@@ -1,0 +1,109 @@
+{#
+  Shared presentation macros for the kubectl activity page, the unified Search
+  page (_rows.html / _results.html), and later the dashboard feed.
+
+  Import with `{% from "_macros.html" import ... %}` (macros are pure: they use
+  only their arguments, so no `with context` is needed).
+
+  Safety rules, unchanged from activity.html:
+    * Every value is autoescaped. Never add |safe. Stored request URLs and
+      usernames are attacker-influenced.
+    * Never interpolate stored text into a class name. The status band is computed
+      from the integer status code, "failed" is matched by equality, and severity
+      is always a SEVERITY_RANK key (sanitized in the route).
+
+  Visual language (see app.css, "kubectl activity"):
+    * HTTP status    -> small monospace chip; 4xx/5xx are amber (--warn).
+    * failed outcome -> red (--err) pill with a cross glyph plus a red stripe on the
+                        row. This is the Gateway's "API request failed" outcome and
+                        is deliberately different from any non-2xx status: a 502 that
+                        the Gateway logged as completed gets only the amber chip.
+#}
+
+{% macro status_chip(code) -%}
+  {%- if code is number -%}
+    {%- set band = ('5xx' if code >= 500 else ('4xx' if code >= 400 else ('3xx' if code >= 300 else ('2xx' if code >= 200 else '1xx')))) -%}
+    <span class="status status-{{ band }}">{{ code }}</span>
+  {%- else -%}
+    <span class="dim">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro failed_pill(outcome) -%}
+  {%- if outcome == 'failed' -%}
+    <span class="outcome-failed"><span aria-hidden="true">✕</span> failed</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro severity_cell(count, severity) -%}
+  {%- if count and severity -%}
+    <span class="sev sev-{{ severity }}">{{ severity }} · {{ count }}</span>
+  {%- else -%}
+    <span class="dim">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{#
+  The per-command request table. `requests` is the list the route builds:
+  {request_id, requested_at, method, url, status_code, outcome, is_discovery,
+  finding_labels}. Wrapped in .table-scroll so it scrolls instead of squashing.
+#}
+{% macro request_table(requests) -%}
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Method</th>
+          <th>URL</th>
+          <th>Status</th>
+          <th>Outcome</th>
+          <th>Findings</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for req in requests %}
+          <tr class="{{ 'is-failed' if req.outcome == 'failed' else '' }}{{ ' is-discovery' if req.is_discovery else '' }}">
+            <td class="dim mono">{{ req.requested_at }}</td>
+            <td class="mono">{{ req.method }}</td>
+            <td class="mono request-url">{{ req.url }}{% if req.is_discovery %} <span class="tag">discovery</span>{% endif %}</td>
+            <td>{{ status_chip(req.status_code) }}</td>
+            <td>
+              {% if req.outcome == 'failed' %}{{ failed_pill(req.outcome) }}{% else %}<span class="dim">{{ req.outcome }}</span>{% endif %}
+            </td>
+            <td>
+              {% for label in req.finding_labels %}
+                <div class="finding-tag">{{ label }}</div>
+              {% else %}
+                <span class="dim">—</span>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{%- endmacro %}
+
+{#
+  A username that links to a pre-built /search?user=... URL. Templates never build
+  /search URLs themselves (the route owns the canonical names and the encoding), so
+  the URL is an argument.
+
+  * icon=false: the label itself is the link; a missing URL (NULL-user bucket)
+    renders the label as plain text.
+  * icon=true: a small trailing "⌕" link placed next to a name that already links
+    elsewhere (spec §8.1), labelled "All activity for <label>" for screen readers.
+    A missing URL renders nothing (the name is already shown).
+#}
+{% macro user_link(label, url, icon=false) -%}
+  {%- if icon -%}
+    {%- if url -%}
+      <a class="user-link user-link-icon" href="{{ url }}" aria-label="All activity for {{ label }}" title="All activity for {{ label }}"><span aria-hidden="true">⌕</span></a>
+    {%- endif -%}
+  {%- elif url -%}
+    <a class="user-link" href="{{ url }}">{{ label }}</a>
+  {%- else -%}
+    {{ label }}
+  {%- endif -%}
+{%- endmacro %}

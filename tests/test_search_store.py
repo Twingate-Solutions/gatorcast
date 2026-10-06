@@ -8,7 +8,10 @@ Covers:
   - content scan: keyword (case-insensitive), regex match, invalid regex -> empty,
     candidate cap -> truncated, pagination
   - sort modes (newest, duration, risk)
-  - dashboard_stats aggregates
+  - dashboard_stats aggregates; session window on SESSION_AT_SQL (NULL start,
+    fractional boundary second, failed connections); kubectl flagged-command
+    figures from Q10 (one per command at its max severity, windowed on the command
+    start, cap + truncation flag, deprecated aliases, pinned plan)
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ from pathlib import Path
 
 import pytest
 
+import gatorcast.store.search as search_mod
 from gatorcast.db import init_db
+from gatorcast.models import ApiRequest
 from gatorcast.pipeline.detect import Finding, max_severity
+from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchFilters, SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -433,3 +439,284 @@ async def test_search_max_severity_exact(
     # Contrast: the at-or-above `severity` filter is broader (high includes critical).
     at_or_above = await search_store.search(SearchFilters(severity="high"))
     assert {i.session.conn_id for i in at_or_above.items} == {"crit", "high"}
+
+
+# ---------------------------------------------------------------------------
+# dashboard: session window on SESSION_AT_SQL (spec §8.2)
+# ---------------------------------------------------------------------------
+#
+# Every cutoff below is an explicit, fixed timestamp passed to dashboard_stats, and
+# every seeded row sits well clear of it except the deliberate boundary rows, so no
+# "now minus N days" clock race is possible. created_at is pinned with an UPDATE
+# rather than taken from SQLite's clock.
+
+_CUTOFF = "2026-06-01T00:00:00Z"
+
+
+async def test_dashboard_session_window_uses_session_at(
+    search_store: SearchStore, repo: SessionRepository, db
+) -> None:
+    """Sessions are windowed on COALESCE(started_at, created_at) in requested_at format.
+
+    Covers the two cases the old ``started_at >= ?`` string compare got wrong: a NULL
+    ``started_at`` (placed by ``created_at``) and a fractional-second start at the
+    boundary second. A failed connection (error, no chunks, no cast) counts too,
+    because "Total sessions" links to ``type=recordings``, which includes it.
+    """
+    # Boundary second with a fraction: "...00.250Z" sorts before "...00Z" as text.
+    await seed_session(repo, conn_id="frac", started_at="2026-06-01T00:00:00.250Z")
+    # Exactly at the cutoff (inclusive).
+    await seed_session(repo, conn_id="edge", started_at="2026-06-01T00:00:00Z")
+    # Just before the cutoff.
+    await seed_session(repo, conn_id="before", started_at="2026-05-31T23:59:59.999Z")
+    # Well inside / well outside.
+    await seed_session(repo, conn_id="inside", started_at="2026-06-20T08:00:00Z")
+    await seed_session(repo, conn_id="old", started_at="2026-01-01T00:00:00Z")
+    # NULL started_at: placed by created_at (pinned inside the window).
+    await repo.upsert_start("nullstart", "n@x", "sysN", None)
+    await db.execute(
+        "UPDATE sessions SET created_at = '2026-06-05 00:00:00' WHERE conn_id = 'nullstart'"
+    )
+    # NULL started_at with created_at outside the window.
+    await repo.upsert_start("nullold", "n@x", "sysN", None)
+    await db.execute(
+        "UPDATE sessions SET created_at = '2026-02-01 00:00:00' WHERE conn_id = 'nullold'"
+    )
+    # A failed connection inside the window.
+    await repo.upsert_start("failed", "f@x", "sysF", "2026-06-10T00:00:00Z")
+    await db.execute("UPDATE sessions SET status = 'error' WHERE conn_id = 'failed'")
+    await db.commit()
+
+    await attach_findings(
+        repo, search_store, "frac", [Finding("r1", "dangerous-command", "high", "H", 1.0)]
+    )
+    await attach_findings(
+        repo, search_store, "before", [Finding("r2", "dangerous-command", "critical", "C", 1.0)]
+    )
+    await attach_findings(
+        repo, search_store, "nullstart", [Finding("r3", "secret-exposure", "medium", "M", 1.0)]
+    )
+
+    stats = await search_store.dashboard_stats(started_after=_CUTOFF)
+    # frac, edge, inside, nullstart, failed
+    assert stats.total_sessions == 5
+    assert stats.flagged_sessions == 2  # frac, nullstart
+    assert stats.by_severity == {"high": 1, "medium": 1}  # "before"'s critical is out
+    assert stats.by_category == {"dangerous-command": 1, "secret-exposure": 1}
+    assert {lc.label for lc in stats.top_users} == {"u@x", "n@x", "f@x"}
+
+    # Any fromisoformat shape of the same instant gives the same figures.
+    same = await search_store.dashboard_stats(started_after="2026-06-01T00:00:00+00:00")
+    naive = await search_store.dashboard_stats(started_after="2026-06-01T00:00:00")
+    assert same == stats
+    assert naive == stats
+
+    all_time = await search_store.dashboard_stats()
+    assert all_time.total_sessions == 8
+
+
+async def test_dashboard_bad_cutoff_raises(search_store: SearchStore) -> None:
+    """An unparseable cutoff is a ValueError (the route validates before calling)."""
+    with pytest.raises(ValueError):
+        await search_store.dashboard_stats(started_after="not-a-date")
+
+
+# ---------------------------------------------------------------------------
+# dashboard: kubectl flagged commands (spec §8.2, Q10)
+# ---------------------------------------------------------------------------
+
+
+async def seed_api(
+    activity: ActivityStore,
+    request_id: str,
+    requested_at: str,
+    *,
+    kubectl_session: str | None = "sess-A",
+    conn_id: str = "conn-1",
+    username: str | None = "alice@x",
+    user_id: str | None = "U-alice",
+    resource_address: str | None = "k8s",
+    method: str = "GET",
+    url: str = "/api/v1/namespaces/default/pods",
+    findings: tuple[Finding, ...] = (),
+) -> None:
+    """Store one API request (and its findings) through the ActivityStore."""
+    req = ApiRequest(
+        conn_id=conn_id,
+        request_id=request_id,
+        requested_at=requested_at,
+        user_id=user_id,
+        username=username,
+        method=method,
+        url=url,
+        status_code=200,
+        kubectl_command="kubectl get",
+        kubectl_session=kubectl_session,
+        user_agent="kubectl/v1.33.0 (linux/amd64)",
+    )
+    await activity.insert_request_with_findings(req, resource_address, findings)
+
+
+def _api_finding(severity: str, rule_id: str = "kube-rule") -> Finding:
+    """An API finding with the given severity (rule metadata only)."""
+    return Finding(rule_id, "kube-api", severity, f"{severity} rule", None)
+
+
+@pytest.fixture
+async def activity(db) -> ActivityStore:
+    """An ActivityStore over the fixture DB."""
+    return ActivityStore(db)
+
+
+async def _seed_commands(activity: ActivityStore) -> None:
+    """Seed kubectl commands around ``_CUTOFF`` (2026-06-01T00:00:00Z).
+
+    ====  ==========================================  =========  ===========
+    cmd   identity                                    start      max sev
+    ====  ==========================================  =========  ===========
+    A     sess-A, alice, k8s (3 requests)             06-10      high
+    B     no Kubectl-Session → conn-B, alice          06-10      medium
+    C     sess-C, alice (+ discovery request)         06-10      none
+    D     sess-D, alice; flagged row after cutoff     05-20      critical
+    E     sess-A again but user bob → own command     06-10      low
+    F     sess-F, finding of unknown severity         06-10      (rank 0)
+    G     sess-G, starts exactly at the cutoff        06-01      high
+    H1/2  empty Kubectl-Session → split by conn       06-11      medium x2
+    ====  ==========================================  =========  ===========
+    """
+    await seed_api(activity, "rA1", "2026-06-10T10:00:00.000Z")
+    await seed_api(activity, "rA2", "2026-06-10T10:00:01.000Z", method="DELETE",
+                   findings=(_api_finding("high"),))
+    await seed_api(activity, "rA3", "2026-06-10T10:00:02.000Z",
+                   findings=(_api_finding("medium"), _api_finding("low", "kube-other")))
+    await seed_api(activity, "rB1", "2026-06-10T11:00:00.000Z", kubectl_session=None,
+                   conn_id="conn-B", findings=(_api_finding("medium"),))
+    await seed_api(activity, "rC1", "2026-06-10T12:00:00.000Z", kubectl_session="sess-C")
+    await seed_api(activity, "rC2", "2026-06-10T12:00:00.100Z", kubectl_session="sess-C",
+                   url="/api")
+    await seed_api(activity, "rD1", "2026-05-20T00:00:00.000Z", kubectl_session="sess-D")
+    await seed_api(activity, "rD2", "2026-06-15T00:00:00.000Z", kubectl_session="sess-D",
+                   findings=(_api_finding("critical"),))
+    await seed_api(activity, "rE1", "2026-06-10T13:00:00.000Z", username="bob@x",
+                   user_id="U-bob", findings=(_api_finding("low"),))
+    await seed_api(activity, "rF1", "2026-06-10T14:00:00.000Z", kubectl_session="sess-F",
+                   findings=(_api_finding("bogus"),))
+    await seed_api(activity, "rG1", "2026-06-01T00:00:00.000Z", kubectl_session="sess-G",
+                   findings=(_api_finding("high"),))
+    await seed_api(activity, "rH1", "2026-06-11T00:00:00.000Z", kubectl_session="",
+                   conn_id="conn-H1", findings=(_api_finding("medium"),))
+    await seed_api(activity, "rH2", "2026-06-11T00:00:01.000Z", kubectl_session="",
+                   conn_id="conn-H2", findings=(_api_finding("medium"),))
+
+
+async def test_dashboard_api_flagged_commands_all_time(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    """Each flagged command counts once, at its max severity; the total counts requests."""
+    await _seed_commands(activity)
+    stats = await search_store.dashboard_stats()
+
+    # A, B, D, E, F, G, H1, H2 (C has no finding).
+    assert stats.api_flagged_commands == 8
+    assert stats.api_commands_by_severity == {
+        "critical": 1,  # D
+        "high": 2,  # A (high beats its medium/low), G
+        "medium": 3,  # B, H1, H2
+        "low": 1,  # E: same Kubectl-Session as A, different user
+    }
+    # F (unknown severity) is flagged but in no chip.
+    assert sum(stats.api_commands_by_severity.values()) == stats.api_flagged_commands - 1
+    assert stats.api_flagged_truncated is False
+    # Requests, not commands, and discovery (rC2) included.
+    assert stats.api_requests_total == 13
+
+
+async def test_dashboard_api_flagged_commands_windowed_on_command_start(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    """A command belongs to the window containing its first request (spec §3).
+
+    D's flagged request is inside the window but its start row is not, so D is
+    excluded, exactly as ``type=kubectl&has_findings=true&window=W`` excludes it.
+    G starts exactly at the cutoff (``...SSZ`` vs stored ``...SS.000Z``) and is in.
+    """
+    await _seed_commands(activity)
+    stats = await search_store.dashboard_stats(started_after=_CUTOFF)
+
+    assert stats.api_flagged_commands == 7
+    assert stats.api_commands_by_severity == {"high": 2, "medium": 3, "low": 1}
+    assert stats.api_flagged_truncated is False
+    # The request total is windowed on requested_at: only rD1 falls out.
+    assert stats.api_requests_total == 12
+
+    late = await search_store.dashboard_stats(started_after="2026-06-10T10:00:01Z")
+    # A starts at 10:00:00 (out) although its flagged rows are in; D and G are out.
+    # B, E, F, H1, H2 remain.
+    assert late.api_flagged_commands == 5
+    assert late.api_commands_by_severity == {"medium": 3, "low": 1}
+
+
+async def test_dashboard_api_figures_empty(search_store: SearchStore) -> None:
+    """With no API data the kubectl figures are zero / empty and not truncated."""
+    stats = await search_store.dashboard_stats(started_after=_CUTOFF)
+    assert stats.api_requests_total == 0
+    assert stats.api_flagged_commands == 0
+    assert stats.api_commands_by_severity == {}
+    assert stats.api_flagged_truncated is False
+
+
+async def test_dashboard_api_flagged_cap(
+    search_store: SearchStore, activity: ActivityStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the cap, the figure is clamped and api_flagged_truncated is set."""
+    for i in range(3):
+        await seed_api(activity, f"r{i}", f"2026-06-1{i}T00:00:00.000Z",
+                       kubectl_session=f"cap-{i}", findings=(_api_finding("high"),))
+
+    monkeypatch.setattr(search_mod, "_FLAGGED_CMD_CAP", 2)
+    capped = await search_store.dashboard_stats()
+    assert capped.api_flagged_truncated is True
+    assert capped.api_flagged_commands == 2
+
+    monkeypatch.setattr(search_mod, "_FLAGGED_CMD_CAP", 3)
+    exact = await search_store.dashboard_stats()
+    assert exact.api_flagged_truncated is False
+    assert exact.api_flagged_commands == 3
+    assert exact.api_commands_by_severity == {"high": 3}
+
+
+async def test_dashboard_request_based_api_fields_are_gone(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    """The Session 9 request-based names were removed with the T7 dashboard switch."""
+    await _seed_commands(activity)
+    stats = await search_store.dashboard_stats()
+    for name in ("api_flagged_requests", "api_by_severity"):
+        assert not hasattr(stats, name)
+        assert name not in stats.model_dump()
+
+
+@pytest.mark.parametrize("windowed", [False, True])
+async def test_flagged_command_stats_plan(db, windowed: bool) -> None:
+    """Q10 is driven from api_findings and probes idx_api_req_cmd per command."""
+    params: dict[str, object] = {"cap": 5001}
+    if windowed:
+        params["cutoff"] = "2026-06-01T00:00:00.000Z"
+    cursor = await db.execute(
+        "EXPLAIN QUERY PLAN " + search_mod.flagged_command_stats_sql(windowed=windowed),
+        params,
+    )
+    details = [row["detail"] for row in await cursor.fetchall()]
+    await cursor.close()
+    plan = "\n".join(details)
+
+    # hit: scan api_findings, reach api_requests by primary key.
+    assert any(d.startswith("SCAN f") for d in details), plan
+    assert any(
+        d.startswith("SEARCH r USING") and "request_id=?" in d for d in details
+    ), plan
+    # Every per-command subquery uses the command-key expression index. Unwindowed,
+    # start_at is unused and SQLite drops its subquery, leaving only max_rank.
+    expected = 2 if windowed else 1
+    assert sum("SEARCH q USING INDEX idx_api_req_cmd" in d for d in details) == expected, plan
+    assert "idx_api_req_sys_user_time" not in plan

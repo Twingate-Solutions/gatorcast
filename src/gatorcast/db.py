@@ -14,19 +14,107 @@ Schema evolution:
     * ``CREATE TABLE/INDEX IF NOT EXISTS`` for new tables (idempotent every boot).
     * ``_ensure_columns`` adds columns to a pre-existing ``sessions`` table (idempotent).
     * ``PRAGMA user_version`` gates one-time data migrations that must never re-run.
+
+Shared SQL fragments (``CMD_KEY_SQL``, ``SESSION_AT_SQL``, ``FAILED_SQL``) live here
+because the expression indexes must reproduce them exactly; query code renders them
+through :func:`cmd_key` / :func:`session_at` (or ``.format(a=...)``) so its
+expressions match the indexes. Every connection opened through :func:`connect` has
+the deterministic SQL function ``gc_is_discovery(method, url)`` registered.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import aiosqlite
 
 from gatorcast.logging import get_logger
+from gatorcast.pipeline.activity import is_discovery
 from gatorcast.pipeline.classify import _safe_conn_id
 
 log = get_logger(__name__)
+
+# --- shared SQL fragments (spec §7.1) ----------------------------------------------
+# Each fragment has an ``{a}`` placeholder for an optional table-alias prefix ("" or
+# "q."). The index DDL below is rendered from the same fragments with ``a=""``, so a
+# query that renders them with any alias produces an expression SQLite matches to the
+# index (it compares parsed expressions; the table qualifier does not matter).
+
+# Command key of an ``api_requests`` row: the ``Kubectl-Session`` header when
+# non-empty, else the connection. Distinct ``s:``/``c:`` tags mirror the tagged tuple
+# in ``pipeline.activity._command_key`` so a header value of ``c:<id>`` can never
+# collide with a connection fallback; the empty-string test mirrors its truthiness.
+CMD_KEY_SQL = (
+    "(CASE WHEN COALESCE({a}kubectl_session, '') <> '' "
+    "THEN 's:' || {a}kubectl_session ELSE 'c:' || {a}conn_id END)"
+)
+
+# Sort/filter instant of a ``sessions`` row, rendered in the exact ``requested_at``
+# format ("YYYY-MM-DDTHH:MM:SS.mmmZ") so recordings and kubectl commands compare as
+# strings. Normalizes every stored ``started_at`` shape and the ``created_at``
+# fallback ("YYYY-MM-DD HH:MM:SS"). Deterministic: no 'now' / 'localtime' / 'utc'.
+SESSION_AT_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE({a}started_at, {a}created_at))"
+
+# A failed connection: a visible ``error`` row that never received a chunk or a cast
+# (spec §4.2). Same predicate as ``SessionRepository.delete_start_only_error``.
+FAILED_SQL = "({a}status = 'error' AND COALESCE({a}chunk_count, 0) = 0 AND {a}cast_path IS NULL)"
+
+# A table alias interpolated into SQL must be a plain identifier (code-supplied only).
+_ALIAS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _alias_prefix(alias: str) -> str:
+    """Return ``"<alias>."`` (or ``""`` for no alias) after validating ``alias``.
+
+    Args:
+        alias: A table alias, or ``""`` for unqualified column names.
+
+    Returns:
+        The column-qualifier prefix to substitute for ``{a}``.
+
+    Raises:
+        ValueError: If ``alias`` is not a plain SQL identifier.
+    """
+    if not alias:
+        return ""
+    if _ALIAS_RE.fullmatch(alias) is None:
+        raise ValueError("SQL alias must be a plain identifier")
+    return f"{alias}."
+
+
+def cmd_key(alias: str = "") -> str:
+    """Render :data:`CMD_KEY_SQL` for an optional table alias.
+
+    Args:
+        alias: Table alias of ``api_requests`` in the query (``"q"`` renders
+            ``q.kubectl_session`` / ``q.conn_id``), or ``""`` for bare columns.
+
+    Returns:
+        The command-key SQL expression, matching ``idx_api_req_cmd``.
+
+    Raises:
+        ValueError: If ``alias`` is not a plain SQL identifier.
+    """
+    return CMD_KEY_SQL.format(a=_alias_prefix(alias))
+
+
+def session_at(alias: str = "") -> str:
+    """Render :data:`SESSION_AT_SQL` for an optional table alias.
+
+    Args:
+        alias: Table alias of ``sessions`` in the query (``"s"`` renders
+            ``s.started_at`` / ``s.created_at``), or ``""`` for bare columns.
+
+    Returns:
+        The session-instant SQL expression, matching ``idx_sessions_at``.
+
+    Raises:
+        ValueError: If ``alias`` is not a plain SQL identifier.
+    """
+    return SESSION_AT_SQL.format(a=_alias_prefix(alias))
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -46,6 +134,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     finding_count    INTEGER DEFAULT 0,             -- number of sidecar findings for this session
     max_severity     TEXT,                          -- highest finding severity (low | medium | high | critical)
     request_id       TEXT,                          -- k8s exec/attach request_id (NULL for SSH)
+    sealed_terminal  INTEGER,                       -- 1 terminal seal | 0 reopenable seal | NULL unsealed/legacy
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -112,6 +201,15 @@ CREATE TABLE IF NOT EXISTS api_findings (
 );
 CREATE INDEX IF NOT EXISTS idx_api_findings_request  ON api_findings(request_id);
 CREATE INDEX IF NOT EXISTS idx_api_findings_severity ON api_findings(severity);
+""" + f"""
+-- Session 10 (spec §7.1). The api_requests columns always exist (Session 9 created
+-- the table), so these need no column guard. idx_api_req_cmd is rendered from
+-- CMD_KEY_SQL so query expressions built with cmd_key() match it exactly.
+CREATE INDEX IF NOT EXISTS idx_api_req_cmd ON api_requests(
+    {CMD_KEY_SQL.format(a="")},
+    requested_at, request_id);
+CREATE INDEX IF NOT EXISTS idx_api_req_user_time   ON api_requests(username, requested_at, request_id);
+CREATE INDEX IF NOT EXISTS idx_api_req_userid_time ON api_requests(user_id, requested_at, request_id);
 """
 
 # Columns added to ``sessions`` after its first release. ``CREATE TABLE IF NOT EXISTS``
@@ -120,6 +218,9 @@ SESSION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("finding_count", "ALTER TABLE sessions ADD COLUMN finding_count INTEGER DEFAULT 0"),
     ("max_severity", "ALTER TABLE sessions ADD COLUMN max_severity TEXT"),
     ("request_id", "ALTER TABLE sessions ADD COLUMN request_id TEXT"),
+    # Session 10 T11: how the row was sealed (1 terminal, 0 reopenable, NULL not
+    # sealed / sealed before this column existed — treated as terminal).
+    ("sealed_terminal", "ALTER TABLE sessions ADD COLUMN sealed_terminal INTEGER"),
 )
 
 # Session indexes are created after _ensure_columns so they can reference columns
@@ -131,15 +232,44 @@ SESSION_INDEXES: tuple[tuple[str, str], ...] = (
     ("started_at", "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at)"),
     ("status", "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)"),
     ("request_id", "CREATE INDEX IF NOT EXISTS idx_sessions_request ON sessions(request_id)"),
+    # Session 10 keyset index for the unified timeline (spec §7.1), rendered from
+    # SESSION_AT_SQL so queries built with session_at() match it.
+    (
+        "started_at",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_at ON sessions("
+        f"{SESSION_AT_SQL.format(a='')}, conn_id)",
+    ),
 )
 
 # Current data-migration level stored in ``PRAGMA user_version``.
 #   0 → 1: move start-only ``sessions`` rows into ``connections`` (Session 9, spec §11).
+# Session 10's indexes are idempotent DDL with no data migration: no bump (spec §7.3).
 SCHEMA_VERSION = 1
 
 
+def _sql_is_discovery(method: object, url: object) -> int:
+    """SQL function ``gc_is_discovery(method, url)``: 1 for a discovery request, else 0.
+
+    Delegates to :func:`gatorcast.pipeline.activity.is_discovery`, the single source
+    of truth for the discovery rule. Never raises: a NULL or non-text argument
+    yields 0, so a bad row can never abort the query that calls it.
+
+    Args:
+        method: The ``api_requests.method`` value (any SQLite type).
+        url: The ``api_requests.url`` value (any SQLite type).
+
+    Returns:
+        1 if ``(method, url)`` is a discovery request, else 0.
+    """
+    return int(isinstance(method, str) and isinstance(url, str) and is_discovery(method, url))
+
+
 async def connect(db_path: Path) -> aiosqlite.Connection:
-    """Open an aiosqlite connection with WAL pragmas and row factory set.
+    """Open an aiosqlite connection with WAL pragmas, row factory, and SQL functions.
+
+    Registers the deterministic SQL function ``gc_is_discovery(method, url)``
+    (spec §7.2). It is used only in queries, never in schema, so the database stays
+    readable by any SQLite client.
 
     Args:
         db_path: Filesystem path to the SQLite database file.
@@ -152,6 +282,7 @@ async def connect(db_path: Path) -> aiosqlite.Connection:
     await conn.execute("PRAGMA journal_mode=WAL;")
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA foreign_keys=ON;")
+    await conn.create_function("gc_is_discovery", 2, _sql_is_discovery, deterministic=True)
     await conn.commit()
     return conn
 
@@ -169,7 +300,8 @@ async def _ensure_columns(conn: aiosqlite.Connection) -> None:
 
     ``CREATE TABLE IF NOT EXISTS`` will not alter an existing table, so a DB created
     before these columns existed needs an explicit, guarded ``ALTER``. Covers the
-    Session 8 finding columns and the Session 9 ``request_id`` column.
+    Session 8 finding columns, the Session 9 ``request_id`` column, and the
+    Session 10 ``sealed_terminal`` column (no ``user_version`` bump).
     """
     existing = await _session_columns(conn)
     for col, ddl in SESSION_COLUMNS:

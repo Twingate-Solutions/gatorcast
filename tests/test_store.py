@@ -5,7 +5,9 @@ Covers:
   - provisional guard: upsert does not clobber a complete row
   - finalize: provisional → complete with metadata; idempotent (complete guard)
   - finalize_from_disk path
-  - list_systems: distinct resource_address, counts, last-seen ordering; NULL bucket
+  - list_systems: distinct resource_address, counts, NULL bucket; Session 10:
+    last_session_at / last_api_at in the requested_at format, ordering by the newer
+    timestamp, ssh_count (needs recording data) / exec_count, badge predicates
   - list_sessions: newest-first; NULL/unknown bucket
   - get: present and missing
   - CastStore: write/read/delete (missing-file tolerant)/total_size_bytes
@@ -444,21 +446,144 @@ async def test_list_systems_null_bucket(repo: SessionRepository, db) -> None:
 
 
 async def test_list_systems_ordered_by_last_seen(repo: SessionRepository, db) -> None:
-    """Systems are returned newest-first by last updated_at."""
-    # Insert in a defined order; rely on updated_at being set by DB trigger.
-    # We override updated_at explicitly to control ordering.
+    """Systems are returned newest-first by recording start (created_at fallback)."""
+    # No started_at: SESSION_AT_SQL falls back to created_at. updated_at is set the
+    # other way round to prove it no longer drives the order.
     await db.execute(
         "INSERT INTO sessions (conn_id, resource_address, status, updated_at, created_at) "
-        "VALUES ('f1', 'older', 'complete', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        "VALUES ('f1', 'older', 'complete', '2026-09-01 00:00:00', '2026-01-01 00:00:00')"
     )
     await db.execute(
         "INSERT INTO sessions (conn_id, resource_address, status, updated_at, created_at) "
-        "VALUES ('f2', 'newer', 'complete', '2026-06-01 00:00:00', '2026-06-01 00:00:00')"
+        "VALUES ('f2', 'newer', 'complete', '2026-02-01 00:00:00', '2026-06-01 00:00:00')"
     )
     await db.commit()
     systems = await repo.list_systems()
-    assert systems[0].resource_address == "newer"
-    assert systems[1].resource_address == "older"
+    assert [s.resource_address for s in systems] == ["newer", "older"]
+    assert systems[0].last_session_at == "2026-06-01T00:00:00.000Z"
+    assert systems[0].last_seen == "2026-06-01T00:00:00.000Z"
+
+
+# --- Session 10 T8: timestamps, ssh/exec counts, badges (spec §7.5) ------------------
+
+
+async def _insert_row(
+    db,
+    conn_id: str,
+    resource_address: str | None,
+    *,
+    started_at: str | None,
+    status: str = "complete",
+    chunk_count: int = 0,
+    cast_path: str | None = None,
+    request_id: str | None = None,
+) -> None:
+    """Insert a sessions row with the kind-relevant columns set explicitly."""
+    await db.execute(
+        "INSERT INTO sessions (conn_id, resource_address, status, started_at, chunk_count, "
+        "cast_path, request_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, '2026-01-01 00:00:00', datetime('now'))",
+        (conn_id, resource_address, status, started_at, chunk_count, cast_path, request_id),
+    )
+    await db.commit()
+
+
+async def _insert_api(
+    db, request_id: str, resource_address: str | None, requested_at: str
+) -> None:
+    """Insert a minimal api_requests row."""
+    await db.execute(
+        "INSERT INTO api_requests (request_id, conn_id, resource_address, requested_at, "
+        "method, url) VALUES (?, 'conn-x', ?, ?, 'GET', '/api/v1/pods')",
+        (request_id, resource_address, requested_at),
+    )
+    await db.commit()
+
+
+async def test_list_systems_timestamps_in_requested_at_format(
+    repo: SessionRepository, db
+) -> None:
+    """last_session_at / last_api_at are per system, in the requested_at format."""
+    # Mixed stored started_at shapes: …SSZ (header), …SS.mmmZ (Gateway ts), nanos.
+    await _insert_row(db, "s1", "mixed", started_at="2026-10-01T10:00:00Z", chunk_count=1)
+    await _insert_row(
+        db, "s2", "mixed", started_at="2026-10-01T10:00:00.250Z", chunk_count=1
+    )
+    await _insert_row(db, "s3", "ssh-only", started_at="2026-10-01T08:00:00.123456789Z")
+    await _insert_api(db, "r1", "mixed", "2026-10-01T09:00:00.000Z")
+    await _insert_api(db, "r2", "mixed", "2026-10-01T11:30:00.500Z")
+    await _insert_api(db, "r3", "api-only", "2026-10-01T07:00:00.000Z")
+
+    by_addr = {s.resource_address: s for s in await repo.list_systems()}
+    mixed = by_addr["mixed"]
+    # The fractional start sorts after the whole-second one (boundary-second fix).
+    assert mixed.last_session_at == "2026-10-01T10:00:00.250Z"
+    assert mixed.last_api_at == "2026-10-01T11:30:00.500Z"
+    assert mixed.last_seen == "2026-10-01T11:30:00.500Z"
+    assert by_addr["ssh-only"].last_session_at == "2026-10-01T08:00:00.123Z"
+    assert by_addr["ssh-only"].last_api_at is None
+    assert by_addr["ssh-only"].last_seen == "2026-10-01T08:00:00.123Z"
+    assert by_addr["api-only"].last_session_at is None
+    assert by_addr["api-only"].last_api_at == "2026-10-01T07:00:00.000Z"
+    assert by_addr["api-only"].session_count == 0
+    assert by_addr["api-only"].api_request_count == 1
+
+
+async def test_list_systems_ordered_by_newer_timestamp(repo: SessionRepository, db) -> None:
+    """Rows sort by the newer of last_session_at and last_api_at, newest first."""
+    # a: old session, newest API request → first. b: newest session → second.
+    # c: API only, oldest → last. NULL bucket in the middle.
+    await _insert_row(db, "a1", "a", started_at="2026-10-01T01:00:00.000Z", chunk_count=1)
+    await _insert_api(db, "ra", "a", "2026-10-01T12:00:00.000Z")
+    await _insert_row(db, "b1", "b", started_at="2026-10-01T11:00:00.000Z", chunk_count=1)
+    await _insert_api(db, "rb", "b", "2026-10-01T02:00:00.000Z")
+    await _insert_row(db, "n1", None, started_at="2026-10-01T06:00:00.000Z", chunk_count=1)
+    await _insert_api(db, "rc", "c", "2026-10-01T03:00:00.000Z")
+
+    order = [s.resource_address for s in await repo.list_systems()]
+    assert order == ["a", "b", None, "c"]
+
+
+async def test_list_systems_ssh_and_exec_counts(repo: SessionRepository, db) -> None:
+    """ssh_count needs recording data; exec_count counts request_id rows."""
+    t = "2026-10-01T10:00:00.000Z"
+    # SSH recording with chunks.
+    await _insert_row(db, "ssh-chunks", "web", started_at=t, chunk_count=3)
+    # SSH recording recovered from disk: chunk_count stays 0 but the cast exists.
+    await _insert_row(db, "ssh-disk", "web", started_at=t, cast_path="/data/casts/x.cast")
+    # SSH error row that did get chunks stays SSH.
+    await _insert_row(db, "ssh-err", "web", started_at=t, status="error", chunk_count=1)
+    # Failed connections (start-only error rows): no SSH credit.
+    await _insert_row(db, "failed-web", "web", started_at=t, status="error")
+    await _insert_row(db, "failed-k8s", "k8s", started_at=t, status="error")
+    # kubectl exec recording.
+    await _insert_row(db, "exec-1", "k8s", started_at=t, chunk_count=2, request_id="req-1")
+
+    by_addr = {s.resource_address: s for s in await repo.list_systems()}
+    web, k8s = by_addr["web"], by_addr["k8s"]
+    assert (web.session_count, web.ssh_count, web.exec_count) == (4, 3, 0)
+    assert (k8s.session_count, k8s.ssh_count, k8s.exec_count) == (2, 0, 1)
+
+
+async def test_list_systems_badges(repo: SessionRepository, db) -> None:
+    """SSH badge needs an SSH recording; Kubernetes needs exec or API requests (§7.5)."""
+    t = "2026-10-01T10:00:00.000Z"
+    await _insert_row(db, "s1", "ssh-box", started_at=t, chunk_count=1)
+    await _insert_row(db, "e1", "exec-cluster", started_at=t, chunk_count=1, request_id="q")
+    await _insert_api(db, "r1", "api-cluster", t)
+    # A cluster whose only session is a pending-backstop error row, plus API traffic.
+    await _insert_row(db, "f1", "api-cluster", started_at=t, status="error")
+    # A system with only a start-only error row earns no badge at all.
+    await _insert_row(db, "f2", "dead-box", started_at=t, status="error")
+
+    by_addr = {s.resource_address: s for s in await repo.list_systems()}
+    badges = {a: (s.has_ssh, s.has_kubernetes) for a, s in by_addr.items()}
+    assert badges == {
+        "ssh-box": (True, False),
+        "exec-cluster": (False, True),
+        "api-cluster": (False, True),
+        "dead-box": (False, False),
+    }
 
 
 async def test_list_systems_findings_summary(repo: SessionRepository, db) -> None:
@@ -980,3 +1105,100 @@ async def test_delete_start_only_error_second_call_false(repo: SessionRepository
     await _insert_raw_session(db, "dse-6", "error", chunk_count=0)
     assert await repo.delete_start_only_error("dse-6") is True
     assert await repo.delete_start_only_error("dse-6") is False
+
+
+# ---------------------------------------------------------------------------
+# SessionRepository — seal mode (Session 10 T11)
+# ---------------------------------------------------------------------------
+
+
+async def _finalize(repo: SessionRepository, conn_id: str, **kwargs) -> None:
+    """Helper: finalize a row with fixed metadata plus any override kwargs."""
+    await repo.finalize(
+        conn_id,
+        username="u@x",
+        shell_user=None,
+        started_at=None,
+        ended_at=None,
+        duration_seconds=1.0,
+        width=80,
+        height=24,
+        chunk_count=1,
+        size_bytes=10,
+        cast_path=f"/data/casts/{conn_id}.cast",
+        status=kwargs.pop("status", "complete"),
+        **kwargs,
+    )
+
+
+async def _sealed_terminal(db, conn_id: str):
+    """Helper: the raw ``sealed_terminal`` column value."""
+    cur = await db.execute(
+        "SELECT sealed_terminal FROM sessions WHERE conn_id = ?", (conn_id,)
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return row["sealed_terminal"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [({"sealed_terminal": True}, 1), ({"sealed_terminal": False}, 0), ({}, 1)],
+    ids=["terminal", "reopenable", "default-terminal"],
+)
+async def test_finalize_writes_sealed_terminal(
+    repo: SessionRepository, db, kwargs: dict, expected: int
+) -> None:
+    """finalize persists the seal mode; an unspecified mode is the safe terminal."""
+    await repo.upsert_start("seal-1", username="u@x", resource_address="h", started_at=None)
+    await _finalize(repo, "seal-1", **kwargs)
+    assert await _sealed_terminal(db, "seal-1") == expected
+    session = await repo.get("seal-1")
+    assert session is not None
+    assert session.sealed_terminal is bool(expected)
+
+
+async def test_sealed_terminal_is_none_until_sealed(repo: SessionRepository) -> None:
+    """A provisional row has no seal mode; the model maps NULL to None."""
+    await repo.upsert_start("seal-2", username="u@x", resource_address="h", started_at=None)
+    session = await repo.get("seal-2")
+    assert session is not None
+    assert session.sealed_terminal is None
+
+
+@pytest.mark.parametrize("status", ["complete", "error"])
+async def test_reopen_accepts_sealed_rows_and_clears_flag(
+    repo: SessionRepository, db, status: str
+) -> None:
+    """reopen moves a sealed complete or error row (cast set) to provisional, flag NULL."""
+    await repo.upsert_start("reopen-1", username="u@x", resource_address="h", started_at=None)
+    await _finalize(repo, "reopen-1", status=status, sealed_terminal=False)
+    assert await _sealed_terminal(db, "reopen-1") == 0
+
+    await repo.reopen("reopen-1")
+
+    session = await repo.get("reopen-1")
+    assert session is not None
+    assert session.status == "provisional"
+    assert session.sealed_terminal is None
+    assert await _sealed_terminal(db, "reopen-1") is None
+
+
+async def test_reopen_rejects_failed_connection_error_row(
+    repo: SessionRepository, db
+) -> None:
+    """An error row with no cast (failed connection) is not reopened."""
+    await _insert_raw_session(db, "reopen-2", "error", chunk_count=0)
+    await repo.reopen("reopen-2")
+    session = await repo.get("reopen-2")
+    assert session is not None
+    assert session.status == "error"
+
+
+async def test_reopen_leaves_provisional_row_untouched(repo: SessionRepository) -> None:
+    """reopen only acts on sealed rows."""
+    await repo.upsert_start("reopen-3", username="u@x", resource_address="h", started_at=None)
+    await repo.reopen("reopen-3")
+    session = await repo.get("reopen-3")
+    assert session is not None
+    assert session.status == "provisional"

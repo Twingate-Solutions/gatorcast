@@ -27,6 +27,7 @@ import re
 import aiosqlite
 from pydantic import BaseModel
 
+from gatorcast.db import cmd_key, session_at
 from gatorcast.logging import get_logger
 from gatorcast.models import Session
 from gatorcast.pipeline.detect import SEVERITY_RANK, Finding
@@ -97,13 +98,29 @@ class SearchResult(BaseModel):
 
 
 class DashboardStats(BaseModel):
-    """Aggregate counts for the dashboard view.
+    """Aggregate counts for the dashboard view (unified search spec §8.2).
 
-    The ``api_*`` fields cover kubectl API-request metadata (kubectl activity spec
-    §9): ``api_requests_total`` counts stored requests, ``api_flagged_requests``
-    counts requests with at least one API finding, and ``api_by_severity`` maps each
-    flagged request's highest finding severity to a request count. They are
-    windowed on ``api_requests.requested_at``.
+    Session figures are windowed on the recording start (``SESSION_AT_SQL``), the
+    same predicate ``/search`` uses, so ``total_sessions`` equals the item count of
+    ``type=recordings&window=W``, ``flagged_sessions`` that of
+    ``type=recordings&has_findings=true&window=W``, and each ``by_severity`` entry
+    that of ``type=recordings&max_severity=S&window=W``.
+
+    The ``api_*`` fields cover kubectl activity:
+
+    * ``api_requests_total`` counts stored **requests** (discovery included),
+      windowed on ``api_requests.requested_at``. It is the one figure that is not
+      an item count of its linked search.
+    * ``api_flagged_commands`` counts kubectl **commands** with at least one API
+      finding, each once, windowed on the command's start row — the item count of
+      ``type=kubectl&has_findings=true&window=W``.
+    * ``api_commands_by_severity`` maps each flagged command's highest finding
+      severity to a command count — each entry is the item count of
+      ``type=kubectl&max_severity=S&window=W``. A command whose findings all have
+      an unknown severity is counted in ``api_flagged_commands`` but in no entry.
+    * ``api_flagged_truncated`` is true when more than ``_FLAGGED_CMD_CAP``
+      flagged commands were found; the figures are then lower bounds and
+      ``api_flagged_commands`` is clamped to the cap (rendered as ``5000+``).
     """
 
     total_sessions: int
@@ -113,8 +130,9 @@ class DashboardStats(BaseModel):
     top_users: list[LabeledCount]
     top_systems: list[LabeledCount]
     api_requests_total: int = 0
-    api_flagged_requests: int = 0
-    api_by_severity: dict[str, int] = {}
+    api_flagged_commands: int = 0
+    api_commands_by_severity: dict[str, int] = {}
+    api_flagged_truncated: bool = False
 
 
 # Columns for a FindingRow, in model field order.
@@ -167,6 +185,66 @@ _API_FINDING_RANK_CASE = (
 
 # Maps a severity rank back to its label (0 / unknown → dropped).
 _RANK_TO_SEVERITY = {rank: name for name, rank in SEVERITY_RANK.items()}
+
+# Distinct flagged kubectl commands considered by one dashboard query (spec §6.5,
+# same cap as the search's flagged mode). Read at call time so tests can lower it.
+_FLAGGED_CMD_CAP = 5000
+
+# "q is a row of the command identified by hit row h" (spec §6.3 SAME_CMD). The
+# command key is rendered by db.cmd_key so SQLite matches it to idx_api_req_cmd.
+# The unary ``+`` on the two scope columns stops the planner from choosing
+# idx_api_req_sys_user_time instead (a range over the user's whole history on that
+# cluster); they stay residual filters on the idx_api_req_cmd range.
+# Static SQL: no user value is interpolated.
+_SAME_CMD_AS_HIT = (
+    f"{cmd_key('q')} = h.ck "
+    "AND +q.resource_address IS h.resource_address AND +q.user_key IS h.user_key"
+)
+
+
+def flagged_command_stats_sql(*, windowed: bool) -> str:
+    """Return the dashboard flagged-command query (spec ``Q10``).
+
+    One row per ``(in_window, max_rank)`` with a command count. Named parameters:
+    ``:cap`` (the ``hit`` limit, ``_FLAGGED_CMD_CAP + 1``) and, when ``windowed``,
+    ``:cutoff`` (``…SS.mmmZ`` format). ``CROSS JOIN`` fixes SQLite's join order so
+    both ``hit`` and the per-command rank are driven as the spec's plan requires
+    (``api_findings`` → ``api_requests`` primary key; ``idx_api_req_cmd`` → findings).
+    Static SQL: only fixed fragments are interpolated, never a user value.
+
+    Args:
+        windowed: Whether to emit the ``:cutoff`` predicates.
+
+    Returns:
+        The SQL text.
+    """
+    hit_where = "WHERE r.requested_at >= :cutoff" if windowed else ""
+    in_window = "(c.start_at >= :cutoff)" if windowed else "1"
+    return f"""
+        WITH hit AS (
+            SELECT DISTINCT r.resource_address AS resource_address,
+                            r.user_key AS user_key,
+                            {cmd_key("r")} AS ck
+            FROM api_findings f
+            CROSS JOIN api_requests r ON r.request_id = f.request_id
+            {hit_where}
+            LIMIT :cap
+        ),
+        cmd AS (
+            SELECT
+                (SELECT q.requested_at FROM api_requests q
+                  WHERE {_SAME_CMD_AS_HIT}
+                  ORDER BY q.requested_at, q.request_id LIMIT 1) AS start_at,
+                (SELECT MAX({_API_FINDING_RANK_CASE})
+                   FROM api_requests q
+                   CROSS JOIN api_findings f ON f.request_id = q.request_id
+                  WHERE {_SAME_CMD_AS_HIT}) AS max_rank
+            FROM hit h
+        )
+        SELECT {in_window} AS in_window, c.max_rank AS max_rank, COUNT(*) AS n
+        FROM cmd c
+        GROUP BY 1, 2
+    """
 
 
 class SearchStore:
@@ -536,30 +614,45 @@ class SearchStore:
     async def dashboard_stats(self, *, started_after: str | None = None) -> DashboardStats:
         """Compute aggregate counts for the dashboard, optionally time-windowed.
 
+        Every count is defined so it equals the item count of the unified search
+        the dashboard links it to (spec §8.2), except ``api_requests_total``:
+
+        * Sessions are windowed on ``SESSION_AT_SQL`` (``COALESCE(started_at,
+          created_at)`` rendered in the ``requested_at`` format), the predicate
+          search's ``window``/``from`` uses. A session with a NULL ``started_at``
+          is placed by ``created_at``, and fractional-second starts compare
+          correctly at the boundary second.
+        * kubectl figures count commands from ``Q10`` (see
+          :meth:`_api_command_stats`).
+
         Args:
-            started_after: An ISO8601 cutoff; when supplied, every aggregate counts
-                only sessions whose ``started_at`` is at or after it (and findings on
-                those sessions). ``None`` means all time. The caller (the dashboard
-                route) computes the cutoff from the selected window so the figures and
-                the drill-down search links stay consistent.
+            started_after: An ISO 8601 cutoff (any ``fromisoformat`` shape; naive is
+                UTC); when supplied, every aggregate counts only sessions whose start
+                is at or after it (and findings on those sessions), API requests at
+                or after it, and kubectl commands whose start row is at or after it.
+                ``None`` means all time. It is normalized with
+                :func:`to_requested_at_format`, as search normalizes ``from``.
 
         Returns:
             A :class:`DashboardStats` with total/flagged session counts, a per-session
-            highest-severity breakdown, a per-category finding breakdown, and the top
-            10 users and systems by session count — all within the window.
+            highest-severity breakdown, a per-category finding breakdown, the top 10
+            users and systems by session count, the API request total, and the
+            flagged-command figures — all within the window.
+
+        Raises:
+            ValueError: If ``started_after`` is not parseable ISO 8601.
         """
-        # Optional time window on the session's started_at. SQLite compares the ISO8601
-        # strings lexicographically, which is correct for the fixed "...Z" format.
-        win = "started_at >= ?"
-        p: tuple[object, ...] = (started_after,) if started_after else ()
+        cutoff = to_requested_at_format(started_after) if started_after else None
+        win = f"{session_at()} >= ?"
+        p: tuple[object, ...] = (cutoff,) if cutoff else ()
 
         def s_and() -> str:
-            return f" AND {win}" if started_after else ""
+            return f" AND {win}" if cutoff else ""
 
         def s_where() -> str:
-            return f" WHERE {win}" if started_after else ""
+            return f" WHERE {win}" if cutoff else ""
 
-        # total / flagged sessions
+        # total / flagged sessions (every sessions row: ssh + exec + failed)
         cursor = await self._db.execute(
             "SELECT COUNT(*) AS total, "
             "SUM(CASE WHEN finding_count > 0 THEN 1 ELSE 0 END) AS flagged "
@@ -582,10 +675,10 @@ class SearchStore:
         by_severity = {r["sev"]: int(r["n"]) for r in sev_rows}
 
         # by category (per-finding; joined to the session for the time window)
+        cat_where = f" WHERE {session_at('s')} >= ?" if cutoff else ""
         cursor = await self._db.execute(
             "SELECT f.category AS cat, COUNT(*) AS n FROM findings f "
-            "JOIN sessions s ON s.conn_id = f.conn_id"
-            f"{(' WHERE s.' + win) if started_after else ''} GROUP BY f.category",
+            f"JOIN sessions s ON s.conn_id = f.conn_id{cat_where} GROUP BY f.category",
             p,
         )
         cat_rows = await cursor.fetchall()
@@ -611,9 +704,8 @@ class SearchStore:
         await cursor.close()
         top_systems = [LabeledCount(label=r["label"], count=int(r["n"])) for r in sys_rows]
 
-        api_total, api_flagged, api_by_severity = await self._api_request_stats(
-            started_after
-        )
+        api_total = await self._api_request_total(cutoff)
+        flagged_cmds, cmds_by_severity, truncated = await self._api_command_stats(cutoff)
 
         return DashboardStats(
             total_sessions=total_sessions,
@@ -623,63 +715,90 @@ class SearchStore:
             top_users=top_users,
             top_systems=top_systems,
             api_requests_total=api_total,
-            api_flagged_requests=api_flagged,
-            api_by_severity=api_by_severity,
+            api_flagged_commands=flagged_cmds,
+            api_commands_by_severity=cmds_by_severity,
+            api_flagged_truncated=truncated,
         )
 
-    async def _api_request_stats(
-        self, started_after: str | None
-    ) -> tuple[int, int, dict[str, int]]:
-        """Aggregate kubectl API-request counts for the dashboard card.
+    async def _api_request_total(self, cutoff: str | None) -> int:
+        """Count stored kubectl API requests (discovery included) for the dashboard.
 
-        Windowed on ``api_requests.requested_at``. That column is stored as
-        ``YYYY-MM-DDTHH:MM:SS.mmmZ`` and compared as a string, so the cutoff is
-        normalized to the same format first (a ``...SSZ`` cutoff would mis-order at
-        the boundary second). Only counts and rule-derived severities are read —
-        never a URL or header value.
+        Windowed on ``api_requests.requested_at`` (``idx_api_req_time``). This is a
+        request count, not a command count, so it is not the item count of its
+        linked ``type=kubectl`` search (spec §8.2: "kubectl API requests").
 
         Args:
-            started_after: ISO 8601 cutoff, or ``None`` for all time.
+            cutoff: A cutoff already in the stored ``…SS.mmmZ`` format, or ``None``
+                for all time.
 
         Returns:
-            ``(total_requests, flagged_requests, highest_severity → request count)``.
+            The number of stored requests at or after the cutoff.
         """
-        cutoff = to_requested_at_format(started_after) if started_after else None
-        r_where = " WHERE r.requested_at >= ?" if cutoff else ""
+        r_where = " WHERE requested_at >= ?" if cutoff else ""
         p: tuple[object, ...] = (cutoff,) if cutoff else ()
-
-        cursor = await self._db.execute(
-            f"SELECT COUNT(*) AS n FROM api_requests r{r_where}", p
-        )
+        cursor = await self._db.execute(f"SELECT COUNT(*) AS n FROM api_requests{r_where}", p)
         row = await cursor.fetchone()
         await cursor.close()
-        total = int(row["n"]) if row is not None else 0
+        return int(row["n"]) if row is not None else 0
 
-        # One row per flagged request carrying its highest finding rank, then a
-        # count per rank.
+    async def _api_command_stats(
+        self, cutoff: str | None
+    ) -> tuple[int, dict[str, int], bool]:
+        """Count flagged kubectl commands by highest severity (spec ``Q10``).
+
+        ``Q10`` is the search's flagged-mode ``Q5`` without a keyset: commands are
+        found from ``api_findings`` (``hit``, at most ``_FLAGGED_CMD_CAP + 1``
+        distinct commands), then each command's start row and highest finding rank
+        are computed over **all** its rows through ``idx_api_req_cmd``. A command
+        is ``(resource_address, user_key, CMD_KEY)`` and is counted once, at its
+        max severity, in the window that contains its start row — exactly how
+        ``type=kubectl&has_findings=true`` / ``&max_severity=S`` select and window
+        commands, so each figure equals the item count of its linked list.
+
+        ``hit`` is driven from ``api_findings``, which holds only rule hits, and
+        reaches ``api_requests`` through its primary key, so the cost does not
+        grow with the time range (:func:`flagged_command_stats_sql`). The ``hit``
+        prefilter ``r.requested_at >= cutoff`` is safe: a command that
+        starts in the window has every row at or after its start. Discovery is not
+        applied (no API rule fires on a discovery path). Only counts and
+        rule-derived severities are read — never a URL or header value.
+
+        Args:
+            cutoff: A cutoff already in the stored ``…SS.mmmZ`` format, or ``None``
+                for all time.
+
+        Returns:
+            ``(flagged_commands, highest severity → command count, truncated)``.
+            When truncated, the figures cover only the capped set and
+            ``flagged_commands`` is clamped to the cap.
+        """
+        cap = _FLAGGED_CMD_CAP
+        params: dict[str, object] = {"cap": cap + 1}
+        if cutoff:
+            params["cutoff"] = cutoff
+
         cursor = await self._db.execute(
-            f"""
-            SELECT sev_rank, COUNT(*) AS n FROM (
-                SELECT r.request_id AS request_id,
-                       MAX({_API_FINDING_RANK_CASE}) AS sev_rank
-                FROM api_requests r
-                JOIN api_findings f ON f.request_id = r.request_id
-                {r_where}
-                GROUP BY r.request_id
-            )
-            GROUP BY sev_rank
-            """,
-            p,
+            flagged_command_stats_sql(windowed=cutoff is not None), params
         )
-        rank_rows = await cursor.fetchall()
+        rows = await cursor.fetchall()
         await cursor.close()
 
+        hits = 0
         flagged = 0
         by_severity: dict[str, int] = {}
-        for r in rank_rows:
+        for r in rows:
             count = int(r["n"])
+            hits += count
+            if not r["in_window"]:
+                continue
             flagged += count
-            label = _RANK_TO_SEVERITY.get(int(r["sev_rank"] or 0))
+            label = _RANK_TO_SEVERITY.get(int(r["max_rank"] or 0))
             if label is not None:
                 by_severity[label] = by_severity.get(label, 0) + count
-        return total, flagged, by_severity
+
+        truncated = hits > cap
+        if truncated:
+            # Counter only; never any request content.
+            log.info("dashboard.flagged_commands_truncated", cap=cap)
+            flagged = min(flagged, cap)
+        return flagged, by_severity, truncated

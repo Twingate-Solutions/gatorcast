@@ -6,8 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-05
+
+This release also ships the kubectl activity work that was previously listed under Unreleased.
+
 ### Changed
 
+- **`/search` is now a unified search over every event kind.** It lists SSH recordings, kubectl
+  exec recordings, failed connections and kubectl commands in one interleaved timeline, selected
+  with `type=any|recordings|ssh|exec|failed|kubectl`. A missing `type` means `any`, even on a link
+  that carries only old parameters. A kubectl result is one command (grouped as on the activity
+  page), expandable to its requests. A filter a kind cannot evaluate (`status`, a duration,
+  `mode=regex`, `sort=duration`) excludes that kind and the page says so.
+- **Old `/search` links can show more results, never fewer.** The previous parameter names
+  (`username`, `resource_address`, `started_after`, `started_before`, `keyword`, `regex`, `page`)
+  are still accepted. A link that carried only recording filters still lists every recording it
+  listed before, plus any kubectl commands and failed connections that satisfy the same filters.
+  Three exceptions:
+  1. A value that used to be silently ignored now returns `400`: an unknown `sort`, a non-numeric
+     `min_duration` or `max_duration`, and an uncompilable `regex` (which used to return an empty
+     result).
+  2. `page=N` lands on the first page. The same results are reachable with **Next ›**.
+  3. A hand-typed `started_after` or `started_before` with a fractional second can differ at that
+     one boundary second, because bounds are now compared in a normalized format. Links built by
+     the dashboard never carried fractions.
+- **Search paging is keyset-based and forward-only.** The result total, page numbers and **Prev**
+  link are gone. **Next ›** carries an opaque cursor and **First page** returns to the start.
+  Each page is bounded: at most 20,000 kubectl request rows are examined, and at most
+  `SEARCH_REGEX_MAX_CANDIDATES` sidecars are read, per page. When a budget stops a page,
+  **Continue scanning ›** resumes without skipping or repeating results. `SEARCH_REGEX_MAX_CANDIDATES`
+  is now a per-page limit; it used to cap the whole candidate set. The `search.truncated` log line
+  is replaced by `timeline.content_budget_hit`, which carries counters only.
+- **Search parameters are validated strictly.** An invalid or repeated value, `window` combined
+  with `from`/`to`, `from` later than `to`, an uncompilable regex, or a bad cursor returns `400`
+  with a message that names the parameter and never echoes the value. HTMX requests swap the
+  message into the results area.
+- **CSV export follows the page.** `/search/export.csv` takes the same filters and kinds as the
+  page and writes recordings and kubectl commands mixed, in page order. It now has 15 columns:
+  the first ten are unchanged for recordings, and `kind`, `command`, `method`, `path` and
+  `request_count` are appended. The response sets `X-Gatorcast-Truncated: true` when the export
+  stopped early (10,000-row cap, a scan budget, the sidecar limit, or the flagged-command cap).
+- **Dashboard figures are links.** Every tile, severity chip and top user opens search with an
+  explicit `type` and the selected window, so a figure and its list agree. The kubectl card's
+  flagged figure and severity chips now count **commands**, not requests; its total still counts
+  requests (discovery included). `DashboardStats.api_flagged_requests` and `api_by_severity` are
+  replaced by `api_flagged_commands`, `api_commands_by_severity` and `api_flagged_truncated`.
+  Session figures are windowed on the recording start (the Gateway start time, else the time
+  Gatorcast first saw the session), the same rule search uses, so a session with no `started_at`
+  now falls inside the windows by its first-seen time instead of appearing only under All time.
+  An invalid dashboard `window` still falls back to 30 days.
+- **Systems list.** "Last seen" is replaced by **Last session** and **Last API request**. Rows
+  carry SSH and Kubernetes type badges, sort by the newer of the two timestamps, and the session
+  and API request counts link into search. "Last session" is now the newest recording start
+  rather than `updated_at`. The SSH badge's `ssh_count` also counts rows that have a `.cast` path
+  but zero chunks (recordings rebuilt from disk).
+- **Usernames link to search.** A username on the search, dashboard, session, system and activity
+  pages links to `/search?user=<username>`. A user known only by id links with that id. The
+  `user` filter matches the username or an exact Gateway user id.
+- **`SearchStore.search` and `SearchFilters` are deprecated.** They are kept for one release and
+  no route calls them.
 - **Start-only connections are now pending, not provisional.** An `Authenticated connection`
   line no longer creates a visible session. It writes a hidden *pending connection*
   (`connections` table); the first recording chunk promotes it to a `provisional` session. An
@@ -46,13 +103,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **In-progress recordings are playable** in the UI (served as plaintext; sealed recordings
   are decrypted), shown with an "in progress" badge.
 - `IDLE_TIMEOUT_SECONDS` is no longer a finalize trigger — it only sets the idle-sweep cadence
-  and the startup-sweep cutoff.
+  (the value clamped to 5–30 seconds) and the startup-sweep cutoff.
 - **Unparseable ingest lines now log at `warning`** (was `debug`) with the line length (never
   content), so a transport that mangles chunks — e.g. journald splitting large asciicast lines
   at `LineMax` — is a one-glance `event=normalize.drop reason=unparseable length=49152` signal.
 
 ### Added
 
+- **Unified search.** Event kinds `ssh`, `exec`, `failed` and `kubectl` in one timeline, with a
+  type badge per row. `type=failed` lists failed connections: a connection that delivered neither
+  chunks nor API audits before `SESSION_MAX_IDLE_SECONDS`. They have no recording, so the row
+  links to the session page (**Details ›**) instead of replay. Under `type=any`, a kubectl exec
+  recording appears twice by design: as its own `exec` row and as the **Replay** link inside its
+  command row.
+- **Per-user view.** `/search?user=<username>` lists that user's SSH, exec and kubectl activity on
+  every system.
+- **kubectl command focus.** `/search?cmd=<request_id>` shows the one command that request
+  belongs to, expanded, or "Command not found". An exec recording's session page links to its
+  command, and dashboard feed rows open it.
+- **kubectl commands in search.** Filters: `system`, `user`, `window`/`from`/`to`, `severity`,
+  `max_severity`, `has_findings`, `category=kube-api`, `rule_ids`, `sort=newest|risk`, and text
+  over request URL paths (query strings excluded) and `Kubectl-Command`. `discovery=1` shows
+  discovery-only commands. Each command row lists its first 200 requests.
+- **Recent-activity feed** on the dashboard: the newest 15 items of every kind, discovery-only
+  commands hidden.
+- **Cross-links.** "Search this system" and "kubectl commands in search" on the system page, a
+  ⌕ link beside usernames there, and links from the systems list into search.
+- **Event-kind registry.** `web/kinds.py` (`EventKind`, `KINDS`, the six `TYPE_GROUPS`,
+  `resolve_kinds`) gives future event families a slot without changing the merge, the URL scheme or
+  the cursor format.
+- **New modules.** `store/timeline.py` (the query engine: `UnifiedQuery`, `Cursor`,
+  `build_sources`, `run_timeline`, keyset paging with a frontier rule), `web/params.py`
+  (`parse_unified_query`, `search_url`, cursor encoding), `web/kinds.py`, and the templates
+  `_macros.html`, `_rows.html` and `_search_error.html`.
+- **Four indexes** (`CREATE INDEX IF NOT EXISTS`, no `user_version` bump): `idx_api_req_cmd`
+  (command key, time, id), `idx_api_req_user_time`, `idx_api_req_userid_time` and
+  `idx_sessions_at` (recording start). The first boot after upgrade builds them. A deterministic
+  SQL function `gc_is_discovery(method, url)` is registered on each connection so SQL and Python
+  share one discovery test.
+- **Tests.** `test_timeline.py`, `test_search_params.py`, `test_query_plans.py` and
+  `tests/fixtures/timeline.py`; the secret-hygiene suite now seeds every search type, user, `cmd`
+  and cursor walk. The full suite is 1,379 tests.
 - **kubectl activity.** The stock Gateway's per-request API audit lines are stored as
   allowlisted metadata (method, sanitized URL, status, user, outcome, and the `User-Agent`,
   `Kubectl-Command` and `Kubectl-Session` headers), deduplicated by `request_id`. Requests are
@@ -68,7 +159,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **API findings.** Six built-in rules run on each stored request's method and normalized
   path, category `kube-api`: `kube-delete` (high), `kube-secrets` (high), `kube-evict` (high),
   `kube-cordon` (medium), `kube-exec` (medium) and `kube-node-proxy-exec` (high). Findings
-  store the rule, severity and label only, never the URL.
+  store the rule, severity and label only, never the URL. They are not produced when
+  `DETECTION_ENABLED=false`.
 - **`KUBECTL_ACTIVITY_GAP_SECONDS`** (default `900`) and **`KUBECTL_ACTIVITY_MAX_SECONDS`**
   (default `14400`): the activity-session split gap and the hard cap on one session's span.
   Startup fails if `0 < gap <= max` does not hold. Both are listed in `.env.example`.
@@ -81,9 +173,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Gateway's flush interval; also bounds the plaintext-at-rest window under encryption.
 - **`"session finished"` end signal** (`is_final` on the recording chunk) — the Gateway's
   reliable end-of-session marker, used to seal immediately.
+- **Envelope wire format accepted by `classify`.** Self-describing records with a `type` of
+  `session_start`, `recording_chunk` or `session_end` and no `logger` are mapped onto the
+  existing start, chunk and end events. Retained for compatibility with the former
+  Gateway-fork recording sink; legacy log-line classification is unchanged and the envelope
+  path is not being extended.
 
 ### Fixed
 
+- **A late chunk after a restart could overwrite a sealed recording (data loss).** The set of
+  sealed `conn_id` values lived only in memory (and was cleared after 10,000 entries), so after a
+  restart, or after eviction, a chunk for an already sealed recording found no buffer and was
+  treated as a new connection. Its fragment replaced the sealed `.cast`. The seal mode is now
+  persisted on the session row (`sessions.sealed_terminal`, added by an idempotent column
+  migration with no `user_version` bump), and the row decides what a chunk with no buffer may do:
+  - Sealed terminally (the `session finished` flush or a close event), or sealed before the
+    column existed (`NULL`, treated as terminal): the chunk is ignored and the `.cast` is
+    byte-identical afterward.
+  - Sealed reopenably (idle backstop): the recording is reopened, appended to and re-sealed.
+  - Orphan `.cast` with no row, or a sealed row whose `.cast` is missing: the chunk is ignored
+    and a warning is logged (`assembler.orphan_cast_skip`, `assembler.sealed_cast_missing`). Nothing
+    is written.
+  - An `error` row that has a `.cast` now reopens on a late chunk; it used to stay stuck. A failed
+    connection (`error`, no `.cast`) still recovers as before.
+  - Provisional rows with a `.cast` are adopted as the baseline (`assembler.adopt`).
 - Sessions that outlived the old 120 s idle window (or whose recording shipped late) were
   finalized prematurely as `error` and their eventual recording discarded. Recordings now
   seal on the real end signal and recombine correctly by `conn_id`.
@@ -93,6 +206,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **CSV formula guard.** Any text cell in a search export that starts with `=`, `+`, `-`, `@`,
+  tab or carriage return is written with a leading `'`, because usernames and `Kubectl-Command`
+  values are client-influenced.
+- **Search input never reaches SQL or a response unchecked.** The search cursor is unsigned,
+  length-capped, strictly validated and used only as bound parameters. A `4xx` never echoes the
+  submitted value. Every new `/search` link is built by one function (`search_url`). The
+  secret-hygiene suite now asserts that no planted secret, `command=` value or full `User-Agent`
+  appears in any search page or export.
 - **Request-header allowlist.** Only `User-Agent`, `Kubectl-Command` and `Kubectl-Session` are
   read from a request, matched case-insensitively, first value only, capped at 256 characters.
   `Authorization` (present on every request), cookies, all other request headers, all response
@@ -126,14 +247,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (accepted tradeoff for durability + live playback). Lower `SESSION_MAX_IDLE_SECONDS` to
   shorten that window for abandoned sessions. See ARCHITECTURE.md → Encryption at Rest.
 
+### Notes
+
+- **Known limitation, unchanged:** a chunk redelivered to a recording that was reopened is
+  appended after the existing document rather than deduplicated, so a reopen can duplicate events.
+- **Known limitation, not fixed here:** if the process dies after a recording is encrypted at seal
+  but before its row is marked sealed, the row stays `provisional` with an encrypted `.cast`. The
+  startup sweep and the adopt path read it as plaintext and fail.
+- Dashboard flagged figures above 5,000 commands are lower bounds, shown as `5000+`.
+- `idx_api_req_session` and `idx_api_req_conn` are now likely redundant with the new indexes.
+  They are kept.
+
 ### Documentation
 
+- README, ARCHITECTURE.md, SEARCH_AND_DETECTION.md and TESTING.md describe the unified search,
+  the dashboard and systems changes, the persisted seal mode, and the new test modules. The README
+  has a new Unified Search section and an upgrade note for 0.4.0.
 - Documented a journald ingestion pitfall: `LineMax` (default 48 KB) splits large asciicast
   lines and rate limiting drops them, so high-volume / full-screen-TUI sessions (`btop`,
   `top`, `watch`) silently fail to record. INGESTION_RECIPES.md §2.1 now has a caveat + fix
   (raise `LineMax`/relax rate limiting, or use the §2.4 file-tail transport), §2.4 is
   flagged as the sturdiest transport for chunky sessions, and the README troubleshooting
   guide has a matching callout.
+- README now has Ingestion, Web UI, Search and Detection, Encryption at Rest and Retention
+  sections, a startup-failure troubleshooting entry, and a note that variables set in the
+  `environment:` block of `docker-compose.yml` take precedence over `.env`. The configuration
+  table lists the placeholder defaults for `INGEST_TOKEN` and `UI_AUTH_PASSWORD`.
 
 ## [0.3.0] - 2026-06-18
 
@@ -325,6 +464,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **GitHub Actions CI** (`publish.yml`): `pytest` gate must pass before the image is
   built and pushed; installs the package with `[dev]` extras.
 
+[Unreleased]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.1.0

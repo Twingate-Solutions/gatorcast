@@ -9,8 +9,15 @@
 
   The player JS/CSS are vendored under /static; no CDN is referenced
   (CLAUDE.md rule 8).
+
+  Cross-links (unified search spec §8.5): the User value links to /search?user=…
+  when a username is known, and an exec recording whose request_id matches a stored
+  API request gets a "kubectl command" row linking /search?cmd=…. Both URLs are
+  built by the route.
 #}
 {% block title %}Session {{ session.conn_id }} · Gatorcast{% endblock %}
+
+{% from "_macros.html" import user_link %}
 
 {% block head %}
   <link rel="stylesheet" href="/static/asciinema-player.css" />
@@ -27,10 +34,15 @@
 
   <dl class="meta-grid">
     <dt>User</dt>
-    <dd>{{ session.username or "(unknown user)" }}</dd>
+    <dd>{{ user_link(session.username or "(unknown user)", session.user_url) }}</dd>
 
     <dt>System</dt>
     <dd class="mono">{{ system_label }}</dd>
+
+    {% if command_url %}
+      <dt>Command</dt>
+      <dd><a href="{{ command_url }}">kubectl command <span aria-hidden="true">›</span></a></dd>
+    {% endif %}
 
     <dt>Shell user</dt>
     <dd class="mono">{{ session.shell_user or "—" }}</dd>

@@ -20,6 +20,7 @@ from __future__ import annotations
 import aiosqlite
 from pydantic import BaseModel
 
+from gatorcast.db import session_at
 from gatorcast.models import Session
 
 
@@ -29,6 +30,19 @@ class SystemSummary(BaseModel):
     A system is listed when it has recording sessions, kubectl API requests, or
     both. ``finding_count``/``max_severity`` summarize recording findings only;
     API-request findings are shown on the system's kubectl activity table.
+
+    Timestamps are all in the ``api_requests.requested_at`` format
+    (``YYYY-MM-DDTHH:MM:SS.mmmZ``), so they compare as strings:
+
+    * ``last_session_at`` — newest recording start (``SESSION_AT_SQL``: ``started_at``,
+      else ``created_at``), or ``None`` with no ``sessions`` rows.
+    * ``last_api_at`` — newest ``requested_at``, or ``None`` with no API requests.
+    * ``last_seen`` — the larger of the two (kept for existing callers).
+
+    Counts (spec §7.5): ``session_count`` is every ``sessions`` row (recordings and
+    failed connections); ``ssh_count`` is SSH recordings that hold recording data
+    (chunks, or a ``.cast`` on disk); ``exec_count`` is kubectl exec/attach
+    recordings (``request_id`` set).
     """
 
     resource_address: str | None
@@ -37,6 +51,20 @@ class SystemSummary(BaseModel):
     finding_count: int = 0
     max_severity: str | None = None
     api_request_count: int = 0
+    ssh_count: int = 0
+    exec_count: int = 0
+    last_session_at: str | None = None
+    last_api_at: str | None = None
+
+    @property
+    def has_ssh(self) -> bool:
+        """True when the system earns the SSH badge (at least one SSH recording)."""
+        return self.ssh_count > 0
+
+    @property
+    def has_kubernetes(self) -> bool:
+        """True when the system earns the Kubernetes badge (exec recordings or API requests)."""
+        return self.exec_count > 0 or self.api_request_count > 0
 
 
 # Maps the SQL severity-rank back to a label (0 / no findings → None).
@@ -48,6 +76,53 @@ _SEVERITY_RANK_CASE = (
     "CASE max_severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
     "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
 )
+
+# Q12 (unified search spec §7.4, §7.5): the systems list. A UNION ALL of a
+# per-system aggregate over ``sessions`` (a small table, scanned) and one over
+# ``api_requests`` answered by a covering scan of ``idx_api_req_sys_time``
+# (``resource_address, requested_at``), folded by the outer GROUP BY. No new index.
+# Both timestamps are in the ``requested_at`` format (the sessions side through
+# ``SESSION_AT_SQL``), so they compare directly with no per-row ``datetime()``.
+# Rows sort by the newer of the two, then by address for a stable order.
+#
+# ``ssh_count`` requires recording data (chunks, or a ``.cast`` from crash recovery,
+# which leaves ``chunk_count`` at 0), so a start-only ``error`` row on a cluster never
+# earns an SSH badge. Static SQL only; no value is interpolated.
+LIST_SYSTEMS_SQL = f"""
+SELECT
+    resource_address        AS resource_address,
+    SUM(session_count)      AS session_count,
+    SUM(ssh_count)          AS ssh_count,
+    SUM(exec_count)         AS exec_count,
+    SUM(api_request_count)  AS api_request_count,
+    MAX(last_session_at)    AS last_session_at,
+    MAX(last_api_at)        AS last_api_at,
+    SUM(finding_count)      AS finding_count,
+    MAX(sev_rank)           AS sev_rank
+FROM (
+    SELECT
+        s.resource_address                                   AS resource_address,
+        COUNT(*)                                             AS session_count,
+        SUM(s.request_id IS NULL AND (COALESCE(s.chunk_count, 0) > 0
+                                      OR s.cast_path IS NOT NULL)) AS ssh_count,
+        SUM(s.request_id IS NOT NULL)                        AS exec_count,
+        0                                                    AS api_request_count,
+        MAX({session_at("s")})                               AS last_session_at,
+        NULL                                                 AS last_api_at,
+        COALESCE(SUM(s.finding_count), 0)                    AS finding_count,
+        MAX({_SEVERITY_RANK_CASE})                           AS sev_rank
+    FROM sessions AS s
+    GROUP BY s.resource_address
+    UNION ALL
+    SELECT
+        r.resource_address, 0, 0, 0, COUNT(*), NULL, MAX(r.requested_at), 0, 0
+    FROM api_requests AS r
+    GROUP BY r.resource_address
+)
+GROUP BY resource_address
+ORDER BY MAX(COALESCE(MAX(last_session_at), ''), COALESCE(MAX(last_api_at), '')) DESC,
+         resource_address
+"""
 
 
 class PurgedSession(BaseModel):
@@ -61,12 +136,17 @@ class PurgedSession(BaseModel):
 _SESSION_COLUMNS = (
     "conn_id, username, resource_address, shell_user, started_at, ended_at, "
     "duration_seconds, width, height, chunk_count, size_bytes, cast_path, status, "
-    "finding_count, max_severity, request_id"
+    "finding_count, max_severity, request_id, sealed_terminal"
 )
 
 
 def _row_to_session(row: aiosqlite.Row) -> Session:
-    """Map a ``sessions`` table row to the ``Session`` model."""
+    """Map a ``sessions`` table row to the ``Session`` model.
+
+    ``sealed_terminal`` is read only when the row carries that column, so a caller
+    selecting its own narrower column list still maps cleanly (it gets ``None``).
+    """
+    sealed = row["sealed_terminal"] if "sealed_terminal" in row.keys() else None
     return Session(
         conn_id=row["conn_id"],
         username=row["username"],
@@ -84,6 +164,7 @@ def _row_to_session(row: aiosqlite.Row) -> Session:
         finding_count=row["finding_count"] or 0,
         max_severity=row["max_severity"],
         request_id=row["request_id"],
+        sealed_terminal=None if sealed is None else bool(sealed),
     )
 
 
@@ -282,18 +363,27 @@ class SessionRepository:
         return deleted
 
     async def reopen(self, conn_id: str) -> None:
-        """Revert a timeout-sealed row from ``complete`` back to ``provisional``.
+        """Revert a timeout-sealed row back to ``provisional`` and clear its seal mode.
 
         Called when a late chunk arrives for a session that was sealed by the idle
         backstop (not by a terminal end signal). Puts the row back in the in-progress
-        state so subsequent appends and the eventual re-seal proceed normally.
+        state so subsequent appends and the eventual re-seal proceed normally, and
+        resets ``sealed_terminal`` to ``NULL`` (not sealed).
+
+        Accepts a sealed ``complete`` row and a sealed ``error`` row (unparseable
+        header, but ``cast_path`` set) — otherwise a reopened ``error`` row would stay
+        ``error`` and ``update_progress`` would silently skip it. A failed connection
+        (``error`` with no ``cast_path``) never matches; it recovers through
+        :meth:`revert_error_to_provisional` instead.
 
         Args:
             conn_id: The connection id to reopen.
         """
         await self._db.execute(
-            "UPDATE sessions SET status = 'provisional', updated_at = datetime('now') "
-            "WHERE conn_id = ? AND status = 'complete'",
+            "UPDATE sessions SET status = 'provisional', sealed_terminal = NULL, "
+            "updated_at = datetime('now') "
+            "WHERE conn_id = ? AND status IN ('complete', 'error') "
+            "AND cast_path IS NOT NULL",
             (conn_id,),
         )
         await self._db.commit()
@@ -350,13 +440,16 @@ class SessionRepository:
         size_bytes: int,
         cast_path: str,
         status: str,
+        sealed_terminal: bool = True,
     ) -> None:
         """Complete a row with derived metadata after reassembly from memory.
 
         Mirrors the assembler's former ``_finalize_buffer`` UPDATE: the
         ``status != 'complete'`` guard makes finalize idempotent, and
         ``COALESCE(started_at, ?)`` preserves the provisional (start-event) value,
-        only falling back to the asciicast header timestamp.
+        only falling back to the asciicast header timestamp. The seal mode is
+        written in the same ``UPDATE`` so the database, not the assembler's memory,
+        decides what a later chunk may do to this row.
 
         Args:
             conn_id: The connection id to finalize.
@@ -371,6 +464,10 @@ class SessionRepository:
             size_bytes: Size of the written ``.cast`` file.
             cast_path: Path to the written ``.cast`` file.
             status: ``"complete"`` (parsed OK) or ``"error"`` (kept but unparsable).
+            sealed_terminal: ``True`` for a terminal seal ("session finished" /
+                close — a later chunk is ignored), ``False`` for a reopenable seal
+                (idle backstop — a later chunk reopens and extends it). Defaults to
+                ``True``, the safe choice for callers that do not say.
         """
         await self._db.execute(
             """
@@ -386,6 +483,7 @@ class SessionRepository:
                 size_bytes       = ?,
                 cast_path        = ?,
                 status           = ?,
+                sealed_terminal  = ?,
                 updated_at       = datetime('now')
             WHERE conn_id = ? AND status != 'complete'
             """,
@@ -401,6 +499,7 @@ class SessionRepository:
                 size_bytes,
                 cast_path,
                 status,
+                1 if sealed_terminal else 0,
                 conn_id,
             ),
         )
@@ -539,71 +638,46 @@ class SessionRepository:
     # --- query path (web UI) ---------------------------------------------------
 
     async def list_systems(self) -> list[SystemSummary]:
-        """List distinct target systems with session/API counts, last-seen, and risk.
+        """List distinct target systems with counts, last activity, and risk (Q12).
 
         The union of systems that have recording sessions and clusters that have
-        only kubectl API activity (kubectl activity spec §9): a ``UNION ALL`` of the
+        only kubectl API activity: :data:`LIST_SYSTEMS_SQL`, a ``UNION ALL`` of the
         per-system ``sessions`` aggregate and a ``GROUP BY resource_address`` over
-        ``api_requests``, folded by an outer ``GROUP BY``. ``GROUP BY`` keeps the
-        NULL (unknown) bucket as one group.
+        ``api_requests`` (a covering scan of ``idx_api_req_sys_time``), folded by an
+        outer ``GROUP BY``. ``GROUP BY`` keeps the NULL (unknown) bucket as one group.
 
-        ``last_seen`` is the newest of the sessions' ``updated_at`` and the API
-        requests' ``requested_at``. The two tables store different timestamp formats
-        (``YYYY-MM-DD HH:MM:SS`` vs ``YYYY-MM-DDTHH:MM:SS.mmmZ``), so both sides are
-        normalized with ``datetime(...)`` before comparing; the result is in the
-        sessions table's ``YYYY-MM-DD HH:MM:SS`` format. ``finding_count`` and
-        ``max_severity`` summarize recording findings only.
+        ``last_session_at`` is the newest recording start and ``last_api_at`` the
+        newest ``requested_at``, both in the ``requested_at`` format;
+        ``last_seen`` is the larger of the two. Rows are ordered by that value,
+        newest first (ties by address). ``finding_count`` and ``max_severity``
+        summarize recording findings only.
 
         Returns:
             A list of ``SystemSummary`` rows, most-recent activity first.
         """
-        cursor = await self._db.execute(
-            f"""
-            SELECT
-                resource_address                  AS resource_address,
-                SUM(session_count)                AS session_count,
-                SUM(api_request_count)            AS api_request_count,
-                MAX(last_seen)                    AS last_seen,
-                SUM(finding_count)                AS finding_count,
-                MAX(sev_rank)                     AS sev_rank
-            FROM (
-                SELECT
-                    resource_address                AS resource_address,
-                    COUNT(*)                        AS session_count,
-                    0                               AS api_request_count,
-                    MAX(datetime(updated_at))       AS last_seen,
-                    COALESCE(SUM(finding_count), 0) AS finding_count,
-                    MAX({_SEVERITY_RANK_CASE})      AS sev_rank
-                FROM sessions
-                GROUP BY resource_address
-                UNION ALL
-                SELECT
-                    resource_address                AS resource_address,
-                    0                               AS session_count,
-                    COUNT(*)                        AS api_request_count,
-                    MAX(datetime(requested_at))     AS last_seen,
-                    0                               AS finding_count,
-                    0                               AS sev_rank
-                FROM api_requests
-                GROUP BY resource_address
-            )
-            GROUP BY resource_address
-            ORDER BY last_seen DESC
-            """
-        )
+        cursor = await self._db.execute(LIST_SYSTEMS_SQL)
         rows = await cursor.fetchall()
         await cursor.close()
-        return [
-            SystemSummary(
-                resource_address=row["resource_address"],
-                session_count=int(row["session_count"] or 0),
-                last_seen=row["last_seen"],
-                finding_count=int(row["finding_count"] or 0),
-                max_severity=_RANK_TO_SEVERITY.get(int(row["sev_rank"] or 0)),
-                api_request_count=int(row["api_request_count"] or 0),
+        summaries: list[SystemSummary] = []
+        for row in rows:
+            last_session_at = row["last_session_at"]
+            last_api_at = row["last_api_at"]
+            present = [t for t in (last_session_at, last_api_at) if t]
+            summaries.append(
+                SystemSummary(
+                    resource_address=row["resource_address"],
+                    session_count=int(row["session_count"] or 0),
+                    ssh_count=int(row["ssh_count"] or 0),
+                    exec_count=int(row["exec_count"] or 0),
+                    api_request_count=int(row["api_request_count"] or 0),
+                    last_session_at=last_session_at,
+                    last_api_at=last_api_at,
+                    last_seen=max(present) if present else None,
+                    finding_count=int(row["finding_count"] or 0),
+                    max_severity=_RANK_TO_SEVERITY.get(int(row["sev_rank"] or 0)),
+                )
             )
-            for row in rows
-        ]
+        return summaries
 
     async def list_sessions(self, resource_address: str | None) -> list[Session]:
         """List sessions for one system, newest first.

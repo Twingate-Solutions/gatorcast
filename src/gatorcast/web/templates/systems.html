@@ -1,10 +1,16 @@
 {% extends "base.html" %}
 {#
-  Systems index: one row per distinct resource_address (the target system), with a
-  session count, kubectl API-request count, and last-seen timestamp. Clusters with
-  only kubectl API activity (no recordings) are listed too. The NULL/unknown
-  resource_address bucket is labelled "(unknown)" and linked through a sentinel path
-  segment so it remains browsable. All values are autoescaped by Jinja.
+  Systems index (unified search spec §8.4): one row per distinct resource_address
+  (the target system) with Type badges, the session count and "Last session", the
+  kubectl API-request count and "Last API request", and the recording findings
+  summary. Clusters with only kubectl API activity (no recordings) are listed too.
+  Rows arrive sorted by the newer of the two timestamps.
+
+  The NULL/unknown resource_address bucket is labelled "(unknown)" and linked
+  through a sentinel path segment so it remains browsable. The counts and "Last API
+  request" link into Search through route-built URLs (templates never build /search
+  URLs). Badge labels and classes are fixed strings from the route, never stored
+  text. All values are autoescaped by Jinja.
 #}
 {% block title %}Systems · Gatorcast{% endblock %}
 
@@ -12,52 +18,67 @@
   <h1>Systems</h1>
 
   {% if systems %}
-    <table>
-      <thead>
-        <tr>
-          <th>System (resource address)</th>
-          <th>Sessions</th>
-          <th>API requests</th>
-          <th>Findings</th>
-          <th>Last seen</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for system in systems %}
+    <div class="table-scroll">
+      <table>
+        <thead>
           <tr>
-            <td class="mono">
-              <a href="/systems/{{ system.address_slug }}">
-                {{ system.label }}
-              </a>
-            </td>
-            <td>
-              {% if system.summary.session_count %}
-                {{ system.summary.session_count }}
-              {% else %}
-                <span class="dim">0</span>
-              {% endif %}
-            </td>
-            <td class="api-count">
-              {% if system.summary.api_request_count %}
-                <span class="pill pill-kubectl">kubectl</span>
-                <span class="badge-count">{{ system.summary.api_request_count }}</span>
-              {% else %}
-                <span class="dim">—</span>
-              {% endif %}
-            </td>
-            <td>
-              {% if system.summary.finding_count and system.summary.max_severity %}
-                <span class="sev sev-{{ system.summary.max_severity }}">{{ system.summary.max_severity }}</span>
-                <span class="badge-count">{{ system.summary.finding_count }}</span>
-              {% else %}
-                <span class="dim">—</span>
-              {% endif %}
-            </td>
-            <td class="dim">{{ system.summary.last_seen or "—" }}</td>
+            <th>System (resource address)</th>
+            <th>Type</th>
+            <th class="num">Sessions</th>
+            <th>Last session</th>
+            <th class="num">API requests</th>
+            <th>Last API request</th>
+            <th>Findings</th>
           </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {% for system in systems %}
+            <tr>
+              <td class="mono">
+                <a href="/systems/{{ system.address_slug }}">
+                  {{ system.label }}
+                </a>
+              </td>
+              <td>
+                {% for badge in system.badges %}
+                  <span class="pill {{ badge.css_class }}">{{ badge.label }}</span>
+                {% endfor %}
+              </td>
+              <td class="num">
+                {% if system.summary.session_count %}
+                  <a href="{{ system.sessions_url }}" aria-label="Search {{ system.summary.session_count }} session(s) on {{ system.label }}">{{ system.summary.session_count }} <span aria-hidden="true">›</span></a>
+                {% else %}
+                  <span class="dim">0</span>
+                {% endif %}
+              </td>
+              <td class="dim mono">{{ system.summary.last_session_at or "—" }}</td>
+              <td class="num api-count">
+                {% if system.summary.api_request_count %}
+                  <a href="{{ system.api_url }}" aria-label="Search kubectl commands on {{ system.label }}">{{ system.summary.api_request_count }} <span aria-hidden="true">›</span></a>
+                {% else %}
+                  <span class="dim">—</span>
+                {% endif %}
+              </td>
+              <td class="dim mono">
+                {% if system.summary.last_api_at %}
+                  <a href="{{ system.api_url }}">{{ system.summary.last_api_at }}</a>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>
+                {% if system.summary.finding_count and system.summary.max_severity %}
+                  <span class="sev sev-{{ system.summary.max_severity }}">{{ system.summary.max_severity }}</span>
+                  <span class="badge-count">{{ system.summary.finding_count }}</span>
+                {% else %}
+                  <span class="dim">—</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No recordings or kubectl activity yet.</p>
   {% endif %}

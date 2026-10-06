@@ -1,14 +1,28 @@
 {% extends "base.html" %}
 {#
-  Dashboard: time-windowed aggregate counts and risk breakdowns.
+  Dashboard (unified search spec §8.2): windowed figures that drill into Search, a
+  recent-activity feed, and the risk breakdowns.
 
   Every figure is rule-derived metadata (session/finding counts, severities,
-  categories, top users/systems) computed by SearchStore.dashboard_stats for the
-  selected window — no recording content is ever read or rendered (CLAUDE.md
-  rules 5/6). Bars are server-rendered with plain CSS widths; there is NO charting
-  JS (rule 8). Each breakdown row links into search (or the systems page); the
-  link URLs are built server-side in the route so the window stays consistent.
+  categories, top users/systems, kubectl request and command counts) computed by
+  SearchStore.dashboard_stats for the selected window. No recording content is
+  ever read or rendered (CLAUDE.md rules 5/6). Bars are server-rendered with plain
+  CSS widths; there is NO charting JS (rule 8).
+
+  Links: every URL is pre-built in routes.dashboard with search_url (explicit
+  `type` + the selected `window`, spec §8.1); the template never builds a /search
+  URL. Each tile's value and label sit in ONE <a class="card-link">. The kubectl
+  card's flagged-commands line and severity chips are sibling links, never nested
+  inside the tile link.
+
+  Feed: the newest items of every kind (discovery-only commands hidden, all time),
+  rendered with the shared _rows.html macros in compact form.
+
+  Safety: everything is autoescaped; never add |safe. Severity class names come
+  only from SEVERITY_RANK keys (filtered in the route).
 #}
+{% from "_rows.html" import recording_row, command_row %}
+
 {% block title %}Dashboard · Gatorcast{% endblock %}
 
 {% macro badge_links(rows, sev_by_label) %}
@@ -50,6 +64,13 @@
   {% endif %}
 {% endmacro %}
 
+{% macro tile_link(url, value, label) %}
+  <a class="card-link" href="{{ url }}">
+    <span class="card-value">{{ value }}</span>
+    <span class="card-label">{{ label }} <span aria-hidden="true">›</span></span>
+  </a>
+{% endmacro %}
+
 {% block content %}
   <div class="page-head">
     <h1>Dashboard</h1>
@@ -58,6 +79,7 @@
         <a
           href="/dashboard?window={{ value }}"
           class="window-opt {{ 'active' if window == value else '' }}"
+          {% if window == value %}aria-current="page"{% endif %}
         >{{ label }}</a>
       {% endfor %}
     </nav>
@@ -65,28 +87,69 @@
 
   <div class="card-grid">
     <div class="card">
-      <div class="card-value">{{ stats.total_sessions }}</div>
-      <div class="card-label">Total sessions</div>
+      {{ tile_link(total_sessions_url, stats.total_sessions, "Total sessions") }}
     </div>
     <div class="card">
-      <div class="card-value">{{ stats.flagged_sessions }}</div>
-      <div class="card-label">Flagged sessions</div>
+      {{ tile_link(flagged_sessions_url, stats.flagged_sessions, "Flagged sessions") }}
     </div>
-    {# kubectl API requests (metadata only), windowed on requested_at. #}
+    {#
+      kubectl: the total counts REQUESTS (discovery included), so it is not the
+      item count of its linked list of commands. The flagged figure and the
+      severity chips count COMMANDS, each once at its highest severity, and equal
+      the item counts of their lists.
+    #}
     <div class="card card-kubectl">
-      <div class="card-value">{{ stats.api_requests_total }}</div>
-      <div class="card-label">kubectl API requests</div>
+      {{ tile_link(api_requests_url, stats.api_requests_total, "kubectl API requests") }}
       <div class="card-sub">
-        <span class="badge-count">{{ stats.api_flagged_requests }} flagged</span>
+        <a class="card-sub-link" href="{{ flagged_commands_url }}"{% if stats.api_flagged_truncated %} title="More flagged commands match than are counted; figures are lower bounds."{% endif %}>
+          <span class="badge-count">{{ flagged_commands_label }}</span>
+          flagged command{{ "s" if flagged_commands_plural else "" }} <span aria-hidden="true">›</span>
+        </a>
         {% for row in api_severity_rows %}
-          <span class="card-sub-item">
+          <a class="badge-link card-sub-item" href="{{ row.url }}">
             <span class="sev sev-{{ row.label }}">{{ row.label }}</span>
             <span class="badge-count">{{ row.count }}</span>
-          </span>
+          </a>
         {% endfor %}
       </div>
+      {% if stats.api_flagged_truncated %}
+        <p class="card-note truncated-notice">Over {{ stats.api_flagged_commands }} flagged commands; counts are lower bounds.</p>
+      {% endif %}
     </div>
   </div>
+
+  <section class="feed" aria-labelledby="feed-heading">
+    <div class="feed-head">
+      <h2 id="feed-heading">Recent activity</h2>
+      <a href="{{ view_all_url }}">View all in Search <span aria-hidden="true">›</span></a>
+    </div>
+    {% if feed_items %}
+      <div class="table-scroll">
+        <table class="results-table feed-table">
+          <thead>
+            <tr>
+              <th scope="col">Type</th>
+              <th scope="col">Start (UTC)</th>
+              <th scope="col">System</th>
+              <th scope="col">User</th>
+              <th scope="col">Summary</th>
+              <th scope="col">Risk</th>
+              <th scope="col"><span class="visually-hidden">Action</span></th>
+            </tr>
+          </thead>
+          {% for item in feed_items %}
+            {% if item.row_macro == "command_row" %}
+              {{ command_row(item, false, compact=true) }}
+            {% else %}
+              {{ recording_row(item, compact=true) }}
+            {% endif %}
+          {% endfor %}
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No activity recorded yet.</p>
+    {% endif %}
+  </section>
 
   <div class="panel-grid">
     <section class="panel">

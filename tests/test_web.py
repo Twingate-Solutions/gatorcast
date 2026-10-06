@@ -165,6 +165,63 @@ def test_systems_lists_resource_addresses_and_unknown_bucket(tmp_path: Path) -> 
     assert "/systems/_unknown" in body
 
 
+def test_systems_page_ssh_row_badge_timestamps_and_links(tmp_path: Path) -> None:
+    """Session 10 §8.4: an SSH system shows the SSH badge, Last session, and a count link."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed(app, conn_id="conn-a", username="alice@x", resource_address="prod.example.com")
+        _seed(app, conn_id="conn-b", username="bob@x", resource_address=None)
+        resp = client.get("/systems", headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert '<span class="pill pill-ssh">SSH</span>' in body
+    assert "Kubernetes</span>" not in body
+    # started_at "…10:00:00Z" renders in the requested_at format.
+    assert "2026-01-01T10:00:00.000Z" in body
+    assert 'href="/search?type=recordings&amp;system=prod.example.com"' in body
+    assert 'href="/search?type=recordings&amp;system=_unknown"' in body
+    # No API requests: no kubectl count link.
+    assert "type=kubectl" not in body
+
+
+def test_system_page_has_search_link_and_user_icon_link(tmp_path: Path) -> None:
+    """Session 10 §8.5: "Search this system" and a ⌕ user link beside the replay link."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed(app, conn_id="s1", username="alice@x", resource_address="db.internal")
+        known = client.get("/systems/db.internal", headers=_auth_header())
+        _seed(app, conn_id="u1", username="dana@x", resource_address=None)
+        unknown = client.get("/systems/_unknown", headers=_auth_header())
+
+    assert known.status_code == 200
+    body = known.text
+    assert '<a href="/search?system=db.internal">Search this system' in body
+    assert 'href="/search?type=kubectl&amp;system=db.internal"' in body
+    assert 'href="/sessions/s1"' in body  # the name still links to replay
+    assert (
+        '<a class="user-link user-link-icon" href="/search?user=alice%40x" '
+        'aria-label="All activity for alice@x"'
+    ) in body
+
+    assert unknown.status_code == 200
+    assert '<a href="/search?system=_unknown">Search this system' in unknown.text
+
+
+def test_session_detail_user_links_to_search_and_ssh_has_no_command_link(
+    tmp_path: Path,
+) -> None:
+    """Session 10 §8.5: the User value links to /search?user=…; SSH has no command link."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed(app, conn_id="p0", username="eve@x", resource_address="web.internal")
+        resp = client.get("/sessions/p0", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert '<a class="user-link" href="/search?user=eve%40x">eve@x</a>' in resp.text
+    assert "/search?cmd=" not in resp.text
+
+
 # ---------------------------------------------------------------------------
 # Test 5 — /systems/{addr} lists sessions; unknown bucket via _unknown slug
 # ---------------------------------------------------------------------------

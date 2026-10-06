@@ -1,0 +1,12 @@
+{#
+  HTMX 400 partial for /search (spec §5.3, §8.6). Swapped into #results; base.html's
+  htmx-config meta is what lets htmx swap a 400 body at all.
+
+  error_message is one of web.params' fixed details, which name the parameter only;
+  the submitted value is never echoed. Autoescaped like every value.
+#}
+<div class="search-error" role="alert">
+  <p class="search-error-title">That search could not run</p>
+  <p class="mono search-error-detail">{{ error_message }}</p>
+  <p>Correct it in the form above, or <a href="/search">start a new search</a>.</p>
+</div>

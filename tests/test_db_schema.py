@@ -1,11 +1,22 @@
-"""Schema/migration tests for the Session 8 findings table + session columns."""
+"""Schema/migration tests: Session 8 findings, Session 9 tables + v1 migration,
+Session 10 indexes, SQL fragments, and the ``gc_is_discovery`` SQL function."""
 
 import sqlite3
 
 import aiosqlite
 import pytest
 
-from gatorcast.db import init_db
+from gatorcast.db import (
+    CMD_KEY_SQL,
+    FAILED_SQL,
+    SCHEMA_VERSION,
+    SESSION_AT_SQL,
+    cmd_key,
+    connect,
+    init_db,
+    session_at,
+)
+from gatorcast.pipeline.activity import is_discovery
 
 
 @pytest.mark.asyncio
@@ -108,6 +119,10 @@ _EXPECTED_INDEXES = {
     "idx_api_req_conn",
     "idx_api_req_session",
     "idx_api_req_time",
+    # api_requests, Session 10 (spec §7.1)
+    "idx_api_req_cmd",
+    "idx_api_req_user_time",
+    "idx_api_req_userid_time",
     # api_findings
     "idx_api_findings_request",
     "idx_api_findings_severity",
@@ -116,6 +131,7 @@ _EXPECTED_INDEXES = {
     "idx_sessions_started",
     "idx_sessions_status",
     "idx_sessions_request",
+    "idx_sessions_at",  # Session 10 (spec §7.1)
 }
 
 
@@ -184,7 +200,7 @@ async def test_session9_tables_and_columns_exist(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_all_16_indexes_exist(tmp_path):
+async def test_all_20_indexes_exist(tmp_path):
     db = await init_db(tmp_path / "gatorcast.db")
     try:
         cur = await db.execute(
@@ -192,7 +208,7 @@ async def test_all_16_indexes_exist(tmp_path):
         )
         indexes = {r[0] for r in await cur.fetchall()}
         assert indexes == _EXPECTED_INDEXES
-        assert len(indexes) == 16
+        assert len(indexes) == 20
     finally:
         await db.close()
 
@@ -380,6 +396,53 @@ async def test_upgrade_adds_request_id_column_and_index(tmp_path):
         assert "idx_sessions_request" in await _names(db, "index")
     finally:
         await db.close()
+
+
+# --- Session 10 T11: sessions.sealed_terminal ----------------------------------
+
+
+async def _session_cols(db) -> set[str]:
+    cur = await db.execute("PRAGMA table_info(sessions)")
+    return {r[1] for r in await cur.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_has_sealed_terminal_column(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        assert "sealed_terminal" in await _session_cols(db)
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_adds_sealed_terminal_without_version_bump(tmp_path):
+    """A legacy sessions table gains sealed_terminal (NULL on old rows); a second
+    init_db is a no-op; user_version stays 1."""
+    path = tmp_path / "old.db"
+    await _make_legacy_db(
+        path,
+        [("sealed", "u", "h", "2026-01-01T00:00:00Z", "complete", 3, 100, "/data/sealed.cast", "2026-01-01 00:00:00")],
+    )
+    db = await init_db(path)
+    try:
+        assert "sealed_terminal" in await _session_cols(db)
+        cur = await db.execute("SELECT sealed_terminal FROM sessions WHERE conn_id = 'sealed'")
+        assert (await cur.fetchone())["sealed_terminal"] is None  # legacy: unknown mode
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+
+    db = await init_db(path)  # second boot: guarded ALTER must not re-run or raise
+    try:
+        cur = await db.execute("PRAGMA table_info(sessions)")
+        names = [r[1] for r in await cur.fetchall()]
+        assert names.count("sealed_terminal") == 1
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+    assert SCHEMA_VERSION == 1
 
 
 # --- one-time migration: start-only sessions rows -> connections (spec §11) ---
@@ -669,5 +732,285 @@ async def test_migration_without_casts_dir_skips_file_check(tmp_path):
     try:
         assert await _ids(db, "sessions") == set()
         assert await _ids(db, "connections") == {"crash-prov"}
+    finally:
+        await db.close()
+
+
+# --- Session 10 T1: indexes, SQL fragments, gc_is_discovery (spec §7.1–§7.3) ---
+
+_SESSION10_INDEXES = {"idx_api_req_cmd", "idx_api_req_user_time", "idx_api_req_userid_time", "idx_sessions_at"}
+
+# SQLITE_DETERMINISTIC, as reported in the flags column of PRAGMA function_list.
+_SQLITE_DETERMINISTIC = 0x800
+
+
+async def _index_info(db, name: str) -> list[str | None]:
+    """Key columns of index ``name`` in order; ``None`` marks an expression column."""
+    cur = await db.execute(f"PRAGMA index_info({name})")  # noqa: S608 - fixed literals
+    return [r[2] for r in sorted(await cur.fetchall(), key=lambda r: r[0])]
+
+
+async def _index_sql(db, name: str) -> str:
+    cur = await db.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,))
+    return (await cur.fetchone())[0]
+
+
+async def _plan(db, sql: str, params: tuple = ()) -> str:
+    """The ``EXPLAIN QUERY PLAN`` detail lines of ``sql``, joined."""
+    cur = await db.execute("EXPLAIN QUERY PLAN " + sql, params)
+    return " | ".join(r[3] for r in await cur.fetchall())
+
+
+async def _schema_snapshot(db) -> set[tuple]:
+    cur = await db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
+    return {tuple(r) for r in await cur.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_session10_indexes_have_expected_keys(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        assert _SESSION10_INDEXES <= await _names(db, "index")
+        assert await _index_info(db, "idx_api_req_cmd") == [None, "requested_at", "request_id"]
+        assert await _index_info(db, "idx_api_req_user_time") == ["username", "requested_at", "request_id"]
+        assert await _index_info(db, "idx_api_req_userid_time") == ["user_id", "requested_at", "request_id"]
+        assert await _index_info(db, "idx_sessions_at") == [None, "conn_id"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_expression_indexes_are_built_from_the_shared_fragments(tmp_path):
+    """The index DDL reproduces the fragments exactly, so cmd_key()/session_at() match."""
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        assert cmd_key() in await _index_sql(db, "idx_api_req_cmd")
+        assert session_at() in await _index_sql(db, "idx_sessions_at")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_second_init_db_is_a_noop(tmp_path):
+    """A second boot changes no schema object and leaves user_version at 1 (no bump)."""
+    path = tmp_path / "gatorcast.db"
+    db = await init_db(path)
+    try:
+        before = await _schema_snapshot(db)
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+    db = await init_db(path)
+    try:
+        assert await _schema_snapshot(db) == before
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+    assert SCHEMA_VERSION == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_sessions_without_started_at_skips_idx_sessions_at(tmp_path):
+    """idx_sessions_at is guarded on started_at; its absence must not crash init_db."""
+    path = tmp_path / "minimal.db"
+    conn = await aiosqlite.connect(path)
+    await conn.execute("CREATE TABLE sessions (conn_id TEXT PRIMARY KEY, status TEXT)")
+    await conn.commit()
+    await conn.close()
+
+    db = await init_db(path)
+    try:
+        indexes = await _names(db, "index")
+        assert "idx_sessions_at" not in indexes
+        assert "idx_sessions_started" not in indexes
+        # indexes on present columns, and the api_requests indexes, are still built
+        assert {"idx_sessions_status", "idx_sessions_request"} <= indexes
+        assert {"idx_api_req_cmd", "idx_api_req_user_time", "idx_api_req_userid_time"} <= indexes
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_sessions_with_started_at_gains_idx_sessions_at(tmp_path):
+    path = tmp_path / "old.db"
+    await _make_legacy_db(path, [_KEPT_ROWS[1]])
+    db = await init_db(path)
+    try:
+        assert "idx_sessions_at" in await _names(db, "index")
+        assert await _user_version(db) == 1
+    finally:
+        await db.close()
+
+
+def test_fragment_helpers_render_aliases():
+    assert cmd_key() == CMD_KEY_SQL.format(a="")
+    assert session_at() == SESSION_AT_SQL.format(a="")
+    assert cmd_key("q") == CMD_KEY_SQL.format(a="q.")
+    assert "q.kubectl_session" in cmd_key("q") and "q.conn_id" in cmd_key("q")
+    assert "{a}" not in cmd_key("q")
+    assert session_at("s") == (
+        "strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(s.started_at, s.created_at))"
+    )
+
+
+@pytest.mark.parametrize("alias", ["q.x", "q; DROP TABLE sessions", "1q", "q r", "q--"])
+def test_fragment_helpers_reject_non_identifier_aliases(alias):
+    with pytest.raises(ValueError):
+        cmd_key(alias)
+    with pytest.raises(ValueError):
+        session_at(alias)
+
+
+async def _insert_api(db, request_id: str, conn_id: str, session: str | None, at: str) -> None:
+    await db.execute(
+        "INSERT INTO api_requests (request_id, conn_id, kubectl_session, requested_at, method, url) "
+        "VALUES (?, ?, ?, ?, 'GET', '/api/v1/pods')",
+        (request_id, conn_id, session, at),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cmd_key_values_and_index_use(tmp_path):
+    """Header when non-empty (s:), else the connection (c:); a c:-shaped header never
+    collides with a connection; an aliased query is served by idx_api_req_cmd."""
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        await _insert_api(db, "r-sess", "conn-1", "S1", "2026-10-01T10:00:00.000Z")
+        await _insert_api(db, "r-null", "conn-1", None, "2026-10-01T10:00:01.000Z")
+        await _insert_api(db, "r-empty", "conn-1", "", "2026-10-01T10:00:02.000Z")
+        await _insert_api(db, "r-spoof", "conn-2", "c:conn-1", "2026-10-01T10:00:03.000Z")
+        await db.commit()
+
+        cur = await db.execute(f"SELECT request_id, {cmd_key('q')} AS k FROM api_requests q")
+        keys = {r["request_id"]: r["k"] for r in await cur.fetchall()}
+        assert keys == {
+            "r-sess": "s:S1",
+            "r-null": "c:conn-1",
+            "r-empty": "c:conn-1",
+            "r-spoof": "s:c:conn-1",
+        }
+
+        sql = (
+            f"SELECT q.request_id FROM api_requests q WHERE {cmd_key('q')} = ? "
+            "ORDER BY q.requested_at, q.request_id"
+        )
+        assert "idx_api_req_cmd" in await _plan(db, sql, ("c:conn-1",))
+        cur = await db.execute(sql, ("c:conn-1",))
+        assert [r[0] for r in await cur.fetchall()] == ["r-null", "r-empty"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_at_normalizes_to_requested_at_format(tmp_path):
+    """Every stored started_at shape and the created_at fallback render as
+    YYYY-MM-DDTHH:MM:SS.mmmZ, fixing the boundary-second string mis-order."""
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        rows = [
+            ("ms", "2026-10-01T10:00:01.250Z", "2026-10-01 10:00:09"),
+            ("whole", "2026-10-01T10:00:01Z", "2026-10-01 10:00:09"),
+            ("nanos", "2026-10-01T10:00:01.123456789Z", "2026-10-01 10:00:09"),
+            ("fallback", None, "2026-10-01 10:00:00"),
+        ]
+        await db.executemany(
+            "INSERT INTO sessions (conn_id, started_at, created_at) VALUES (?, ?, ?)", rows
+        )
+        await db.commit()
+
+        cur = await db.execute(f"SELECT s.conn_id, {session_at('s')} AS at FROM sessions s")
+        got = {r["conn_id"]: r["at"] for r in await cur.fetchall()}
+        assert got == {
+            "ms": "2026-10-01T10:00:01.250Z",
+            "whole": "2026-10-01T10:00:01.000Z",
+            "nanos": "2026-10-01T10:00:01.123Z",
+            "fallback": "2026-10-01T10:00:00.000Z",
+        }
+
+        sql = f"SELECT s.conn_id FROM sessions s ORDER BY {session_at('s')} DESC, s.conn_id DESC"
+        assert "idx_sessions_at" in await _plan(db, sql)
+        cur = await db.execute(sql)
+        # raw strings would sort "…01.250Z" before "…01Z"; the normalized form does not
+        assert [r[0] for r in await cur.fetchall()] == ["ms", "nanos", "whole", "fallback"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_sql_selects_only_failed_connections(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        # (conn_id, status, chunk_count, cast_path)
+        rows = [
+            ("failed", "error", 0, None),
+            ("failed-null-count", "error", None, None),
+            ("error-with-chunks", "error", 3, "/data/casts/error-with-chunks.cast"),
+            ("error-with-cast", "error", 0, "/data/casts/error-with-cast.cast"),
+            ("error-chunks-no-cast", "error", 1, None),
+            ("empty-complete", "complete", 0, None),
+            ("provisional", "provisional", 0, None),
+        ]
+        await db.executemany(
+            "INSERT INTO sessions (conn_id, status, chunk_count, cast_path) VALUES (?, ?, ?, ?)", rows
+        )
+        await db.commit()
+        cur = await db.execute(f"SELECT s.conn_id FROM sessions s WHERE {FAILED_SQL.format(a='s.')}")
+        assert {r[0] for r in await cur.fetchall()} == {"failed", "failed-null-count"}
+        cur = await db.execute(f"SELECT conn_id FROM sessions WHERE NOT {FAILED_SQL.format(a='')}")
+        assert len(await cur.fetchall()) == len(rows) - 2
+    finally:
+        await db.close()
+
+
+# The five spec §12 cases plus extra NULL / non-text shapes: (method, url, expected).
+_DISCOVERY_CASES = [
+    ("GET", "/api?timeout=32s", 1),
+    ("GET", "/apis/apps/v1", 1),
+    ("GET", "/api/v1/pods?limit=500", 0),
+    ("POST", "/api", 0),
+    (None, None, 0),
+    (None, "/api", 0),
+    ("GET", None, 0),
+    (1, "/api", 0),
+    ("GET", b"/api", 0),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "url", "expected"), _DISCOVERY_CASES)
+async def test_gc_is_discovery_agrees_with_is_discovery(tmp_path, method, url, expected):
+    """Registered by connect() itself (not only init_db); never raises; 0 for NULLs."""
+    db = await connect(tmp_path / "plain.db")
+    try:
+        cur = await db.execute("SELECT gc_is_discovery(?, ?)", (method, url))
+        got = (await cur.fetchone())[0]
+        assert got == expected
+        if isinstance(method, str) and isinstance(url, str):
+            assert got == int(is_discovery(method, url))
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_gc_is_discovery_is_deterministic_and_works_over_rows(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        cur = await db.execute("PRAGMA function_list")
+        flags = [r["flags"] for r in await cur.fetchall() if r["name"] == "gc_is_discovery"]
+        assert flags and all(f & _SQLITE_DETERMINISTIC for f in flags)
+
+        await db.execute(
+            "INSERT INTO api_requests (request_id, conn_id, requested_at, method, url) VALUES "
+            "('d1', 'c', '2026-10-01T10:00:00.000Z', 'GET', '/api?timeout=32s'), "
+            "('d2', 'c', '2026-10-01T10:00:01.000Z', 'get', '/openapi/v2'), "
+            "('n1', 'c', '2026-10-01T10:00:02.000Z', 'GET', '/api/v1/namespaces/default/pods'), "
+            "('n2', 'c', '2026-10-01T10:00:03.000Z', 'DELETE', '/apis/apps/v1')"
+        )
+        await db.commit()
+        cur = await db.execute(
+            "SELECT request_id FROM api_requests WHERE gc_is_discovery(method, url) = 1"
+        )
+        assert {r[0] for r in await cur.fetchall()} == {"d1", "d2"}
     finally:
         await db.close()

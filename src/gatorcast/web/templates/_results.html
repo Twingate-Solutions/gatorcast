@@ -1,115 +1,93 @@
 {#
-  Search results partial.
+  Unified search results partial (spec §8.3).
 
-  Returned ALONE for HTMX requests (HX-Request header) and included inside
-  search.html for full-page loads. Each row shows session metadata, a risk badge
-  (derived from max_severity + finding_count), and per-finding badges with a
-  "jump" link to the player at the finding offset. NO recording content is shown —
-  only the rule label, severity, and time offset (CLAUDE.md rules 5/6).
+  Returned ALONE for HTMX requests and included inside search.html for full-page
+  loads, so everything that depends on the current search (the filter summary, the
+  Export CSV link, the paging links) lives here and is refreshed by every swap.
 
-  Pagination links preserve the active query string (query_string) and only swap
-  the page number.
+  Rows are plain dicts built by routes._search_context (see the template context
+  contract): metadata and finding rule metadata only — NO recording content
+  (CLAUDE.md rules 5/6). Every value is autoescaped; never add |safe. Class names
+  come only from the registry (badge_class), fixed status maps (status_class), and
+  severity keys. Every /search link is pre-built by the route.
+
+  Row dispatch is on `item.row_macro`: "recording_row" (ssh, exec, failed) or
+  "command_row" (kubectl). Both macros live in _rows.html.
 #}
-{% set result = result %}
-{% set page = result.page %}
-{% set page_size = result.page_size %}
-{% set total = result.total %}
-{% set last_page = ((total + page_size - 1) // page_size) if total else 1 %}
+{% from "_rows.html" import recording_row, command_row %}
 
 <div class="results-meta">
-  <span>{{ total }} result{{ "" if total == 1 else "s" }}</span>
-  <span class="dim">· page {{ page }} of {{ last_page }}</span>
-  {% if result.truncated %}
-    <span class="truncated-notice">
-      Content scan truncated — narrow your filters for complete results.
+  <span class="results-count">Showing {{ shown_count }}</span>
+  {% for chip in summary %}
+    <span class="filter-chip">
+      <span class="dim">{{ chip.name }}:</span>
+      <span class="{{ 'mono' if chip.name == 'system' else '' }}">{{ chip.value }}</span>
+      <a class="chip-clear" href="{{ chip.clear_url }}" hx-get="{{ chip.clear_url }}" hx-target="#results" hx-indicator="#results" hx-push-url="true"
+         aria-label="Remove {{ chip.name }} filter"><span aria-hidden="true">✕</span></a>
     </span>
-  {% endif %}
+  {% endfor %}
+  <a class="export-link" href="{{ export_url }}">Export CSV</a>
 </div>
 
-{% if result.items %}
-  <table>
-    <thead>
-      <tr>
-        <th>Session</th>
-        <th>System</th>
-        <th>User</th>
-        <th>Started</th>
-        <th>Duration</th>
-        <th>Status</th>
-        <th>Risk</th>
-        <th>Findings</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for item in result.items %}
-        {% set s = item.session %}
-        <tr>
-          <td class="mono">
-            <a href="/sessions/{{ s.conn_id }}">{{ s.conn_id }}</a>
-          </td>
-          <td class="mono">{{ s.resource_address or "(unknown)" }}</td>
-          <td>{{ s.username or "(unknown user)" }}</td>
-          <td class="dim">{{ s.started_at or "—" }}</td>
-          <td class="dim">
-            {% if s.duration_seconds is not none %}{{ s.duration_seconds | round(0) | int }}s{% else %}—{% endif %}
-          </td>
-          <td>
-            <span class="pill pill-{{ s.status }}">{{ "in progress" if s.status == "provisional" else s.status }}</span>
-          </td>
-          <td>
-            {% if s.finding_count and s.max_severity %}
-              <span class="sev sev-{{ s.max_severity }}">
-                {{ s.max_severity }} · {{ s.finding_count }}
-              </span>
-            {% else %}
-              <span class="dim">—</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if item.findings %}
-              <ul class="finding-badges">
-                {% for f in item.findings %}
-                  <li>
-                    <span class="sev sev-{{ f.severity }}">{{ f.label }}</span>
-                    {% if f.offset_seconds is not none %}
-                      <a
-                        class="jump"
-                        href="/sessions/{{ s.conn_id }}?t={{ f.offset_seconds }}"
-                        data-offset="{{ f.offset_seconds }}"
-                      >▶ jump</a>
-                    {% endif %}
-                  </li>
-                {% endfor %}
-              </ul>
-            {% else %}
-              <span class="dim">—</span>
-            {% endif %}
-          </td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+{% if focus %}
+  <p class="notice notice-focus">
+    Showing one kubectl command —
+    <a href="{{ focus.clear_url }}" hx-get="{{ focus.clear_url }}" hx-target="#results" hx-indicator="#results" hx-push-url="true">clear</a>
+  </p>
+  {% if focus.not_found %}<p class="notice notice-warn">{{ focus.not_found_text }}</p>{% endif %}
+{% endif %}
 
-  <div class="pagination">
-    {% if page > 1 %}
-      <a
-        class="page-link"
-        href="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page - 1)) }}"
-        hx-get="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page - 1)) }}"
-        hx-target="#results"
-        hx-push-url="true"
-      >‹ Prev</a>
-    {% endif %}
-    {% if page < last_page %}
-      <a
-        class="page-link"
-        href="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page + 1)) }}"
-        hx-get="/search?{{ query_string | replace('page=' ~ page, 'page=' ~ (page + 1)) }}"
-        hx-target="#results"
-        hx-push-url="true"
-      >Next ›</a>
-    {% endif %}
+{% for notice in exclusion_notices %}
+  <p class="notice"><span aria-hidden="true">ⓘ</span> {{ notice.text }}</p>
+{% endfor %}
+{% if flagged_cap_notice %}<p class="truncated-notice">{{ flagged_cap_notice }}</p>{% endif %}
+
+{% if items %}
+  <div class="table-scroll">
+    <table class="results-table">
+      <thead>
+        <tr>
+          <th scope="col">Type</th>
+          <th scope="col">Start (UTC)</th>
+          <th scope="col">System</th>
+          <th scope="col">User</th>
+          <th scope="col">Summary</th>
+          <th scope="col">Risk</th>
+          <th scope="col"><span class="visually-hidden">Action</span></th>
+        </tr>
+      </thead>
+      {% for item in items %}
+        {% if item.row_macro == "command_row" %}
+          {{ command_row(item, show_discovery) }}
+        {% else %}
+          {{ recording_row(item) }}
+        {% endif %}
+      {% endfor %}
+    </table>
   </div>
+{% elif focus %}
+  {# The banner above already says what happened (found, or not found). #}
+{% elif all_excluded %}
+  <p class="empty">No type can be searched with these filters. Remove a filter, or choose a different Type.</p>
+{% elif budget_notices %}
+  <p class="empty">Nothing matched in the part searched so far. Continue scanning, or narrow the search by system, user, or time.</p>
 {% else %}
-  <p class="empty">No sessions match these filters.</p>
+  <p class="empty">No results match these filters. Widen the window or clear a filter.</p>
+{% endif %}
+
+{% for text in budget_notices %}
+  <p class="truncated-notice">{{ text }}</p>
+{% endfor %}
+
+{% if first_page_url or continue_url or next_url %}
+  <nav class="pagination" aria-label="Search results pages">
+    {% if first_page_url %}
+      <a class="page-link" href="{{ first_page_url }}" hx-get="{{ first_page_url }}" hx-target="#results" hx-indicator="#results" hx-swap="innerHTML show:top" hx-push-url="true">First page</a>
+    {% endif %}
+    {% if continue_url %}
+      <a class="page-link" href="{{ continue_url }}" hx-get="{{ continue_url }}" hx-target="#results" hx-indicator="#results" hx-swap="innerHTML show:top" hx-push-url="true">Continue scanning ›</a>
+    {% elif next_url %}
+      <a class="page-link" href="{{ next_url }}" hx-get="{{ next_url }}" hx-target="#results" hx-indicator="#results" hx-swap="innerHTML show:top" hx-push-url="true">Next ›</a>
+    {% endif %}
+  </nav>
 {% endif %}

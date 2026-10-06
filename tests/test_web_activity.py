@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -201,8 +202,11 @@ def test_systems_lists_api_only_cluster(tmp_path: Path) -> None:
     (summary,) = [s for s in summaries if s.resource_address == "api-only.example.internal"]
     assert summary.session_count == 0
     assert summary.api_request_count == 3
-    # last_seen is normalized with datetime(...) on both sides of the union.
-    assert summary.last_seen == "2026-10-01 09:00:02"
+    # Timestamps are in the requested_at format (spec §7.5); last_seen is the newer.
+    assert summary.last_api_at == "2026-10-01T09:00:02.000Z"
+    assert summary.last_session_at is None
+    assert summary.last_seen == "2026-10-01T09:00:02.000Z"
+    assert (summary.has_ssh, summary.has_kubernetes) == (False, True)
 
 
 def test_systems_union_merges_recordings_and_api_counts(tmp_path: Path) -> None:
@@ -224,6 +228,73 @@ def test_systems_union_merges_recordings_and_api_counts(tmp_path: Path) -> None:
     assert CLUSTER in resp.text
 
 
+def test_systems_page_timestamps_badges_and_count_links(tmp_path: Path, monkeypatch) -> None:
+    """Systems page (spec §8.4): both timestamp columns, Type badges, count links."""
+    app = create_app(_settings(tmp_path))
+    captured = _capture_contexts(monkeypatch)
+    with TestClient(app) as client:
+        _feed_fixture(app)
+        _insert_request(
+            app,
+            request_id="api-only-1",
+            resource_address="api-only.example.internal",
+            requested_at="2026-09-30T09:00:00.000Z",
+        )
+        resp = client.get("/systems", headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.text
+    views = {v.summary.resource_address: v for v in captured["systems.html"]["systems"]}
+    cluster = views[CLUSTER].summary
+    # The exec recording on B is the cluster's only session; the newest request is
+    # C's legacy-path line at 10:06:00.
+    assert (cluster.session_count, cluster.ssh_count, cluster.exec_count) == (1, 0, 1)
+    assert cluster.last_session_at == "2026-10-01T10:00:02.900Z"
+    assert cluster.last_api_at == SPAN_TO
+    assert [b.label for b in views[CLUSTER].badges] == ["Kubernetes"]
+    assert [b.label for b in views["api-only.example.internal"].badges] == ["Kubernetes"]
+    # Newer activity first.
+    assert list(views) == [CLUSTER, "api-only.example.internal"]
+
+    for header in ("Type", "Last session", "Last API request"):
+        assert f"<th>{header}</th>" in body
+    assert '<span class="pill pill-kubectl">Kubernetes</span>' in body
+    assert "2026-10-01T10:00:02.900Z" in body
+    assert SPAN_TO in body
+    # Count links into search (spec §8.1), built by search_url.
+    assert f'href="/search?type=recordings&amp;system={CLUSTER}"' in body
+    assert f'href="/search?type=kubectl&amp;system={CLUSTER}"' in body
+    assert 'href="/search?type=kubectl&amp;system=api-only.example.internal"' in body
+
+
+def test_systems_page_ssh_badge_and_no_badge_for_failed_only(tmp_path: Path) -> None:
+    """An SSH recording earns the SSH badge; a start-only error row earns none."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+
+        async def seed() -> None:
+            db = app.state.db
+            await db.execute(
+                "INSERT INTO sessions (conn_id, resource_address, status, started_at, "
+                "chunk_count, cast_path) VALUES "
+                "('ssh-1', 'ssh.example.internal', 'complete', '2026-10-01T10:00:00Z', 2, '/x.cast'), "
+                "('dead-1', 'dead.example.internal', 'error', '2026-10-01T09:00:00Z', 0, NULL)"
+            )
+            await db.commit()
+
+        asyncio.run(seed())
+        summaries = {s.resource_address: s for s in asyncio.run(app.state.repo.list_systems())}
+        resp = client.get("/systems", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert '<span class="pill pill-ssh">SSH</span>' in resp.text
+    assert "Kubernetes</span>" not in resp.text
+    assert summaries["ssh.example.internal"].has_ssh is True
+    dead = summaries["dead.example.internal"]
+    assert (dead.has_ssh, dead.has_kubernetes) == (False, False)
+    assert dead.last_session_at == "2026-10-01T09:00:00.000Z"
+
+
 def test_systems_null_cluster_bucket_merges(tmp_path: Path) -> None:
     """API requests with no cluster join the (unknown) bucket."""
     app = create_app(_settings(tmp_path))
@@ -237,6 +308,8 @@ def test_systems_null_cluster_bucket_merges(tmp_path: Path) -> None:
     assert [s.resource_address for s in summaries] == [None]
     assert summaries[0].api_request_count == 1
     assert "/systems/_unknown" in resp.text
+    # The unknown bucket searches through the system=_unknown sentinel.
+    assert 'href="/search?type=kubectl&amp;system=_unknown"' in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +414,69 @@ def test_system_page_truncation_notice(tmp_path: Path, monkeypatch) -> None:
     assert resp.status_code == 200
     assert "truncated-notice" in resp.text
     assert "first 3 requests" in resp.text
+
+
+def test_system_page_search_cross_links(tmp_path: Path, monkeypatch) -> None:
+    """System page (spec §8.5): "Search this system", kubectl-in-search, ⌕ user links."""
+    app = create_app(_settings(tmp_path))
+    captured = _capture_contexts(monkeypatch)
+    with TestClient(app) as client:
+        _feed_fixture(app)
+        resp = client.get(SYSTEM_URL, headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert f'<a href="/search?system={CLUSTER}">Search this system' in body
+    assert f'<a href="/search?type=kubectl&amp;system={CLUSTER}">kubectl commands in search' in body
+
+    user_href = "/search?user=user%40example.com"
+    icon = (
+        f'<a class="user-link user-link-icon" href="{user_href}" '
+        f'aria-label="All activity for {USERNAME}"'
+    )
+    # One ⌕ link in the recordings table (exec recording) and one in the activity table.
+    assert body.count(icon) == 2
+    # The names keep their primary links (replay / activity page).
+    assert f'href="/sessions/{CONN_B}"' in body
+    ctx = captured["sessions.html"]
+    (row,) = ctx["activity_sessions"]
+    assert row["user_search_url"] == user_href
+    (session,) = ctx["sessions"]
+    assert session["user_url"] == user_href
+
+
+def test_system_page_user_key_fallback_and_null_bucket(tmp_path: Path) -> None:
+    """⌕ falls back to the user_key with no username; the NULL-user bucket gets none."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _insert_request(
+            app,
+            request_id="uid-only",
+            resource_address="fallback.example.internal",
+            requested_at="2026-10-01T10:00:00.000Z",
+            username=None,  # type: ignore[arg-type]
+            user_id="VXNlcjo5",
+        )
+        _insert_request(
+            app,
+            request_id="anon",
+            resource_address="fallback.example.internal",
+            requested_at="2026-10-01T10:00:01.000Z",
+            username=None,  # type: ignore[arg-type]
+            user_id=None,
+            conn_id="cccccccc-0000-4000-8000-000000000009",
+        )
+        resp = client.get(
+            f"/systems/fallback.example.internal?activity_before={BEFORE}",
+            headers=_auth_header(),
+        )
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert 'href="/search?user=VXNlcjo5" aria-label="All activity for VXNlcjo5"' in body
+    assert "(unknown user)" in body
+    assert "All activity for (unknown user)" not in body
+    assert body.count("user-link-icon") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +653,97 @@ def test_activity_page_unknown_user_bucket(tmp_path: Path) -> None:
         )
     assert resp.status_code == 200
     assert "(unknown user)" in resp.text
+    # The NULL-user bucket gets no search link.
+    assert "user-link" not in resp.text
+
+
+def test_activity_page_links_user_to_search(tmp_path: Path) -> None:
+    """The activity header's user label links to /search?user=<username> (spec §8.5)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _feed_fixture(app)
+        resp = client.get(ACTIVITY_URL, headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert (
+        f'<a class="user-link" href="/search?user=user%40example.com">{USERNAME}</a>'
+        in resp.text
+    )
+
+
+def test_activity_page_user_link_falls_back_to_user_key(tmp_path: Path) -> None:
+    """With no username, the header links with the user_key (matched as a user_id)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _insert_request(
+            app,
+            request_id="uid-only",
+            resource_address="fallback.example.internal",
+            requested_at="2026-10-01T10:00:00.000Z",
+            username=None,  # type: ignore[arg-type]
+            user_id="VXNlcjo5",
+        )
+        resp = client.get(
+            "/systems/fallback.example.internal/activity?user=VXNlcjo5"
+            "&from=2026-10-01T10:00:00Z&to=2026-10-01T10:00:00Z",
+            headers=_auth_header(),
+        )
+    assert resp.status_code == 200
+    assert '<a class="user-link" href="/search?user=VXNlcjo5">VXNlcjo5</a>' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Session page — user link and exec → command link (Q13)
+# ---------------------------------------------------------------------------
+
+
+def test_session_page_exec_recording_links_its_command(tmp_path: Path, monkeypatch) -> None:
+    """An exec recording whose request_id is stored links /search?cmd=<request_id>."""
+    app = create_app(_settings(tmp_path))
+    captured = _capture_contexts(monkeypatch)
+    with TestClient(app) as client:
+        _feed_fixture(app)
+        resp = client.get(f"/sessions/{CONN_B}", headers=_auth_header())
+        # The command link opens the command in search.
+        focus = client.get(f"/search?cmd={EXEC_REQUEST_ID}", headers=_auth_header())
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert captured["session.html"]["command_url"] == f"/search?cmd={EXEC_REQUEST_ID}"
+    assert f'<a href="/search?cmd={EXEC_REQUEST_ID}">kubectl command' in body
+    assert f'<a class="user-link" href="/search?user=user%40example.com">{USERNAME}</a>' in body
+    assert focus.status_code == 200
+    assert "kubectl exec" in focus.text
+
+
+def test_session_page_exec_without_stored_command_has_no_link(tmp_path: Path) -> None:
+    """No command link when the exec request_id has no api_requests row (or for SSH)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+
+        async def seed() -> None:
+            db = app.state.db
+            await db.execute(
+                "INSERT INTO sessions (conn_id, resource_address, status, started_at, "
+                "chunk_count, request_id) VALUES "
+                "('exec-orphan', 'k8s.example.internal', 'complete', "
+                "'2026-10-01T10:00:00Z', 1, 'missing-request'), "
+                "('ssh-plain', 'ssh.example.internal', 'complete', "
+                "'2026-10-01T10:00:00Z', 1, NULL)"
+            )
+            await db.commit()
+
+        asyncio.run(seed())
+        orphan = client.get("/sessions/exec-orphan", headers=_auth_header())
+        ssh = client.get("/sessions/ssh-plain", headers=_auth_header())
+
+    for resp in (orphan, ssh):
+        assert resp.status_code == 200
+        assert "/search?cmd=" not in resp.text
+        assert "kubectl command" not in resp.text
+        # No username stored: the user value is plain text.
+        assert "(unknown user)" in resp.text
+        assert "user-link" not in resp.text
 
 
 def test_activity_page_empty_bounds_404(tmp_path: Path) -> None:
@@ -633,7 +860,7 @@ def test_error_detail_does_not_echo_value(tmp_path: Path) -> None:
 
 
 def test_dashboard_shows_kubectl_card(tmp_path: Path) -> None:
-    """The dashboard renders the kubectl API-request card with counts."""
+    """The kubectl card shows the request total, flagged commands, and linked chips."""
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         _feed_fixture(app)
@@ -643,12 +870,17 @@ def test_dashboard_shows_kubectl_card(tmp_path: Path) -> None:
     assert resp.status_code == 200
     body = resp.text
     assert "kubectl API requests" in body
-    assert "1 flagged" in body
+    # Flagged figures count commands (spec §8.2), singular for one.
+    assert re.search(r'<span class="badge-count">1</span>\s*flagged command\s', body)
+    assert 'href="/search?type=kubectl&amp;window=all&amp;has_findings=true"' in body
+    assert 'href="/search?type=kubectl&amp;window=all&amp;max_severity=medium"' in body
+    assert 'href="/search?type=kubectl&amp;window=all"' in body
     assert "sev-medium" in body
 
     assert stats.api_requests_total == 8
-    assert stats.api_flagged_requests == 1
-    assert stats.api_by_severity == {"medium": 1}
+    assert stats.api_flagged_commands == 1
+    assert stats.api_commands_by_severity == {"medium": 1}
+    assert stats.api_flagged_truncated is False
     # Existing aggregates are unchanged: one recording session on the cluster.
     assert stats.total_sessions == 1
 
@@ -671,8 +903,8 @@ def test_dashboard_api_stats_windowed_on_requested_at(tmp_path: Path) -> None:
         )
 
     assert late.api_requests_total == 4
-    assert late.api_flagged_requests == 0
-    assert late.api_by_severity == {}
+    assert late.api_flagged_commands == 0
+    assert late.api_commands_by_severity == {}
     assert boundary.api_requests_total == 1
     assert empty.api_requests_total == 0
 
@@ -684,4 +916,22 @@ def test_dashboard_card_renders_with_no_api_data(tmp_path: Path) -> None:
         resp = client.get("/dashboard", headers=_auth_header())
     assert resp.status_code == 200
     assert "kubectl API requests" in resp.text
-    assert "0 flagged" in resp.text
+    assert re.search(r'<span class="badge-count">0</span>\s*flagged commands\s', resp.text)
+    assert "No activity recorded yet." in resp.text
+
+
+def test_dashboard_flagged_cap_renders_plus_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the flagged-command cap the figure renders as ``N+`` with a lower-bound note."""
+    from gatorcast.store import search as search_mod
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _feed_fixture(app)
+        monkeypatch.setattr(search_mod, "_FLAGGED_CMD_CAP", 0)
+        resp = client.get("/dashboard?window=all", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert re.search(r'<span class="badge-count">0\+</span>\s*flagged commands\s', resp.text)
+    assert "counts are lower bounds" in resp.text

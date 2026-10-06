@@ -1,18 +1,26 @@
 {% extends "base.html" %}
 {#
-  Search page: a GET filter form (HTMX-driven) plus a results region.
+  Unified search page (spec §8.3): one GET filter form (HTMX-driven) plus a results
+  region. The form submits via hx-get to /search, swapping only #results; the same
+  route, hit with HX-Request, returns _results.html (or _search_error.html with a
+  400) alone. Without JavaScript the form is a plain GET to /search and still works.
 
-  The form submits via hx-get to /search, swapping only #results so the page does
-  not reload. The same route, when hit with HX-Request, returns _results.html alone.
-  All inputs are repopulated from the parsed filters so the form is sticky.
+  Inputs are repopulated from `form` (canonical names only), so the form is sticky.
+  The form never carries `cursor` or `cmd`. `max_severity` (the dashboard's exact
+  highest-severity filter) and an explicit `page_size` ride along as hidden inputs.
 
-  Results never include recording content — only metadata + finding label/severity/
-  offset (CLAUDE.md rules 5/6). A CSV export link mirrors the active filters.
+  Window vs From/To: the route rejects a request that carries both (400). A small
+  Alpine handler clears the other side as soon as one is used, so a submitted form
+  never sends both. Alpine is the vendored build; no inline event-handler attributes
+  (same pattern as sessions.html).
+
+  The Export CSV link lives in _results.html, not here, so it follows each swap.
+  Results never include recording content (CLAUDE.md rules 5/6).
 #}
 {% block title %}Search · Gatorcast{% endblock %}
 
 {% block content %}
-  <h1>Search sessions</h1>
+  <h1>Search</h1>
 
   <form
     class="search-form"
@@ -20,126 +28,139 @@
     action="/search"
     hx-get="/search"
     hx-target="#results"
+    hx-indicator="#results"
     hx-push-url="true"
+    x-data
   >
-    {# Exact highest-severity filter, set by the dashboard drill-down. Carried as a
-       hidden field so it survives form re-submits; "Min severity" below is the
-       separate at-or-above filter. #}
-    <input type="hidden" name="max_severity" value="{{ filters.max_severity or '' }}" />
+    <input type="hidden" name="max_severity" value="{{ form.max_severity }}" />
+    {% if form.page_size %}<input type="hidden" name="page_size" value="{{ form.page_size }}" />{% endif %}
+
     <div class="field-grid">
       <label>
-        User
-        <input type="text" name="username" value="{{ filters.username or '' }}" />
-      </label>
-      <label>
-        System (resource address)
-        <input type="text" name="resource_address" value="{{ filters.resource_address or '' }}" />
-      </label>
-      <label>
-        Status
-        <select name="status">
-          {% set statuses = ["", "complete", "provisional", "error"] %}
-          {% for st in statuses %}
-            <option value="{{ st }}" {{ "selected" if (filters.status or "") == st else "" }}>
-              {{ st or "any" }}
-            </option>
+        Type
+        <select name="type">
+          {% for value, label in type_options %}
+            <option value="{{ value }}"{% if form.type == value %} selected{% endif %}>{{ label }}</option>
           {% endfor %}
         </select>
       </label>
-
       <label>
-        Started after
-        <input type="text" name="started_after" placeholder="2026-01-01T00:00:00Z"
-               value="{{ filters.started_after or '' }}" />
+        System
+        <input type="text" name="system" value="{{ form.system }}" placeholder="address, or _unknown" autocomplete="off" spellcheck="false" />
       </label>
       <label>
-        Started before
-        <input type="text" name="started_before" placeholder="2026-12-31T23:59:59Z"
-               value="{{ filters.started_before or '' }}" />
-      </label>
-
-      <label>
-        Min duration (s)
-        <input type="text" name="min_duration"
-               value="{{ filters.min_duration if filters.min_duration is not none else '' }}" />
+        User
+        <input type="text" name="user" value="{{ form.user }}" placeholder="username" autocomplete="off" spellcheck="false" />
       </label>
       <label>
-        Max duration (s)
-        <input type="text" name="max_duration"
-               value="{{ filters.max_duration if filters.max_duration is not none else '' }}" />
+        Window
+        <select name="window" x-ref="window" x-on:change="if ($el.value) { $refs.from.value = ''; $refs.to.value = '' }">
+          {% for value, label in window_options %}
+            <option value="{{ value }}"{% if form.window == value %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
       </label>
-
+      <label>
+        From (UTC)
+        <input type="text" name="from" value="{{ form['from'] }}" placeholder="2026-01-01T00:00:00Z" autocomplete="off" spellcheck="false"
+               x-ref="from" x-on:input="$refs.window.value = ''" />
+      </label>
+      <label>
+        To (UTC)
+        <input type="text" name="to" value="{{ form.to }}" placeholder="2026-12-31T23:59:59Z" autocomplete="off" spellcheck="false"
+               x-ref="to" x-on:input="$refs.window.value = ''" />
+      </label>
       <label>
         Min severity
         <select name="severity">
-          <option value="" {{ "selected" if not filters.severity else "" }}>any</option>
+          <option value=""{% if not form.severity %} selected{% endif %}>any</option>
           {% for sev in severity_options %}
-            <option value="{{ sev }}" {{ "selected" if filters.severity == sev else "" }}>
-              {{ sev }}
-            </option>
+            <option value="{{ sev }}"{% if form.severity == sev %} selected{% endif %}>{{ sev }}</option>
           {% endfor %}
         </select>
       </label>
-      <label>
-        Category
-        <select name="category">
-          {% set cats = ["", "dangerous-command", "secret-exposure"] %}
-          {% for cat in cats %}
-            <option value="{{ cat }}" {{ "selected" if (filters.category or "") == cat else "" }}>
-              {{ cat or "any" }}
-            </option>
-          {% endfor %}
-        </select>
-      </label>
-
       <label>
         Has findings
         <select name="has_findings">
-          <option value="" {{ "selected" if filters.has_findings is none else "" }}>any</option>
-          <option value="true" {{ "selected" if filters.has_findings is true else "" }}>yes</option>
-          <option value="false" {{ "selected" if filters.has_findings is false else "" }}>no</option>
+          <option value=""{% if form.has_findings == "" %} selected{% endif %}>any</option>
+          <option value="true"{% if form.has_findings == "true" %} selected{% endif %}>yes</option>
+          <option value="false"{% if form.has_findings == "false" %} selected{% endif %}>no</option>
         </select>
       </label>
-
       <label class="field-wide">
-        Dangerous-command rules
-        <select name="rule_ids" multiple size="5">
-          {% for rule in rules %}
-            <option value="{{ rule.id }}" {{ "selected" if rule.id in filters.rule_ids else "" }}>
-              {{ rule.label }}
-            </option>
-          {% endfor %}
-        </select>
+        Text
+        <input type="text" name="q" value="{{ form.q }}" autocomplete="off" spellcheck="false" />
       </label>
-
-      <label>
-        Keyword (content)
-        <input type="text" name="keyword" value="{{ filters.keyword or '' }}" />
-      </label>
-      <label>
-        Regex (content)
-        <input type="text" name="regex" value="{{ filters.regex or '' }}" />
-      </label>
-
+      <fieldset class="radio-group">
+        <legend>Match as</legend>
+        {% for value, label in mode_options %}
+          <label><input type="radio" name="mode" value="{{ value }}"{% if form.mode == value %} checked{% endif %} /> {{ label }}</label>
+        {% endfor %}
+      </fieldset>
       <label>
         Sort
         <select name="sort">
           {% for value, label in sort_options %}
-            <option value="{{ value }}" {{ "selected" if filters.sort == value else "" }}>
-              {{ label }}
-            </option>
+            <option value="{{ value }}"{% if form.sort == value %} selected{% endif %}>{{ label }}</option>
           {% endfor %}
         </select>
       </label>
     </div>
+    <p class="form-hint dim">Use either a Window or From/To, not both. The last one you touch wins.</p>
+
+    <details class="recording-filters"{% if recording_filters_open %} open{% endif %}>
+      <summary>Recording filters <span class="dim">(status, duration, category, dangerous-command rules)</span></summary>
+      <div class="field-grid">
+        <label>
+          Status
+          <select name="status">
+            <option value=""{% if not form.status %} selected{% endif %}>any</option>
+            {% for st in status_options %}
+              <option value="{{ st }}"{% if form.status == st %} selected{% endif %}>{{ st }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Min duration (seconds)
+          <input type="text" name="min_duration" value="{{ form.min_duration }}" inputmode="decimal" autocomplete="off" />
+        </label>
+        <label>
+          Max duration (seconds)
+          <input type="text" name="max_duration" value="{{ form.max_duration }}" inputmode="decimal" autocomplete="off" />
+        </label>
+        <label>
+          Category
+          <select name="category">
+            <option value=""{% if not form.category %} selected{% endif %}>any</option>
+            {% for cat in category_options %}
+              <option value="{{ cat }}"{% if form.category == cat %} selected{% endif %}>{{ cat }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="field-wide">
+          Dangerous-command rules
+          <select name="rule_ids" multiple size="5">
+            {% for rule in rules %}
+              <option value="{{ rule.id }}"{% if rule.id in form.rule_ids %} selected{% endif %}>{{ rule.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <p class="form-hint dim">These filters apply to recordings only; kubectl commands are skipped when one is set.</p>
+    </details>
+
+    <label class="checkbox">
+      <input type="checkbox" name="discovery" value="1"{% if form.discovery %} checked{% endif %} />
+      Show discovery-only kubectl commands
+    </label>
 
     <div class="form-actions">
       <button type="submit">Search</button>
-      <a class="export-link" href="/search/export.csv?{{ query_string }}">Export CSV</a>
+      <a class="reset-link" href="/search">Clear all filters</a>
     </div>
   </form>
 
-  <div id="results">
+  <div id="results" aria-live="polite">
     {% include "_results.html" %}
   </div>
 {% endblock %}

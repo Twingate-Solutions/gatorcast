@@ -89,7 +89,25 @@ _LOG_MODULES = (
 )
 
 _HREF_RE = re.compile(r'href="([^"]+)"')
-_MAX_CRAWLED_PAGES = 80
+# Session 10 T9: raised from 80. The explicit seeds now number ~90 (search types, users,
+# systems, windows, legacy params, command focus, both CSV exports, the Next-cursor
+# walk), which alone exceeded the old cap. Search pages link to each other through
+# facets, so the crawl graph is effectively unbounded and always runs to the cap; it
+# sits well above the seed count so links followed from the dashboard feed, systems
+# list, and search results are still fetched. Seeds are fetched regardless of the cap.
+_MAX_CRAWLED_PAGES = 300
+# "Next >" / "Continue scanning >" link on a /search results page.
+_NEXT_RE = re.compile(
+    r'<a class="page-link" href="([^"]+)"[^>]*>\s*(?:Next|Continue scanning)\s*›'
+)
+_CURSOR_WALK_STEPS = 6  # pages followed through Next per cursor-walk seed
+
+# Fixture values that must never be rendered or exported (spec s10 / s12): the full
+# User-Agent string, the Gateway TCP peer (remote_addr), and a response-header value.
+FULL_USER_AGENT = "kubectl/v1.33.0 (linux/amd64) kubernetes/abcdef0"
+USER_AGENT_FRAGMENTS = (FULL_USER_AGENT, "linux/amd64", "kubernetes/abcdef0")
+REMOTE_ADDR_HOST = "10.0.0.5"
+RESPONSE_HEADER_VALUE = "no-cache, private"
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +298,7 @@ class HygieneRun:
     pages: dict[str, Page] = field(default_factory=dict)
     explicit_paths: list[str] = field(default_factory=list)
     cast_responses: dict[str, Page] = field(default_factory=dict)
+    error_pages: dict[str, Page] = field(default_factory=dict)  # 400 probes (not crawled)
     ingest_status: int = 0
 
 
@@ -391,10 +410,18 @@ def _run_pipeline(data_dir: Path, *, encryption: bool) -> HygieneRun:
                 asyncio.run(app.state.assembler.finalize_idle())
 
                 run.explicit_paths = _explicit_paths(db)
+                # Next-cursor pages: walk the one-item-per-page results for the mixed
+                # list and for kubectl only.
+                for start in ("/search?page_size=1", "/search?type=kubectl&page_size=1"):
+                    run.explicit_paths += _cursor_walk(client, start, _CURSOR_WALK_STEPS)
+                run.explicit_paths.append("/search?type=kubectl&page_size=1")
+                run.explicit_paths = list(dict.fromkeys(run.explicit_paths))
                 _crawl(client, run, list(run.explicit_paths))
                 # Explicit seeds are always recorded, even if the crawl cap was hit.
                 for path in run.explicit_paths:
                     run.pages.setdefault(path, _fetch(client, path))
+                for path in _BAD_REQUEST_PROBES:
+                    run.error_pages[path] = _fetch(client, path)
                 for (conn_id,) in _rows(db, "SELECT conn_id FROM sessions"):
                     cast_path = f"/sessions/{conn_id}/cast"
                     run.cast_responses[cast_path] = _fetch(client, cast_path)
@@ -403,6 +430,25 @@ def _run_pipeline(data_dir: Path, *, encryption: bool) -> HygieneRun:
         root.setLevel(previous_level)
         patcher.undo()
     return run
+
+
+# Rejected requests carrying a marker value: the 400 must not echo it (spec s10). The
+# marker is deliberately not one of SENTINELS: the TestClient's own httpx logger prints
+# every request URL, which would otherwise trip the app-log scan with a test artifact.
+ECHO_PROBE = "GC_PROBE_ECHO"
+_BAD_REQUEST_PROBES = (
+    f"/search?type={ECHO_PROBE}",
+    f"/search?cursor={ECHO_PROBE}",
+    f"/search?cmd={ECHO_PROBE}%00",
+    f"/search?sort={ECHO_PROBE}",
+    f"/search?severity={ECHO_PROBE}",
+    f"/search?q=({ECHO_PROBE}&mode=regex",
+    f"/search?window={ECHO_PROBE}",
+    f"/search?from={ECHO_PROBE}",
+    f"/search?user={ECHO_PROBE}&username={ECHO_PROBE}",
+    f"/search/export.csv?type={ECHO_PROBE}",
+    f"/search/export.csv?cursor={ECHO_PROBE}&page_size={ECHO_PROBE}",
+)
 
 
 def _explicit_paths(db_path: Path) -> list[str]:
@@ -439,7 +485,119 @@ def _explicit_paths(db_path: Path) -> list[str]:
             paths.append(base + "&discovery=1")
     for (conn_id,) in _rows(db_path, "SELECT conn_id FROM sessions"):
         paths.append(f"/sessions/{conn_id}")
+    paths.extend(_search_paths(db_path))
     return paths
+
+
+def _q(**params: str) -> str:
+    """Build a ``/search``-style query string (values percent-encoded)."""
+    return "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
+
+
+def _search_paths(db_path: Path) -> list[str]:
+    """Every Session 10 search seed (spec s12): unified search, focus, and both exports."""
+    paths: list[str] = ["/search?page_size=1"]  # first page of the Next-cursor walk
+    # One seed per search type, plus the shapes called out in the spec.
+    for type_ in ("any", "recordings", "ssh", "exec", "failed", "kubectl"):
+        paths.append(f"/search?type={type_}")
+    paths += [
+        "/search?type=kubectl&discovery=1",
+        "/search?type=any&discovery=1",
+        "/search?type=any&sort=risk",
+        "/search?type=kubectl&sort=risk",
+        "/search?type=kubectl&has_findings=true",
+        "/search?type=kubectl&severity=high",
+        "/search?type=any&status=complete",
+        # Text and regex search (text over kubectl matches path / kubectl_command).
+        "/search?type=kubectl&q=pods",
+        "/search?type=any&q=exec",
+        "/search?type=any&q=echo",
+        "/search?type=any&q=echo&mode=regex",
+        "/search?type=recordings&q=hi&mode=regex",
+        # Windows.
+        "/search?window=7",
+        "/search?window=30",
+        "/search?window=90",
+        "/search?window=all",
+        "/search?type=kubectl&window=all&discovery=1",
+        # Absolute bounds that pin the fixture day.
+        "/search?" + _q(**{"from": "2026-10-01T00:00:00Z", "to": BEFORE}),
+        # Legacy (Session 8) params, which still resolve to type=any.
+        "/search?" + _q(keyword="echo"),
+        "/search?" + _q(regex="echo|hi"),
+        "/search?" + _q(started_after="2026-10-01T00:00:00Z"),
+        "/search?" + _q(started_before=BEFORE),
+        "/search?page=1",
+    ]
+
+    addresses = [a for (a,) in _rows(db_path, "SELECT resource_address FROM sessions "
+                                              "UNION SELECT resource_address FROM api_requests")]
+    for address in addresses:
+        system = address if address else "_unknown"
+        paths.append("/search?" + _q(system=system))
+        paths.append("/search?" + _q(type="kubectl", system=system))
+        paths.append("/search?" + _q(type="exec", system=system, window="all"))
+        if address:
+            paths.append("/search?" + _q(resource_address=address))  # legacy alias
+    paths.append("/search?system=_unknown")
+
+    # Users: every username and user_id the fixture produced, from all three tables.
+    identities = _rows(
+        db_path,
+        "SELECT username FROM api_requests UNION SELECT user_id FROM api_requests "
+        "UNION SELECT username FROM sessions "
+        "UNION SELECT username FROM connections UNION SELECT user_id FROM connections",
+    )
+    for (identity,) in identities:
+        if not identity:
+            continue
+        paths.append("/search?" + _q(user=identity))  # username or user_id
+        paths.append("/search?" + _q(type="kubectl", user=identity))
+        paths.append("/search?" + _q(type="any", user=identity, sort="risk"))
+        paths.append("/search?" + _q(type="failed", user=identity))
+        paths.append("/search?" + _q(username=identity))  # legacy alias
+    paths.append("/search?" + _q(user="user@example.com", system="k8s.example.internal",
+                                 window="all", type="any"))
+
+    # Command focus: every stored request id (non-start ids resolve to their command).
+    for (request_id,) in _rows(db_path, "SELECT request_id FROM api_requests"):
+        paths.append("/search?" + _q(cmd=request_id))
+        paths.append("/search?" + _q(type="kubectl", cmd=request_id, discovery="1"))
+
+    # Both CSV exports, the type-restricted variants, and a legacy-params export.
+    paths += [
+        "/search/export.csv",
+        "/search/export.csv?type=kubectl",
+        "/search/export.csv?type=any",
+        "/search/export.csv?type=recordings",
+        "/search/export.csv?type=exec",
+        "/search/export.csv?type=failed",
+        "/search/export.csv?type=kubectl&discovery=1",
+        "/search/export.csv?type=any&sort=risk",
+        "/search/export.csv?" + _q(type="kubectl", q="pods"),
+        "/search/export.csv?" + _q(keyword="echo", username="user@example.com"),  # legacy
+        "/search/export.csv?" + _q(regex="echo", resource_address="k8s.example.internal"),
+        "/search/export.csv?" + _q(started_after="2026-10-01T00:00:00Z"),
+    ]
+    return paths
+
+
+def _cursor_walk(client: TestClient, start: str, steps: int) -> list[str]:
+    """Follow a results page's Next / Continue link up to ``steps`` times.
+
+    Returns the cursor-bearing paths visited (the Next-cursor pages of spec s12), so they
+    become explicit seeds that are scanned like any other page.
+    """
+    visited: list[str] = []
+    path = start
+    for _ in range(steps):
+        match = _NEXT_RE.search(_fetch(client, path).text)
+        if match is None:
+            break
+        path = html.unescape(match.group(1))
+        assert "cursor=" in path, f"Next link without a cursor: {path}"
+        visited.append(path)
+    return visited
 
 
 @pytest.fixture(
@@ -659,6 +817,159 @@ def test_activity_pages_render_no_command_parameter(run: HygieneRun) -> None:
         assert "command=" not in page.text, f"{page.path} renders a command= parameter"
     exec_pages = [p for p in activity if "/pods/web-1/exec" in p.text]
     assert exec_pages, "no activity page rendered the exec URL (vacuous)"
+
+
+def _split(page: Page) -> tuple[str, str]:
+    """Split a fetched page into ``(header_text, body)`` at the first blank line."""
+    head, _, body = page.text.partition("\n\n")
+    return head, body
+
+
+def _csv_pages(run: HygieneRun) -> dict[str, Page]:
+    """Every fetched CSV export."""
+    return {p: pg for p, pg in run.pages.items() if urlsplit(p).path == "/search/export.csv"}
+
+
+def _search_pages(run: HygieneRun) -> dict[str, Page]:
+    """Every fetched ``/search`` HTML page."""
+    return {p: pg for p, pg in run.pages.items() if urlsplit(p).path == "/search"}
+
+
+def test_positive_control_forbidden_values_are_in_the_fixture() -> None:
+    """The UA, remote_addr, and response-header values really are in the input."""
+    audits = [o for o in _fixture_objects() if o.get("logger") == "gateway.audit"]
+    with_headers = [o for o in audits if "request" in o]
+    assert with_headers
+    for line in with_headers:
+        assert line["request"]["headers"]["User-Agent"] == [FULL_USER_AGENT]
+        assert line["remote_addr"].startswith(REMOTE_ADDR_HOST)
+    responses = [o["response"]["headers"] for o in audits if o.get("response", {}).get("headers")]
+    assert responses
+    assert all(RESPONSE_HEADER_VALUE in h["Cache-Control"] for h in responses)
+
+
+def test_search_surface_was_seeded_and_fetched(run: HygieneRun) -> None:
+    """Every Session 10 seed is present, fetched with 200, and not lost to the crawl cap."""
+    paths = set(run.explicit_paths)
+    for type_ in ("any", "recordings", "ssh", "exec", "failed", "kubectl"):
+        assert f"/search?type={type_}" in paths
+    assert any("user=VXNlcjox" in p for p in paths), "no user=<user_id> seed"
+    assert any("user=user%40example.com" in p for p in paths), "no user=<username> seed"
+    assert any("type=failed" in p and "user=" in p for p in paths)
+    assert any("cmd=" in p for p in paths)
+    assert any("system=" in p for p in paths)
+    assert any("window=" in p for p in paths)
+    assert any("q=pods" in p for p in paths) and any("mode=regex" in p for p in paths)
+    assert any("cursor=" in p for p in paths), "no Next-cursor page was reached"
+    assert {"/search/export.csv", "/search/export.csv?type=kubectl"} <= paths
+    assert any(p.startswith("/search/export.csv?") and "username=" in p for p in paths), (
+        "no legacy-params export seed"
+    )
+    assert len(paths) <= _MAX_CRAWLED_PAGES // 2, "seeds leave no room for crawled links"
+    for path in paths:
+        assert path in run.pages, f"{path} was not fetched"
+        assert run.pages[path].status == 200, f"{path} -> {run.pages[path].status}"
+
+
+def test_search_pages_render_real_content(run: HygieneRun) -> None:
+    """The new surface is not empty shells, so the leak scans below are not vacuous."""
+    pages = run.pages
+    # Mixed list: the kubectl command label and the exec recording's own row.
+    any_page = pages["/search?type=any"].text
+    assert "kubectl exec" in any_page
+    assert any(
+        f"/sessions/{c}" in any_page for (c,) in _rows(run.db_path, "SELECT conn_id FROM sessions")
+    )
+    # kubectl-only list has the command and no recording-only rows.
+    assert "kubectl exec" in pages["/search?type=kubectl"].text
+    assert "kubectl get" in pages["/search?type=kubectl"].text
+    # user=<user_id> and user=<username> resolve to the same user's activity.
+    by_id = pages["/search?user=VXNlcjox"].text
+    by_name = pages["/search?user=user%40example.com"].text
+    assert "kubectl exec" in by_id and "kubectl exec" in by_name
+    # Focus on a command by request id renders that command.
+    focus = next(
+        pg for p, pg in pages.items() if p.startswith("/search?cmd=11111111-1111-4111-8111-111111111111")
+    )
+    assert "kubectl exec" in focus.text
+    # Next-cursor pages came from real result pages.
+    cursor_pages = [pg for p, pg in pages.items() if p.startswith("/search?") and "cursor=" in p]
+    assert cursor_pages and all(pg.status == 200 for pg in cursor_pages)
+    # Dashboard and systems list link into search (crawl feed).
+    assert "/search?" in pages["/dashboard"].text
+    assert "/search?" in pages["/systems"].text
+
+
+def test_csv_exports_have_rows_and_are_clean(run: HygieneRun) -> None:
+    """Each CSV has a header and data rows (positive control), and carries no secret."""
+    import csv as csvmod
+
+    csvs = _csv_pages(run)
+    assert {"/search/export.csv", "/search/export.csv?type=kubectl",
+            "/search/export.csv?type=any"} <= set(csvs)
+    forbidden = (
+        *SENTINELS, PANIC_TEXT, "Bearer", INGEST_TOKEN, UI_PASSWORD, "command=",
+        *USER_AGENT_FRAGMENTS, REMOTE_ADDR_HOST, RESPONSE_HEADER_VALUE, "Authorization",
+        "Cookie", "remote_addr",
+    )
+    for path, page in csvs.items():
+        head, body = _split(page)
+        assert "text/csv" in head.lower(), f"{path} is not served as CSV"
+        rows = list(csvmod.reader(io.StringIO(body)))
+        assert rows and rows[0][0] == "conn_id" and len(rows[0]) == 15, f"{path}: bad header"
+        assert _hits(page.text, forbidden) == [], f"{path} leaks {_hits(page.text, forbidden)}"
+    # Default and type=kubectl/any exports are not empty shells.
+    for path in ("/search/export.csv", "/search/export.csv?type=kubectl",
+                 "/search/export.csv?type=any"):
+        rows = list(csvmod.reader(io.StringIO(_split(csvs[path])[1])))
+        assert len(rows) >= 2, f"{path} has no data rows (vacuous)"
+    kube_rows = list(csvmod.reader(io.StringIO(_split(csvs["/search/export.csv?type=kubectl"])[1])))
+    assert any("kubectl exec" in cell for row in kube_rows[1:] for cell in row)
+    # The legacy-params export is served and parsed (200 asserted above), as CSV.
+    legacy = [p for p in csvs if "username=" in p]
+    assert legacy
+
+
+def test_no_command_param_in_any_search_page_or_export(run: HygieneRun) -> None:
+    """No rendered or exported URL carries a ``command=`` parameter, on any page."""
+    leaks = [
+        p
+        for p, page in run.pages.items()
+        if "command=" in page.text
+    ]
+    assert leaks == [], f"command= rendered on: {leaks}"
+    # Seeds that the sentinel could hide behind were actually fetched.
+    assert any("/pods/web-1/exec" in pg.text for pg in _search_pages(run).values()), (
+        "no search page rendered the exec URL (vacuous)"
+    )
+
+
+def test_no_user_agent_remote_addr_or_response_header_in_any_response(run: HygieneRun) -> None:
+    """No full User-Agent, remote_addr, response-header value, or request header
+    name/value pair appears in any page, header block, or CSV (spec s10)."""
+    forbidden = (*USER_AGENT_FRAGMENTS, REMOTE_ADDR_HOST, RESPONSE_HEADER_VALUE)
+    leaks = [
+        f"{path}: {needle}"
+        for path, page in run.pages.items()
+        for needle in forbidden
+        if needle in page.text
+    ]
+    assert leaks == [], f"gateway-only values rendered: {leaks}"
+    # Cookie and Authorization values are covered by the sentinel/Bearer scan; the
+    # request-header names themselves must not be echoed as stored data either.
+    for path, page in run.pages.items():
+        assert "session=GC_SENTINEL" not in page.text, path
+        assert "Authorization: Bearer" not in page.text, path
+
+
+def test_search_400_pages_do_not_echo_submitted_values(run: HygieneRun) -> None:
+    """A rejected search or export is a 400 that never echoes the submitted value (s10)."""
+    assert run.error_pages, "no 400 probes were fetched (vacuous)"
+    for path, page in run.error_pages.items():
+        assert page.status == 400, f"{path} -> {page.status}"
+        assert ECHO_PROBE not in page.text, f"{path} echoed a submitted value"
+        assert _hits(page.text, SENTINELS) == []
+        assert "command=" not in page.text
 
 
 def test_cast_endpoint_serves_no_sentinel(run: HygieneRun) -> None:

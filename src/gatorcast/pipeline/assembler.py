@@ -19,6 +19,10 @@ Reassembly contract (confirmed against the Gateway's ``internal/sessionrecorder`
     end-of-session signal; finalize triggers on it. The idle sweep is only a
     backstop for sessions whose Gateway died without that final flush.
   * Finalize is idempotent: re-finalizing a finished ``conn_id`` is a no-op.
+  * The seal mode (terminal vs. reopenable) is persisted on the session row
+    (``sealed_terminal``). After a restart or a cache eviction, the row — not
+    memory — decides whether a late chunk is ignored or reopens the recording, so
+    a sealed ``.cast`` is never replaced by a fragment.
   * Recording payloads are never written to application logs (rule 5).
 
 Connection lifecycle (kubectl activity spec §6). ``Authenticated connection``
@@ -53,7 +57,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from gatorcast.logging import get_logger
 from gatorcast.models import ApiRequest, RecordingChunk, SessionEnd, SessionStart
@@ -69,11 +73,14 @@ log = get_logger(__name__)
 # SQLite's datetime('now') renders as "YYYY-MM-DD HH:MM:SS" in UTC.
 _SQLITE_TS = "%Y-%m-%d %H:%M:%S"
 
-# Cap on the set of finalized conn_ids remembered to reject late/redelivered
-# events. Bounded to avoid unbounded memory growth; once exceeded the set is
-# cleared (the only cost of forgetting is that a very-late redelivered chunk for
-# a long-gone connection could re-create a buffer — acceptable and rare).
+# Cap on the in-memory cache of sealed conn_ids (and pending shell users). Bounded
+# to avoid unbounded memory growth; once exceeded the map is cleared. Forgetting an
+# entry is safe: a chunk with no buffer and no cache entry falls back to the
+# session row (``Assembler._resolve_unbuffered``), which records the seal mode.
 _FINALIZED_MAX = 10_000
+
+# What a chunk with no in-memory buffer may do, decided from the session row.
+UnbufferedAction = Literal["promote", "reopen", "ignore", "adopt"]
 
 
 @dataclass(slots=True)
@@ -339,10 +346,12 @@ class Assembler:
         self._lock = asyncio.Lock()
         # conn_ids already sealed. Value = reopenable: True means a late chunk should
         # reopen (decrypt → append → re-seal); False means the session ended
-        # terminally ("session finished"/close) and late chunks are ignored. Bounded
-        # (see ``_FINALIZED_MAX``); forgetting an old entry only risks a rare re-buffer.
+        # terminally ("session finished"/close) and late chunks are ignored. A cache
+        # only: the seal mode is persisted on the session row, and a miss falls back
+        # to it (``_resolve_unbuffered``). Bounded (see ``_FINALIZED_MAX``).
         self._sealed: dict[str, bool] = {}
-        # Debug counter: late chunks ignored because their conn_id is terminally sealed.
+        # Debug counter: late chunks/starts ignored because their conn_id is sealed
+        # terminally (or, for a legacy row, with an unknown seal mode).
         self._ignored_finalized = 0
         # Envelope-format start lines carry the OS account (``shell_user``), which the
         # ``connections`` table has no column for. Held here between the start line
@@ -428,31 +437,43 @@ class Assembler:
     async def _on_chunk(self, event: RecordingChunk) -> None:
         """Store a chunk, persist the growing plaintext ``.cast``, and scan live.
 
-        The first chunk for a ``conn_id`` promotes its connection (``pending``,
-        ``api``, ``error``, or not yet seen) to ``recording`` and creates the
-        ``provisional`` session row, seeded from the connection's start line.
+        A chunk with no in-memory buffer is resolved first. The ``_sealed`` cache
+        answers when it has an entry (terminal → ignore, reopenable → reopen);
+        otherwise :meth:`_resolve_unbuffered` decides from the session row, which
+        covers a restart and a cache eviction alike. The first chunk of a new
+        connection promotes it (``pending``, ``api``, ``error``, or not yet seen) to
+        ``recording`` and creates the ``provisional`` session row.
+
+        Invariant: :meth:`_persist` — and so ``CastStore.write_plaintext`` — is
+        reached only for a buffer created by promote, adopt, or reopen. A sealed
+        ``.cast`` is therefore never rewritten without its full text as the buffer's
+        baseline. Chunk content is never logged.
         """
         async with self._lock:
-            buf = self._buffers.get(event.conn_id)
+            conn_id = event.conn_id
+            buf = self._buffers.get(conn_id)
             if buf is None:
-                sealed_reopenable = self._sealed.get(event.conn_id)
+                sealed_reopenable = self._sealed.get(conn_id)
                 if sealed_reopenable is False:
                     # Terminally ended ("session finished"/close): a late/redelivered
                     # chunk must not reopen or clobber the file. Never log content.
                     self._ignored_finalized += 1
-                    log.debug("assembler.ignore_sealed", phase="chunk")
+                    log.debug("assembler.ignore_sealed", phase="chunk", source="cache")
                     return
                 if sealed_reopenable is True:
-                    # Reopen a backstop-sealed session: decrypt the file back to
-                    # plaintext, revert the row to provisional, and continue appending.
-                    baseline = await self._casts.reopen(event.conn_id)
-                    await self._repo.reopen(event.conn_id)
-                    del self._sealed[event.conn_id]
-                    buf = InProgress(conn_id=event.conn_id, baseline=baseline)
-                    log.info("assembler.reopen", conn_id=event.conn_id)
+                    buf = await self._reopen_sealed(conn_id, source="cache")
                 else:
-                    buf = await self._promote(event.conn_id)
-                self._buffers[event.conn_id] = buf
+                    action = await self._resolve_unbuffered(conn_id)
+                    if action == "ignore":
+                        return
+                    if action == "reopen":
+                        buf = await self._reopen_sealed(conn_id, source="db")
+                    elif action == "adopt":
+                        buf = await self._adopt_provisional(conn_id, self._clock())
+                        log.info("assembler.adopt", conn_id=conn_id)
+                    else:
+                        buf = await self._promote(conn_id)
+                self._buffers[conn_id] = buf
 
             buf.chunks[event.seq] = event.asciicast  # last write wins → dup-safe
             if event.request_id is not None and buf.request_id is None:
@@ -477,6 +498,13 @@ class Assembler:
         row, and marks the connection ``recording`` (``has_api`` is kept). A chunk
         with no start line seen inserts a minimal ``recording`` connection, so a
         start line arriving later never leaves it ``pending``. Caller holds the lock.
+
+        Only for a connection with no recording yet: no row, a ``provisional`` row
+        with no ``.cast`` on disk, or a failed connection (``error``, no
+        ``cast_path``). A sealed row never reaches here — :meth:`_resolve_unbuffered`
+        ignores or reopens it — because the buffer this returns starts empty, and
+        the next :meth:`_persist` would replace the sealed file with the new chunks
+        alone.
         """
         conn = await self._activity.get_connection(conn_id)
         buf = InProgress(conn_id=conn_id)
@@ -502,6 +530,101 @@ class Assembler:
             from_state=conn.state if conn is not None else None,
         )
         return buf
+
+    async def _resolve_unbuffered(self, conn_id: str) -> UnbufferedAction:
+        """Decide what a chunk with no buffer and no ``_sealed`` entry may do.
+
+        The session row is authoritative (one primary-key lookup per buffer miss,
+        i.e. once per session, not per chunk):
+
+        * no row, no ``.cast`` → ``promote`` (a new connection's first chunk);
+        * no row, a non-empty ``.cast`` → ``ignore``: an orphan file whose row is
+          gone is never overwritten;
+        * ``provisional`` with a non-empty ``.cast`` → ``adopt`` its text as the
+          baseline (as :meth:`sweep_startup` does); without one → ``promote``;
+        * ``error`` with no ``cast_path`` (a failed connection) → ``promote``, which
+          recovers it through ``revert_error_to_provisional``;
+        * sealed (``complete``, or ``error`` with a ``cast_path``) whose ``.cast`` is
+          missing → ``ignore`` with a warning; nothing is written;
+        * sealed reopenably (``sealed_terminal`` 0) → ``reopen``;
+        * sealed terminally (1) or before the column existed (``NULL``) →
+          ``ignore``, counted and re-cached as terminal. Legacy ``NULL`` is treated
+          as terminal because the likely trigger is a shipper redelivering its
+          buffer, and reopening would append those chunks as duplicate events.
+
+        Caller holds the lock. Logs carry ``conn_id`` and phase/source only, never
+        chunk content.
+
+        Args:
+            conn_id: The connection id of the unbuffered chunk.
+
+        Returns:
+            The action for :meth:`_on_chunk` to take.
+        """
+        row = await self._repo.get(conn_id)
+        path = self._casts.path_for(conn_id)
+        if row is None:
+            if self._has_nonempty_file(path):
+                log.warning("assembler.orphan_cast_skip", conn_id=conn_id)
+                return "ignore"
+            return "promote"
+        if row.status == "provisional":
+            return "adopt" if self._has_nonempty_file(path) else "promote"
+        if row.status == "error" and row.cast_path is None:
+            return "promote"
+        if row.status in ("complete", "error"):
+            if not path.is_file():
+                log.warning("assembler.sealed_cast_missing", conn_id=conn_id)
+                return "ignore"
+            if row.sealed_terminal is False:
+                return "reopen"
+            self._ignored_finalized += 1
+            log.debug("assembler.ignore_sealed", phase="chunk", source="db")
+            self._mark_sealed(conn_id, False)
+            return "ignore"
+        # Defensive: an unknown status is never written over.
+        log.warning("assembler.unknown_status_skip", conn_id=conn_id)
+        return "ignore"
+
+    async def _reopen_sealed(self, conn_id: str, *, source: str) -> InProgress:
+        """Reopen a reopenably-sealed session and return its buffer.
+
+        Decrypts the sealed file back to plaintext (``CastStore.reopen``), reverts
+        the row to ``provisional`` (``SessionRepository.reopen``, which also clears
+        ``sealed_terminal``), and seeds the buffer with the full prior text as its
+        baseline so appends extend it. Caller holds the lock.
+
+        Args:
+            conn_id: The connection id to reopen.
+            source: ``"cache"`` (from ``_sealed``) or ``"db"`` (from the session
+                row); logged for diagnostics.
+
+        Returns:
+            The new in-progress buffer.
+        """
+        baseline = await self._casts.reopen(conn_id)
+        await self._repo.reopen(conn_id)
+        self._sealed.pop(conn_id, None)
+        log.info("assembler.reopen", conn_id=conn_id, source=source)
+        return InProgress(conn_id=conn_id, baseline=baseline)
+
+    async def _adopt_provisional(self, conn_id: str, now: float) -> InProgress:
+        """Build a buffer for a ``provisional`` row from its on-disk plaintext ``.cast``.
+
+        In-progress files are plaintext (only sealed rows are encrypted), so the file
+        text becomes the buffer's baseline and continuation chunks append after it.
+        Used by :meth:`sweep_startup` and by :meth:`_on_chunk` on a buffer miss.
+        Caller holds the lock and has checked the file is non-empty.
+
+        Args:
+            conn_id: The connection id to adopt.
+            now: Monotonic time to stamp as the buffer's last activity.
+
+        Returns:
+            The adopted in-progress buffer (not yet registered in ``_buffers``).
+        """
+        baseline = await self._casts.read_plaintext(self._casts.path_for(conn_id))
+        return InProgress(conn_id=conn_id, baseline=baseline, last_activity=now)
 
     async def _on_api(self, event: ApiRequest) -> None:
         """Store one API audit line and advance its connection's state.
@@ -664,13 +787,8 @@ class Assembler:
         now = self._clock()
         async with self._lock:
             for conn_id, created_at in rows:
-                path = self._casts.path_for(conn_id)
-                if path.is_file() and path.stat().st_size > 0:
-                    # In-progress files are plaintext (only sealed rows are encrypted).
-                    baseline = await self._casts.read_plaintext(path)
-                    self._buffers[conn_id] = InProgress(
-                        conn_id=conn_id, baseline=baseline, last_activity=now
-                    )
+                if self._has_nonempty_file(self._casts.path_for(conn_id)):
+                    self._buffers[conn_id] = await self._adopt_provisional(conn_id, now)
                     readopted += 1
                 elif self._older_than(created_at, cutoff):
                     await self._repo.delete_provisional(conn_id)
@@ -720,10 +838,11 @@ class Assembler:
 
         Writes the search sidecar and runs a final detection pass over the plaintext,
         then encrypts the ``.cast`` (a no-op when encryption is disabled) and marks the
-        row ``complete`` (or ``error`` if it never carried a valid header). The conn_id
-        is recorded in ``_sealed`` with ``reopenable`` so a late chunk is either
-        ignored (terminal) or reopens the session (backstop). Caller holds the lock and
-        has already removed ``buf`` from the active map.
+        row ``complete`` (or ``error`` if it never carried a valid header). The seal
+        mode is persisted on the row (``sealed_terminal = not reopenable``) and cached
+        in ``_sealed``, so a late chunk is either ignored (terminal) or reopens the
+        session (backstop) — before or after a restart. Caller holds the lock and has
+        already removed ``buf`` from the active map.
         """
         if not buf.has_data:
             # A start-only entry with nothing recorded — nothing to seal, don't lock.
@@ -749,6 +868,7 @@ class Assembler:
             size_bytes=size,
             cast_path=str(path),
             status=status,
+            sealed_terminal=not reopenable,
         )
         self._mark_sealed(buf.conn_id, reopenable)
         log.info(
@@ -807,15 +927,25 @@ class Assembler:
         self._pending_shell_user[conn_id] = shell_user
 
     def _mark_sealed(self, conn_id: str, reopenable: bool) -> None:
-        """Record a conn_id as sealed (``reopenable`` flag). Caller holds the lock.
+        """Cache a conn_id as sealed (``reopenable`` flag). Caller holds the lock.
 
         Bounded: clears the map once it exceeds ``_FINALIZED_MAX`` to keep memory flat.
-        Forgetting an old entry only risks re-buffering a very-late redelivery for a
-        long-closed connection, which is rare and harmless.
+        The map is a cache only — the seal mode is persisted on the session row — so
+        a miss after eviction falls back to the session row
+        (:meth:`_resolve_unbuffered`) and never re-buffers a sealed recording.
         """
         if len(self._sealed) >= _FINALIZED_MAX:
             self._sealed.clear()
         self._sealed[conn_id] = reopenable
+
+    @staticmethod
+    def _has_nonempty_file(path: Path) -> bool:
+        """True if ``path`` is a regular file with at least one byte.
+
+        A ``stat`` failure propagates rather than reading as "absent", so an
+        unreadable file is never treated as free to overwrite.
+        """
+        return path.is_file() and path.stat().st_size > 0
 
     @staticmethod
     def _older_than(created_at: str | None, cutoff: datetime) -> bool:

@@ -25,26 +25,45 @@ The Twingate L7 Gateway writes structured JSON audit logs to **stdout/stderr**.
 Among those lines are the session-recording chunks:
 
 ```json
-{"logger":"gateway.audit","ts":"…Z","user":{"username":"alice@corp"},"conn_id":"<uuid>","asciicast":"<v2 chunk>","asciicast_sequence_num":0}
+{"logger":"gateway.audit","message":"session recording","ts":"…Z","user":{"username":"alice@corp"},"conn_id":"<uuid>","asciicast":"<v2 chunk>","asciicast_sequence_num":1}
 ```
 
 plus the session-start line that carries the target system:
 
 ```json
-{"logger":"gateway","message":"Authenticated connection","conn_id":"<uuid>","resource_address":"prod-db-01"}
+{"logger":"gateway","message":"Authenticated connection","conn_id":"<uuid>","resource_address":"prod-db-01","user":{"username":"alice@corp"}}
 ```
+
+The Gateway's last chunk for a connection has `"message":"session finished"`. Gatorcast
+treats it as the end of the recording and seals it immediately.
 
 For Kubernetes access, the Gateway also emits one `gateway.audit` line per API
 request (`"message":"API request completed"` or `"API request failed"`, with no
 `asciicast`). Gatorcast stores these as allowlisted kubectl activity metadata (see
-the README's [kubectl Activity](README.md#kubectl-activity) section), joining each to
-its cluster through the session-start line's `conn_id`, so ship both.
+the README's [kubectl Activity](README.md#kubectl-activity) section). The audit line
+carries no `resource_address`, so Gatorcast joins each request to its cluster through
+the start line's `conn_id`. **Ship both.** If the start line never arrives, the request
+is stored with an unknown cluster; a start line that arrives later fills it in.
 
 You do **not** need to filter these out of the Gateway's other output — Gatorcast
-classifies and drops everything that isn't a recording chunk, a session event, or an
-API-request audit. **Ship the Gateway's whole log stream; Gatorcast sorts it out.** The only
-hard requirement is that **whole lines arrive intact and untruncated** —
-asciicast chunks are multi-KB.
+classifies and drops everything it does not recognize. **Ship the Gateway's whole log
+stream; Gatorcast sorts it out.** The only hard requirement is that **whole lines arrive
+intact and untruncated** — asciicast chunks are multi-KB.
+
+What Gatorcast does with each line, as decided by `classify`:
+
+| Line | Match | Result |
+| --- | --- | --- |
+| Recording chunk | `logger` is `gateway.audit` **and** `asciicast` is a non-null string, with an integer `asciicast_sequence_num` | Chunk for that `conn_id`; `message` of `session finished` also seals the recording. A chunk with a missing or non-integer sequence number is dropped. |
+| Start line | `logger` is `gateway`, `message` is `Authenticated connection` | Hidden pending connection. Needs a recording chunk (becomes a session) or an API audit line (becomes kubectl activity) within `SESSION_MAX_IDLE_SECONDS`, or it becomes a visible `error` session. |
+| API audit line | `logger` is `gateway.audit`, no `asciicast`, `message` is `API request completed` or `API request failed` | Allowlisted kubectl activity metadata, deduplicated by `request_id`. |
+| Close line | `logger` is `gateway`, `message` is `Connection closed` or `Closed connection` | Seals the recording. A defensive fallback; the stock Gateway does not log a close event. |
+| Envelope record | No `logger`; `type` is `session_start`, `recording_chunk` or `session_end` | Same events as above, from the Gateway fork's recording sink. Additive; the recipes below do not need it. |
+| Anything else | | Dropped as noise. |
+
+Every recognized line must also carry a `conn_id` made only of letters, digits, `_`, `.` and `-`
+(at most 128 characters), because it names the `.cast` file. A line with any other
+`conn_id` is dropped.
 
 Under systemd, the Gateway logs to journald under the identifier `gateway`
 (`SYSLOG_IDENTIFIER=gateway`). Confirm on any host with:
@@ -57,19 +76,37 @@ journalctl -t gateway -n 1 -o cat
 
 | Door | Default | Auth | Body | Use when |
 | --- | --- | --- | --- | --- |
-| **HTTP** `POST /ingest` | `:8080` | `Authorization: Bearer $INGEST_TOKEN` | NDJSON, single JSON object, JSON array, or newline-delimited text | Default. Works over any routed network; auth lets you expose it more safely. |
-| **Syslog TCP** | `:6514` | **None** (rely on network position) | Syslog frames (octet-counted **or** newline-delimited); the `<PRI>` envelope is stripped automatically | Your shipper already speaks syslog (rsyslog `omfwd`, Docker syslog driver). Bind it to an internal interface only. |
+| **HTTP** `POST /ingest` | `:8080` (`HTTP_PORT`), the same port as the UI | `Authorization: Bearer $INGEST_TOKEN` (missing or wrong token: `401`) | NDJSON, single JSON object, JSON array, or newline-delimited text | Default. Works over any routed network; auth lets you expose it more safely. |
+| **Syslog TCP** | `:6514` (`SYSLOG_TCP_PORT`; `0` disables the listener) | **None** (rely on network position) | Syslog frames (octet-counted **or** newline-delimited); the `<PRI>` header is skipped automatically | Your shipper already speaks syslog (rsyslog `omfwd`, Docker syslog driver). Bind it to an internal interface only. |
 
 Key behaviors that make the recipes simple:
 
-- **The HTTP door is tolerant.** One malformed line never fails the batch, and it
-  accepts NDJSON / a JSON array / plain newline-delimited text interchangeably.
+- **The HTTP door is tolerant.** One malformed line never fails the batch. A successful
+  request returns `204 No Content` even if some lines were dropped. The body is split by
+  `Content-Type`: `application/json` is parsed as **one** JSON document (an object or an
+  array of objects); any other type (`application/x-ndjson`, `text/plain`, none) is read
+  line by line. Do not send multi-line NDJSON as `application/json` — it is not one valid
+  JSON document, so the whole body is dropped. The recipes below use
+  `application/x-ndjson`.
 - **Collector envelopes are unwrapped automatically.** If a shipper wraps each
   line as `{"log":"<original>","stream":"stdout"}` (Docker's and many log
-  collectors' default), Gatorcast recovers the inner Gateway line for you. This
-  is what makes the Docker and Kubernetes recipes nearly config-free.
+  collectors' default), Gatorcast recovers the inner Gateway line for you, on both the
+  line-by-line and the `application/json` paths. Only a top-level string field named
+  `log` on an object with no `logger` is unwrapped; other wrapper shapes (for example
+  `{"message":"…"}`) are dropped. This is what makes the Docker and Kubernetes recipes
+  nearly config-free.
 - **Syslog TCP is TCP-only and unauthenticated.** Never publish `6514` on a
-  public interface. UDP is never accepted (it would truncate multi-KB chunks).
+  public interface. UDP is never accepted (it would truncate multi-KB chunks). The
+  framing is detected per message: RFC 6587 octet-counting (`<len> <msg>`) or a
+  newline-delimited line (LF or CRLF). Gatorcast reads the JSON from the first `{`
+  in each message, so the `<PRI>` header of both RFC 5424 and BSD syslog is skipped. Gatorcast
+  closes a connection that declares a frame over 16 MiB or a length prefix of more than 10
+  digits, refuses connections beyond 128 concurrent, and reaps one that is silent for
+  300 s. The shipped `docker-compose.yml` publishes the port as `127.0.0.1:6514`; change
+  `127.0.0.1` to your internal interface address before pointing a remote shipper at it.
+- **An unparseable line is logged, not stored.** Gatorcast logs `normalize.drop` with the
+  line length (never the content) and drops the line. A length at or near `49152` is the
+  tell for journald splitting (see the warning in §2.1).
 
 ### 1.3 Reachability — a caveat that bites everyone
 
@@ -84,6 +121,13 @@ Throughout this doc the placeholders are:
 - `GATORCAST_HTTP` → e.g. `https://gatorcast.internal.example.com:8080`
 - `GATORCAST_HOST` / `6514` → the syslog TCP listener
 - `INGEST_TOKEN` → the value from Gatorcast's `.env`
+
+> **TLS.** Gatorcast itself serves plain HTTP (it has no TLS settings). The `https://`
+> URLs in this doc assume a TLS-terminating reverse proxy in front of it, and `:8080` in
+> the examples stands for whatever port that proxy listens on. Without a proxy, use
+> `http://` and Gatorcast's own port, and keep it on a trusted network, because the bearer
+> token and the recordings then cross the wire in the clear. The Fluent Bit recipe in §7.3
+> sets `tls On` for the same reason; turn it off if you point it at Gatorcast directly.
 
 ---
 
@@ -194,7 +238,7 @@ journalctl -u journald-http-shipper -f   # quiet unless a POST fails
 
 > **⚠️ journald has two limits that silently break large recordings.** This path routes recordings through journald, and asciicast chunks can be big — a busy shell, and especially a full-screen TUI (`btop`, `top`, `htop`, `watch`, `vim`), emits large, rapid frames. Two journald defaults bite:
 >
-> 1. **`LineMax` (default 48 KB)** — journald splits any single log line longer than this into multiple entries. Each fragment is only a piece of a JSON object, so it fails to parse: Gatorcast drops it (`event=normalize.drop reason=unparseable`) and the recording never assembles. The recording never appears: the connection stays a hidden pending connection and, after `SESSION_MAX_IDLE_SECONDS` with no valid chunks, becomes a visible **`error`** session with no recording.
+> 1. **`LineMax` (default 48 KB)** — journald splits any single log line longer than this into multiple entries. Each fragment is only a piece of a JSON object, so it fails to parse: Gatorcast drops it (`event=normalize.drop reason=unparseable`) and the recording never assembles. The recording never appears: the connection stays a hidden pending connection and, after `SESSION_MAX_IDLE_SECONDS` with no valid chunks (and no API audit lines), becomes a visible **`error`** session with no recording.
 > 2. **Rate limiting (`RateLimitIntervalSec` / `RateLimitBurst`)** — under a firehose (a repainting TUI), journald *drops* entries entirely once the burst is exceeded. You'll see `Suppressed N messages` in the journal and gaps in `asciicast_sequence_num`.
 >
 > **Quick check on the Gateway host** (as root) — reproduce a heavy session, then look for lines pinned at exactly the 48 KB cap:
@@ -287,8 +331,10 @@ if ($programname == "gateway") then {
 ```
 
 `octet-counted` framing is preferred — it cannot be confused by any byte in the
-payload. Gatorcast strips the `<PRI>…` syslog header automatically and parses
-the JSON that follows.
+payload. Gatorcast also accepts newline-delimited frames (`TCP_Framing="traditional"`),
+detecting the framing per message. It skips the `<PRI>…` syslog header automatically by
+parsing the JSON from the first `{`. Set `port` to the published syslog port, and note that the
+shipped `docker-compose.yml` binds it to `127.0.0.1` only (see §1.2).
 
 ### 2.4 LXC / privilege-drop fallback — redirect stderr to a file, tail with `imfile`
 
@@ -362,10 +408,9 @@ sinks:
 ```
 
 > Vector's journald `message` field is the Gateway's JSON line. The `text` codec
-> forwards it verbatim, which is what Gatorcast wants. (If you use the `json`
-> codec instead, Vector wraps the line in its own envelope — Gatorcast's
-> collector-unwrap handles a `{"message":...}`/`{"log":...}` wrapper, but `text`
-> is the cleaner choice here.)
+> forwards it verbatim, which is what Gatorcast wants. Do not switch to the `json`
+> codec: Vector then wraps the line as `{"message":"<line>",…}`, and Gatorcast only
+> unwraps a `{"log":"<line>"}` envelope, so every line would be dropped as noise.
 
 ---
 
@@ -612,10 +657,12 @@ docker run \
   twingate/gateway:latest
 ```
 
-Each stdout line is wrapped in a syslog frame and sent over TCP; Gatorcast strips
-the `<PRI>` header and parses the Gateway JSON. Docker uses octet-framed TCP by
-default — the framing Gatorcast expects. **TCP only** — never `udp://` (asciicast
-chunks would be truncated).
+Each stdout line is wrapped in a syslog frame and sent over TCP; Gatorcast skips
+the `<PRI>` header and parses the Gateway JSON. Gatorcast accepts both octet-counted and
+newline-delimited TCP framing, so it does not matter which one the driver uses. **TCP
+only** — never `udp://` (asciicast chunks would be truncated). Point `syslog-address` at
+the syslog port you publish (the shipped `docker-compose.yml` binds it to `127.0.0.1`; see
+§1.2).
 
 **Alternative — HTTP via Fluent Bit/Vector sidecar.** If you'd rather use the
 authenticated HTTP door, run a Fluent Bit container with a `forward`/`docker`
@@ -634,10 +681,13 @@ the Gateway pod's lines, and POSTs them to Gatorcast's HTTP door.
 
 ### 7.1 Why this is low-friction
 
-Kubernetes/CRI log records arrive wrapped (`{"log":"<line>","stream":"stdout",…}`
-or with CRI metadata). **Gatorcast unwraps the `{"log":…}` collector envelope
-automatically**, so you do not need a JSON parser/decoder filter just to expose
-the inner Gateway line — forward the record and Gatorcast recovers it.
+Kubernetes/CRI log records arrive wrapped (`{"log":"<line>","stream":"stdout",…}`).
+For CRI-format container logs, the `log` value can also start with a CRI prefix
+(`<timestamp> stdout F`, then the line). **Gatorcast unwraps the `{"log":…}` collector envelope
+automatically**, and parses the inner line from its first `{`, so you do not need a JSON
+parser/decoder filter just to expose the inner Gateway line — forward the record and
+Gatorcast recovers it. The unwrap applies only to a top-level `log` string, so do not
+rename or nest that field in a Fluent Bit filter.
 
 ### 7.2 Scope the agent to the Gateway pod
 
@@ -696,12 +746,17 @@ curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
   --data-binary $'{"logger":"gateway","message":"Authenticated connection","conn_id":"test-001","resource_address":"demo-host","user":{"username":"you@corp"}}\n{"logger":"gateway.audit","conn_id":"test-001","asciicast_sequence_num":0,"asciicast":"{\\"version\\":2,\\"width\\":80,\\"height\\":24,\\"timestamp\\":1718700000}\\n[0.5,\\"o\\",\\"hello from gatorcast\\\\r\\\\n\\"]\\n","user":{"username":"you@corp"}}\n{"logger":"gateway","message":"Connection closed","conn_id":"test-001"}'
 ```
 
-A `204 No Content` means accepted. The recording is written to disk and playable
-as soon as its chunk is processed. The trailing close event seals it to *complete*
-immediately — as does the Gateway's real end signal, a recording chunk whose
-`message` is `"session finished"` (emitted by the recorder on session stop). With
-neither, the recording still seals via the idle backstop after
-`SESSION_MAX_IDLE_SECONDS` (default 1 h).
+A `204 No Content` means the request was accepted; it does not mean every line was
+kept. A `401` means the bearer token is missing or wrong. If the session does not
+appear, check Gatorcast's logs for `normalize.drop` (a line that is not a JSON object).
+
+The start line creates a hidden pending connection, and the chunk promotes it to a
+session. The recording is written to disk and playable as soon as its chunk is
+processed. The trailing close event seals it to *complete* immediately. The stock
+Gateway does not log a close event; its real end signal is a recording chunk whose
+`message` is `"session finished"` (emitted by the recorder on session stop), which
+also seals the recording. With neither, the recording still seals via the idle
+backstop after `SESSION_MAX_IDLE_SECONDS` (default 1 h), and a later chunk reopens it.
 
 To replay actual Gateway journald output through the door for a realistic test:
 
@@ -738,7 +793,7 @@ Pick one:
 
 | Option | How | Notes |
 | --- | --- | --- |
-| **Public ingress + TLS** | Front Gatorcast's `:8080` with a reverse proxy (e.g. NPMplus / Caddy / nginx) on a public hostname with a cert | The `INGEST_TOKEN` bearer auth is what makes the HTTP door safe to expose. Don't expose syslog `6514` this way. |
+| **Public ingress + TLS** | Front Gatorcast's `:8080` with a reverse proxy (e.g. NPMplus / Caddy / nginx) on a public hostname with a cert | The `INGEST_TOKEN` bearer auth is what makes the HTTP door safe to expose. The same port also serves the UI (HTTP Basic auth), so if you only want intake public, have the proxy forward just `/ingest`. Don't expose syslog `6514` this way. |
 | **Site-to-site / VPN route** | Give the Gateway host a network route to Gatorcast's network (WireGuard, IPsec, cloud peering) | Keeps everything private; use the syslog TCP door over the tunnel. |
 | **Reverse SSH tunnel** | From the Gatorcast host, `ssh -R 8080:localhost:8080 gateway-host` (or autossh) | Quick for labs/testing; fragile for production. |
 | **Connector beside the sink** | Run a Twingate connector on Gatorcast's network and a *separate* forwarding hop that is overlay-connected | Heavier; only if policy forbids any direct route. The Gateway itself still can't use the overlay. |

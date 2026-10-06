@@ -16,6 +16,26 @@ exec/attach recording links (joined by ``request_id``). Only allowlisted stored
 columns reach the templates, every URL renders autoescaped (never ``|safe``), and
 the ``user``/``from``/``to``/``activity_before``/``discovery`` query params are
 validated strictly (400 on bad input) and used only as bound SQL parameters.
+
+Unified search (Session 10, spec §8.3): ``/search`` parses its query with
+``web.params.parse_unified_query`` and pages ``store.timeline.run_timeline`` over
+recordings (ssh / exec / failed) and kubectl commands. Rows are built here as plain
+dicts from allowlisted columns; templates never receive raw request rows (so never
+``user_agent``). ``/search/export.csv`` uses the same parser and engine, walking
+pages into a 15-column CSV (spec §9).
+
+Dashboard (Session 10, spec §8.2): every tile, chip, and top-user link is built
+with ``search_url`` and carries an explicit ``type`` and the selected ``window``,
+so each figure (except the "kubectl API requests" request total) equals the item
+count of the search it links to. The recent-activity feed is one
+``run_timeline`` page (any kind, newest first, discovery-only commands hidden,
+all time) rendered with the shared ``_rows.html`` macros in compact form.
+
+Systems list and cross-links (Session 10, spec §8.4, §8.5): ``/systems`` shows Type
+badges, "Last session" / "Last API request", and count links into search; the
+system, activity, and session pages link usernames to ``/search?user=…`` and the
+session page links an exec recording to its kubectl command (``/search?cmd=…``).
+Every ``/search`` URL is built by ``search_url``; templates never build one.
 """
 
 from __future__ import annotations
@@ -27,7 +47,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
@@ -48,9 +68,43 @@ from gatorcast.store.activity import (
     to_requested_at_format,
 )
 from gatorcast.store.casts import CastStore
-from gatorcast.store.search import SearchFilters, SearchStore, SessionWithFindings
+from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository, SystemSummary
+from gatorcast.store.timeline import (
+    KIND_EXEC,
+    KIND_FAILED,
+    KIND_KUBECTL,
+    CommandHit,
+    Cursor,
+    RecordingHit,
+    TimelinePage,
+    UnifiedQuery,
+    build_sources,
+    run_timeline,
+)
 from gatorcast.web.auth import require_ui_auth
+from gatorcast.web.kinds import (
+    EXCLUSION_LABELS,
+    KINDS,
+    TYPE_GROUPS,
+    TYPE_LABELS,
+    resolve_kinds,
+)
+from gatorcast.web.params import (
+    MAX_PAGE_SIZE,
+    STATUS_VALUES,
+    UNKNOWN_SYSTEM,
+    WINDOW_VALUES,
+    ParsedSearch,
+    _bad_request,
+    _has_control_chars,
+    _parse_discovery_param,
+    _parse_time_param,
+    _single_param,
+    encode_cursor,
+    parse_unified_query,
+    search_url,
+)
 
 log = get_logger(__name__)
 
@@ -78,19 +132,24 @@ _SORT_OPTIONS = [
     ("risk", "Highest risk first"),
 ]
 
-# Upper bound on rows pulled for a CSV export — the export covers the full filtered
-# set in a single page rather than honoring the UI page size.
+# Upper bound on items in one CSV export (spec §9). The export walks timeline pages
+# until this many items are written; reaching it sets ``X-Gatorcast-Truncated``.
 _CSV_EXPORT_CAP = 10000
 
 # Dashboard time-window options (query value, label). Findings/counts and the
 # drill-down links are scoped to the selected window; "all" disables the cutoff.
+# The values are exactly search's ``window`` values, so a link carries the same one.
 _WINDOW_OPTIONS: list[tuple[str, str]] = [
     ("7", "Last 7 days"),
     ("30", "Last 30 days"),
     ("90", "Last 90 days"),
     ("all", "All time"),
 ]
+assert tuple(v for v, _ in _WINDOW_OPTIONS) == WINDOW_VALUES, "dashboard windows = search windows"
 _DEFAULT_WINDOW = "30"
+
+# Items in the dashboard's recent-activity feed (spec §8.2, Q11).
+_FEED_LIMIT = 15
 
 # Severity badge order (highest first) for dashboard rendering.
 _SEVERITY_DISPLAY_ORDER = ["critical", "high", "medium", "low"]
@@ -109,57 +168,92 @@ _UNKNOWN_USER = "_unknown"
 # username (email); anything longer is rejected rather than queried.
 _MAX_USER_KEY_LEN = 512
 
-# Upper bound on an ISO 8601 time-bound query value (generous for nanosecond
-# fractions plus an offset); longer values are rejected before parsing.
-_MAX_TIME_PARAM_LEN = 64
 
+def _window_cutoff(window: str, now: datetime) -> str | None:
+    """Return the dashboard cutoff for a window value, or ``None`` for all time.
 
-def _window_cutoff(window: str) -> str | None:
-    """Return the ISO8601 cutoff for a dashboard window value, or None for all-time.
+    Computed exactly as search computes ``window`` (``now - N days``, normalized to
+    ``YYYY-MM-DDTHH:MM:SS.mmmZ``), so a figure and its linked list use the same
+    lower bound up to the moment each request is served.
 
     Args:
-        window: One of the ``_WINDOW_OPTIONS`` values (``"7"``/``"30"``/``"90"``/``"all"``).
+        window: One of :data:`WINDOW_VALUES` (``"7"``/``"30"``/``"90"``/``"all"``).
+        now: The current UTC time.
 
     Returns:
-        An ISO8601 ``...Z`` cutoff string, or ``None`` when the window is ``"all"`` or
-        unparseable.
+        The normalized cutoff, or ``None`` when the window is ``"all"``.
     """
     if window == "all":
         return None
-    try:
-        days = max(1, int(window))
-    except ValueError:
-        return None
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
-    return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return to_requested_at_format(now - timedelta(days=int(window)))
 
-
-def _search_url(**params: str | None) -> str:
-    """Build a ``/search`` URL from non-empty query params (values are URL-encoded).
-
-    Args:
-        **params: Candidate query params; ``None``/empty values are dropped.
-
-    Returns:
-        A ``/search`` URL with an encoded query string (or bare ``/search`` if none).
-    """
-    pairs = [(k, v) for k, v in params.items() if v]
-    return f"/search?{urlencode(pairs)}" if pairs else "/search"
 
 router = APIRouter(dependencies=[Depends(require_ui_auth)])
 
 
+class SystemBadge(BaseModel):
+    """One Type badge on the systems index (fixed label and CSS class, never stored text)."""
+
+    label: str
+    css_class: str
+
+
+# Type badges (spec §7.5, §8.4), in display order. A future web-app kind adds a
+# ``Web`` badge here (spec §13).
+_SSH_BADGE = SystemBadge(label="SSH", css_class="pill-ssh")
+_KUBERNETES_BADGE = SystemBadge(label="Kubernetes", css_class="pill-kubectl")
+
+
 class SystemView(BaseModel):
-    """Presentation wrapper for one system row on the systems index."""
+    """Presentation wrapper for one system row on the systems index.
+
+    ``sessions_url`` lists the system's recordings and failed connections
+    (``type=recordings``, matching ``session_count``); ``api_url`` lists its kubectl
+    commands (``type=kubectl``). Both are built with :func:`search_url`.
+    """
 
     summary: SystemSummary
     label: str
     address_slug: str
+    badges: list[SystemBadge]
+    sessions_url: str
+    api_url: str
 
 
 def _system_label(resource_address: str | None) -> str:
     """Return the display label for a system, mapping NULL to the unknown bucket."""
     return resource_address if resource_address else _UNKNOWN_LABEL
+
+
+def _search_system(resource_address: str | None) -> str:
+    """Return the ``/search`` ``system`` value for a system (NULL → the unknown sentinel)."""
+    return resource_address if resource_address else UNKNOWN_SYSTEM
+
+
+def _system_badges(summary: SystemSummary) -> list[SystemBadge]:
+    """Return a system's Type badges (spec §7.5).
+
+    ``SSH`` when it has an SSH recording (``ssh_count > 0``, which requires recording
+    data); ``Kubernetes`` when it has exec recordings or API requests. A system with
+    only start-only ``error`` rows gets none.
+    """
+    badges: list[SystemBadge] = []
+    if summary.has_ssh:
+        badges.append(_SSH_BADGE)
+    if summary.has_kubernetes:
+        badges.append(_KUBERNETES_BADGE)
+    return badges
+
+
+def _user_search_url(username: str | None, user_key: str | None = None) -> str | None:
+    """Return ``/search?user=…`` for a user: the username, else the user key.
+
+    The search ``user`` filter matches ``username`` or an exact ``user_id``, and a
+    ``user_key`` is the user id else the username, so either value finds the user's
+    activity (spec §8.1). Returns ``None`` for the NULL-user bucket (no link).
+    """
+    value = username or user_key
+    return search_url(user=value) if value else None
 
 
 def _system_slug(resource_address: str | None) -> str:
@@ -210,11 +304,14 @@ def _session_view(session: Session) -> dict[str, object]:
     """Build the template context for a session row/detail.
 
     Wraps the model with a precomputed ``duration_display`` and exposes the model
-    fields the templates read. Recording content is never included.
+    fields the templates read, plus ``user_url`` (``/search?user=<username>``, or
+    ``None`` when no username is known — ``sessions`` holds no user id). Recording
+    content is never included.
     """
     return {
         "conn_id": session.conn_id,
         "username": session.username,
+        "user_url": _user_search_url(session.username),
         "resource_address": session.resource_address,
         "shell_user": session.shell_user,
         "started_at": session.started_at,
@@ -251,75 +348,8 @@ def _get_activity(request: Request) -> ActivityStore:
 
 
 # --- kubectl activity: strict query-param validation -------------------------------
-
-
-def _bad_request(detail: str) -> HTTPException:
-    """Build a ``400 Bad Request`` for an invalid query parameter.
-
-    The detail names the parameter only; the submitted value is never echoed.
-    """
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-
-
-def _single_param(request: Request, name: str) -> str | None:
-    """Return a query parameter that may appear at most once.
-
-    Args:
-        request: The incoming request.
-        name: The query parameter name.
-
-    Returns:
-        The raw value, or ``None`` when the parameter is absent.
-
-    Raises:
-        HTTPException: ``400`` if the parameter is repeated.
-    """
-    values = request.query_params.getlist(name)
-    if len(values) > 1:
-        raise _bad_request(f"'{name}' may be given only once")
-    return values[0] if values else None
-
-
-def _has_control_chars(value: str) -> bool:
-    """Tell whether ``value`` contains ASCII/C1 control characters."""
-    return any(ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 for ch in value)
-
-
-def _parse_time_param(name: str, raw: str | None, *, required: bool) -> datetime | None:
-    """Parse an ISO 8601 time-bound query parameter to an aware UTC datetime.
-
-    Accepts any ``datetime.fromisoformat`` shape (``Z`` or offset suffix; naive
-    values are taken as UTC). The value is only ever used as a bound SQL parameter
-    after normalization to the stored ``requested_at`` format.
-
-    Args:
-        name: The parameter name (for the error detail).
-        raw: The raw query value, or ``None`` when absent.
-        required: True to reject an absent/blank value.
-
-    Returns:
-        The aware UTC datetime, or ``None`` when optional and absent/blank.
-
-    Raises:
-        HTTPException: ``400`` if the value is missing (when required), too long,
-            or not parseable ISO 8601.
-    """
-    if raw is None or not raw.strip():
-        if required:
-            raise _bad_request(f"'{name}' is required")
-        return None
-    value = raw.strip()
-    if len(value) > _MAX_TIME_PARAM_LEN:
-        raise _bad_request(f"'{name}' is not a valid ISO 8601 timestamp")
-    try:
-        dt = datetime.fromisoformat(value)
-        dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-        # Round-trip through the stored format so an unrepresentable value fails
-        # here (400) rather than inside the store.
-        to_requested_at_format(dt)
-    except (ValueError, OverflowError):
-        raise _bad_request(f"'{name}' is not a valid ISO 8601 timestamp") from None
-    return dt
+# The generic helpers (_bad_request, _single_param, _has_control_chars,
+# _parse_time_param, _parse_discovery_param) live in gatorcast.web.params.
 
 
 def _parse_user_param(raw: str | None) -> str | None:
@@ -342,19 +372,6 @@ def _parse_user_param(raw: str | None) -> str | None:
     if raw == _UNKNOWN_USER:
         return None
     return raw
-
-
-def _parse_discovery_param(raw: str | None) -> bool:
-    """Parse the ``discovery`` toggle: ``1`` shows discovery requests, ``0``/absent hides.
-
-    Raises:
-        HTTPException: ``400`` for any other value.
-    """
-    if raw is None or raw == "0":
-        return False
-    if raw == "1":
-        return True
-    raise _bad_request("'discovery' must be 0 or 1")
 
 
 # --- kubectl activity: presentation ------------------------------------------------
@@ -414,6 +431,7 @@ def _activity_session_view(session: ActivitySession, address_slug: str) -> dict[
     return {
         "user_key": session.user_key,
         "user_label": _user_label(session.username, session.user_key),
+        "user_search_url": _user_search_url(session.username, session.user_key),
         "started_at": session.started_at,
         "ended_at": session.ended_at,
         "duration_seconds": session.duration_seconds,
@@ -493,115 +511,6 @@ def _dangerous_command_rules() -> list[dict[str, str]]:
     ]
 
 
-def _clean_str(value: str | None) -> str | None:
-    """Normalize a query-string value: blank/whitespace-only becomes ``None``.
-
-    Args:
-        value: The raw query-param value, or ``None`` if the param was absent.
-
-    Returns:
-        The stripped value, or ``None`` when it is missing or empty.
-    """
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
-def _clean_float(value: str | None) -> float | None:
-    """Parse a query-string value as a float, tolerating blanks/invalid input.
-
-    Args:
-        value: The raw query-param value.
-
-    Returns:
-        The parsed float, or ``None`` when blank or not a valid number.
-    """
-    cleaned = _clean_str(value)
-    if cleaned is None:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def _clean_bool(value: str | None) -> bool | None:
-    """Parse an optional tri-state boolean (``"true"``/``"false"``/absent).
-
-    Args:
-        value: The raw query-param value.
-
-    Returns:
-        ``True``/``False`` for the recognized strings, else ``None``.
-    """
-    cleaned = _clean_str(value)
-    if cleaned is None:
-        return None
-    match cleaned.lower():
-        case "true":
-            return True
-        case "false":
-            return False
-        case _:
-            return None
-
-
-def _parse_filters(request: Request, *, default_page_size: int) -> SearchFilters:
-    """Build :class:`SearchFilters` from the request query string.
-
-    Empty-string values become ``None`` so a blank form field never filters. The
-    repeated ``rule_ids`` param is collected into a list. Page defaults to 1 and
-    page size to the configured default when absent/invalid.
-
-    Args:
-        request: The incoming request whose query params drive the filters.
-        default_page_size: The page size to use when none is supplied.
-
-    Returns:
-        The parsed :class:`SearchFilters`.
-    """
-    qp = request.query_params
-
-    page = 1
-    raw_page = _clean_str(qp.get("page"))
-    if raw_page is not None:
-        try:
-            page = max(1, int(raw_page))
-        except ValueError:
-            page = 1
-
-    page_size = default_page_size
-    raw_size = _clean_str(qp.get("page_size"))
-    if raw_size is not None:
-        try:
-            page_size = max(1, int(raw_size))
-        except ValueError:
-            page_size = default_page_size
-
-    rule_ids = [rid for rid in qp.getlist("rule_ids") if rid.strip()]
-
-    return SearchFilters(
-        username=_clean_str(qp.get("username")),
-        resource_address=_clean_str(qp.get("resource_address")),
-        status=_clean_str(qp.get("status")),
-        started_after=_clean_str(qp.get("started_after")),
-        started_before=_clean_str(qp.get("started_before")),
-        min_duration=_clean_float(qp.get("min_duration")),
-        max_duration=_clean_float(qp.get("max_duration")),
-        category=_clean_str(qp.get("category")),
-        severity=_clean_str(qp.get("severity")),
-        max_severity=_clean_str(qp.get("max_severity")),
-        rule_ids=rule_ids,
-        has_findings=_clean_bool(qp.get("has_findings")),
-        keyword=_clean_str(qp.get("keyword")),
-        regex=_clean_str(qp.get("regex")),
-        sort=_clean_str(qp.get("sort")) or "newest",
-        page=page,
-        page_size=page_size,
-    )
-
-
 @router.get("/", include_in_schema=False)
 async def index() -> RedirectResponse:
     """Redirect the site root to the dashboard."""
@@ -610,67 +519,102 @@ async def index() -> RedirectResponse:
     )
 
 
+def _dashboard_window(request: Request) -> str:
+    """Return the dashboard's ``window`` value; absent, blank, or unknown → the default.
+
+    The dashboard stays lenient (it is a landing page, not a search): an invalid
+    value renders the default window rather than a ``400``.
+    """
+    raw = (request.query_params.get("window") or "").strip()
+    return raw if raw in WINDOW_VALUES else _DEFAULT_WINDOW
+
+
+async def _recent_activity(request: Request) -> list[dict[str, object]]:
+    """Build the dashboard's recent-activity feed (spec §8.2, Q11).
+
+    One :func:`run_timeline` page: every kind (``type=any``), newest first,
+    discovery-only commands hidden, no window, :data:`_FEED_LIMIT` items. Rows are
+    the same dicts the search page renders. A budget hit just yields a shorter feed,
+    with no notice.
+    """
+    settings = request.app.state.settings
+    query = UnifiedQuery(kinds=TYPE_GROUPS["any"])
+    kinds, excluded = resolve_kinds(query)
+    sources = build_sources(
+        request.app.state.db,
+        _get_casts(request),
+        content_budget=settings.search_regex_max_candidates,
+    )
+    page = await run_timeline(sources, query, kinds, limit=_FEED_LIMIT, excluded=excluded)
+    linked = await _linked_command_ids(request, page)
+    return _item_views(page, show_discovery=False, focused=False, linked_command_ids=linked)
+
+
 @router.get("/dashboard")
 async def dashboard(request: Request) -> object:
-    """Render the dashboard: time-windowed counts + risk breakdowns, all drillable.
+    """Render the dashboard: windowed figures that drill into search, plus a recent feed.
 
-    Figures come from :meth:`SearchStore.dashboard_stats` scoped to the selected time
-    window (``?window=7|30|90|all``, default 30 days) — session/finding counts and
-    rule-derived severities/categories only; no recording text is read or shown
-    (CLAUDE.md rules 5/6). Each breakdown is rendered with a link: severities and
-    categories deep-link into ``/search`` (carrying the same window via
-    ``started_after``), top users link to that user's sessions in search, and top
-    systems link to the system's session list.
+    Figures come from :meth:`SearchStore.dashboard_stats` for the selected window
+    (``?window=7|30|90|all``, default 30 days; an invalid value falls back to the
+    default). Every drill-down is built with :func:`search_url` and carries an
+    explicit ``type`` and the same ``window`` (spec §8.1):
+
+    * Total sessions → ``type=recordings``; Flagged sessions → ``type=recordings&
+      has_findings=true``; session severity chips → ``type=recordings&max_severity=S``;
+      category chips → ``type=recordings&category=C``.
+    * kubectl API requests → ``type=kubectl``; flagged commands →
+      ``type=kubectl&has_findings=true``; API severity chips →
+      ``type=kubectl&max_severity=S``.
+    * Top users → ``user=U`` (every kind); top systems → ``/systems/{slug}``.
+
+    The recent-activity feed (:func:`_recent_activity`) is not windowed. Only
+    metadata and rule-derived figures are shown; no recording text is read or
+    rendered (CLAUDE.md rules 5/6).
     """
-    search = _get_search(request)
+    window = _dashboard_window(request)
+    cutoff = _window_cutoff(window, datetime.now(tz=timezone.utc))
+    stats = await _get_search(request).dashboard_stats(started_after=cutoff)
 
-    window = _clean_str(request.query_params.get("window")) or _DEFAULT_WINDOW
-    if window not in {value for value, _ in _WINDOW_OPTIONS}:
-        window = _DEFAULT_WINDOW
-    cutoff = _window_cutoff(window)
-
-    stats = await search.dashboard_stats(started_after=cutoff)
+    def link(**params: object) -> str:
+        return search_url(**params, window=window)
 
     severity_rows = [
         {
             "label": sev,
             "count": stats.by_severity[sev],
-            "url": _search_url(max_severity=sev, started_after=cutoff),
+            "url": link(type="recordings", max_severity=sev),
         }
         for sev in _SEVERITY_DISPLAY_ORDER
         if sev in stats.by_severity
     ]
+    # Counts findings per category; the chip lists the sessions holding one, so the
+    # two numbers differ by design.
     category_rows = [
-        {
-            "label": cat,
-            "count": count,
-            "url": _search_url(category=cat, started_after=cutoff),
-        }
+        {"label": cat, "count": count, "url": link(type="recordings", category=cat)}
         for cat, count in stats.by_category.items()
     ]
+    # Counts sessions per user; the link lists every kind for that user (commands
+    # too), so the two numbers differ by design.
     user_rows = [
-        {
-            "label": u.label,
-            "count": u.count,
-            "url": _search_url(username=u.label, started_after=cutoff),
-        }
+        {"label": u.label, "count": u.count, "url": link(user=u.label)}
         for u in stats.top_users
     ]
     system_rows = [
-        {
-            "label": s.label,
-            "count": s.count,
-            "url": f"/systems/{_system_slug(s.label)}",
-        }
+        {"label": s.label, "count": s.count, "url": f"/systems/{_system_slug(s.label)}"}
         for s in stats.top_systems
     ]
-    # kubectl API requests by each flagged request's highest severity. No search
-    # integration exists for API requests (spec §2 non-goal), so rows carry no URL.
+    # Flagged kubectl commands, each counted once at its highest severity. Only known
+    # severities get a chip (SEVERITY_RANK keys, so the class name is never stored text).
     api_severity_rows = [
-        {"label": sev, "count": stats.api_by_severity[sev]}
+        {
+            "label": sev,
+            "count": stats.api_commands_by_severity[sev],
+            "url": link(type=KIND_KUBECTL, max_severity=sev),
+        }
         for sev in _SEVERITY_DISPLAY_ORDER
-        if sev in stats.api_by_severity
+        if sev in stats.api_commands_by_severity
     ]
+    flagged_commands = stats.api_flagged_commands
 
     return templates.TemplateResponse(
         request,
@@ -679,62 +623,538 @@ async def dashboard(request: Request) -> object:
             "stats": stats,
             "window": window,
             "window_options": _WINDOW_OPTIONS,
+            "total_sessions_url": link(type="recordings"),
+            "flagged_sessions_url": link(type="recordings", has_findings=True),
+            "api_requests_url": link(type=KIND_KUBECTL),
+            "flagged_commands_url": link(type=KIND_KUBECTL, has_findings=True),
+            "flagged_commands_label": (
+                f"{flagged_commands}+" if stats.api_flagged_truncated else str(flagged_commands)
+            ),
+            "flagged_commands_plural": flagged_commands != 1 or stats.api_flagged_truncated,
             "severity_rows": severity_rows,
             "category_rows": category_rows,
             "user_rows": user_rows,
             "system_rows": system_rows,
             "api_severity_rows": api_severity_rows,
+            "feed_items": await _recent_activity(request),
+            "view_all_url": search_url(),
         },
     )
 
 
+# --- unified search: presentation (spec §8.3) ----------------------------------------
+# Every value below is built from allowlisted stored columns or fixed strings. Class
+# names come from the kind registry (badge_class), fixed status maps, and
+# SEVERITY_RANK keys — never from stored text (spec §10). ``user_agent`` and raw
+# ApiRequestRow objects never reach a template.
+
+# Recording status → (label, CSS class). Anything else renders as "unknown".
+_STATUS_DISPLAY: dict[str, tuple[str, str]] = {
+    "complete": ("complete", "pill-complete"),
+    "provisional": ("in progress", "pill-provisional"),
+    "error": ("error", "pill-error"),
+}
+_STATUS_UNKNOWN = ("unknown", "pill-unknown")
+
+# Plural kind labels for notices ("SSH sessions", "kubectl commands", …).
+_KIND_PLURALS: dict[str, str] = {k: label for k, label in TYPE_LABELS if k in KINDS}
+
+# Filters that live in the form's "Recording filters" <details> (spec §8.3); the
+# <details> opens when any of them is set.
+_RECORDING_FILTER_FIELDS = ("status", "min_duration", "max_duration", "category", "rule_ids")
+
+_FOCUS_NOT_FOUND_TEXT = "Command not found. It may have been removed by retention."
+_FLAGGED_CAP_TEXT = (
+    "More than {cap:,} flagged kubectl commands match. Narrow by system, user, or time."
+)
+_SCAN_BUDGET_TEXT = "Scanned {n:,} kubectl requests without filling the page."
+_CONTENT_BUDGET_TEXT = "Scanned {n:,} recordings without filling the page."
+_SEARCH_WINDOW_OPTIONS: list[tuple[str, str]] = [("", "—"), *_WINDOW_OPTIONS]
+_MODE_OPTIONS: list[tuple[str, str]] = [("text", "text"), ("regex", "regex")]
+
+
+def _session_url(conn_id: str) -> str:
+    """Return the session detail / replay page URL for a recording."""
+    return f"/sessions/{quote(conn_id, safe='')}"
+
+
+def _safe_severity(value: str | None) -> str | None:
+    """Return ``value`` when it is a known severity (a SEVERITY_RANK key), else ``None``."""
+    return value if value in SEVERITY_RANK else None
+
+
+def _number_str(value: float | None) -> str:
+    """Render an optional duration for a form field: ``60`` rather than ``60.0``."""
+    if value is None:
+        return ""
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
+
+
+def _is_htmx_partial(request: Request) -> bool:
+    """Tell whether to answer with the results partial rather than the full page.
+
+    True for an HTMX request, except htmx's history-restore request (a cache miss
+    after Back/Forward), which replaces the whole body and so needs the full page.
+    """
+    headers = request.headers
+    if headers.get("HX-Request", "").lower() != "true":
+        return False
+    return headers.get("HX-History-Restore-Request", "").lower() != "true"
+
+
+def _recording_item_view(
+    at: str, hit: RecordingHit, *, linked_command_ids: set[str]
+) -> dict[str, object]:
+    """Build one ``recording_row`` context (ssh / exec / failed).
+
+    Metadata and finding rule metadata only — never recording content (rule 6).
+    """
+    s = hit.session
+    kind = KINDS[hit.kind]
+    url = _session_url(s.conn_id)
+    is_failed = hit.kind == KIND_FAILED
+    status_label, status_class = _STATUS_DISPLAY.get(s.status, _STATUS_UNKNOWN)
+    findings = [
+        {
+            "label": f.label,
+            "severity": _safe_severity(f.severity),
+            "category": f.category,
+            "offset_seconds": f.offset_seconds,
+            "jump_url": (
+                f"{url}?{urlencode([('t', f.offset_seconds)])}"
+                if f.offset_seconds is not None
+                else None
+            ),
+        }
+        for f in hit.findings
+    ]
+    command_url = (
+        search_url(cmd=s.request_id)
+        if hit.kind == KIND_EXEC and s.request_id and s.request_id in linked_command_ids
+        else None
+    )
+    return {
+        "kind": kind.key,
+        "kind_label": kind.label,
+        "badge_class": kind.badge_class,
+        "row_macro": kind.row_macro,
+        "at": at,
+        "conn_id": s.conn_id,
+        "session_url": url,
+        "action": "details" if is_failed else "replay",
+        "system_label": _system_label(s.resource_address),
+        "system_url": f"/systems/{_system_slug(s.resource_address)}",
+        "username": s.username,
+        "user_label": s.username or "(unknown user)",
+        "user_url": search_url(user=s.username) if s.username else None,
+        "shell_user": s.shell_user,
+        "status": s.status,
+        "status_label": status_label,
+        "status_class": status_class,
+        "started_at": s.started_at,
+        "ended_at": s.ended_at,
+        "duration_seconds": None if is_failed else s.duration_seconds,
+        "duration_display": None if is_failed else _duration_display(s.duration_seconds),
+        "finding_count": s.finding_count,
+        "max_severity": _safe_severity(s.max_severity),
+        "findings": findings,
+        "command_url": command_url,
+    }
+
+
+def _command_item_view(
+    at: str, hit: CommandHit, *, show_discovery: bool, focused: bool
+) -> dict[str, object]:
+    """Build one ``command_row`` context (a kubectl command, spec §8.3).
+
+    Aggregates (counts, end, severity, labels, recordings) cover every request of the
+    command; ``requests`` is the listed (≤ 200) requests, discovery hidden unless
+    ``discovery=1``. Only allowlisted stored columns are exposed.
+    """
+    kind = KINDS[KIND_KUBECTL]
+    primary = hit.command.primary
+    slug = _system_slug(hit.resource_address)
+    username = hit.username
+    user_value = username or hit.user_key
+    return {
+        "kind": kind.key,
+        "kind_label": kind.label,
+        "badge_class": kind.badge_class,
+        "row_macro": kind.row_macro,
+        "at": at,
+        "command_id": hit.command_id,
+        "focus_url": search_url(cmd=hit.command_id),
+        "open": focused,
+        "label": hit.label,
+        "method": primary.method,
+        "path": hit.command.primary_path,
+        "status_code": primary.status_code,
+        "outcome": primary.outcome,
+        "started_at": hit.started_at,
+        "ended_at": hit.ended_at,
+        "duration_seconds": hit.duration_seconds,
+        "duration_display": _duration_display(hit.duration_seconds),
+        "request_count": hit.request_count,
+        "discovery_count": hit.discovery_count,
+        "hidden_discovery_count": 0 if show_discovery else hit.discovery_count,
+        "is_discovery_only": hit.is_discovery_only,
+        "listed_count": hit.listed_count,
+        "requests_truncated": hit.requests_truncated,
+        "finding_count": hit.finding_count,
+        "max_severity": _safe_severity(hit.max_severity),
+        "finding_labels": list(hit.finding_labels),
+        "recordings": [_recording_link(conn_id) for conn_id in hit.recordings],
+        "requests": [
+            _request_view(r, dict(hit.findings))
+            for r in hit.visible_requests(include_discovery=show_discovery)
+        ],
+        "activity_url": _activity_url(slug, hit.user_key, hit.started_at, hit.ended_at),
+        "system_label": _system_label(hit.resource_address),
+        "system_url": f"/systems/{slug}",
+        "username": username,
+        "user_label": _user_label(username, hit.user_key),
+        "user_url": search_url(user=user_value) if user_value else None,
+    }
+
+
+def _item_views(
+    page: TimelinePage,
+    *,
+    show_discovery: bool,
+    focused: bool,
+    linked_command_ids: set[str],
+) -> list[dict[str, object]]:
+    """Build the row dicts for a timeline page (search results and the dashboard feed)."""
+    items: list[dict[str, object]] = []
+    for item in page.items:
+        if isinstance(item.data, RecordingHit):
+            items.append(
+                _recording_item_view(item.at, item.data, linked_command_ids=linked_command_ids)
+            )
+        elif isinstance(item.data, CommandHit):
+            items.append(
+                _command_item_view(
+                    item.at, item.data, show_discovery=show_discovery, focused=focused
+                )
+            )
+    return items
+
+
+async def _linked_command_ids(request: Request, page: TimelinePage) -> set[str]:
+    """Return the exec recordings' ``request_id``\\s on ``page`` that have a stored command.
+
+    One batched ``api_requests`` primary-key lookup (Q13), so an exec row links to its
+    command only when the command exists.
+    """
+    exec_request_ids = [
+        item.data.session.request_id
+        for item in page.items
+        if isinstance(item.data, RecordingHit)
+        and item.data.kind == KIND_EXEC
+        and item.data.session.request_id
+    ]
+    if not exec_request_ids:
+        return set()
+    return await _get_activity(request).known_request_ids(exec_request_ids)
+
+
+def _exclusion_notices(excluded: dict[str, str], *, focused: bool) -> list[dict[str, object]]:
+    """Build the "<kinds> not searched: the <filter> applies to … only." notices.
+
+    Kinds excluded for the same reason share one notice; the three recording kinds
+    together read "Recordings". Under a ``cmd`` focus the recording kinds' ``cmd``
+    exclusions are not listed (the focus banner already says one command is shown).
+    Fixed strings only; no request value is interpolated.
+    """
+    by_reason: dict[str, list[str]] = {}
+    for kind, reason in excluded.items():
+        if focused and reason == "cmd":
+            continue
+        by_reason.setdefault(reason, []).append(kind)
+    notices: list[dict[str, object]] = []
+    for reason, kinds in by_reason.items():
+        if frozenset(kinds) == TYPE_GROUPS["recordings"]:
+            subject = "Recordings"
+        else:
+            names = [_KIND_PLURALS[k] for k in kinds]
+            subject = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+        what = EXCLUSION_LABELS.get(reason, "filter")
+        scope = "kubectl commands" if reason == "cmd" else "recordings"
+        notices.append(
+            {
+                "kinds": kinds,
+                "reason": reason,
+                "text": f"{subject} not searched: the {what} applies to {scope} only.",
+            }
+        )
+    return notices
+
+
+def _search_context(
+    parsed: ParsedSearch,
+    page: TimelinePage,
+    *,
+    linked_command_ids: set[str],
+) -> dict[str, object]:
+    """Build the context shared by ``search.html`` and ``_results.html`` (spec §8.3).
+
+    See the template context contract for every key. URLs are built only through
+    :func:`search_url` (canonical names; the cursor is unsigned base64url and is
+    URL-encoded like any other value).
+    """
+    q = parsed.query
+    params = parsed.url_params()
+    focused = q.cmd is not None
+    items = _item_views(
+        page,
+        show_discovery=q.discovery,
+        focused=focused,
+        linked_command_ids=linked_command_ids,
+    )
+
+    cursor_url: str | None = None
+    if page.next_cursor is not None:
+        cursor_url = search_url(**params, cursor=encode_cursor(page.next_cursor))
+
+    summary: list[dict[str, str]] = []
+    if not focused:
+        if params["system"] is not None:
+            summary.append(
+                {
+                    "name": "system",
+                    "value": _system_label(q.system),
+                    "clear_url": search_url(**{**params, "system": None}),
+                }
+            )
+        if params["user"] is not None:
+            summary.append(
+                {
+                    "name": "user",
+                    "value": str(params["user"]),
+                    "clear_url": search_url(**{**params, "user": None}),
+                }
+            )
+
+    budget_notices: list[str] = []
+    if page.scan_budget_hit:
+        budget_notices.append(_SCAN_BUDGET_TEXT.format(n=page.scan_budget))
+    if page.content_budget_hit:
+        budget_notices.append(_CONTENT_BUDGET_TEXT.format(n=page.content_budget))
+
+    export_query = search_url(**{**params, "page_size": None})[len("/search"):]
+    return {
+        "items": items,
+        "shown_count": len(items),
+        "summary": summary,
+        "exclusion_notices": _exclusion_notices(dict(parsed.excluded), focused=focused),
+        "all_excluded": not parsed.kinds,
+        "budget_notices": budget_notices,
+        "flagged_cap_notice": (
+            _FLAGGED_CAP_TEXT.format(cap=page.flagged_cap) if page.flagged_cap_hit else None
+        ),
+        "focus": (
+            {
+                "command_id": q.cmd,
+                "not_found": page.focus_not_found,
+                "not_found_text": _FOCUS_NOT_FOUND_TEXT,
+                "clear_url": search_url(type=KIND_KUBECTL),
+            }
+            if focused
+            else None
+        ),
+        "show_discovery": q.discovery,
+        "next_url": cursor_url if not page.budget_hit else None,
+        "continue_url": cursor_url if page.budget_hit else None,
+        "first_page_url": search_url(**params) if parsed.cursor is not None else None,
+        "export_url": f"/search/export.csv{export_query}",
+    }
+
+
+def _search_form_context(parsed: ParsedSearch) -> dict[str, object]:
+    """Build the sticky form values and option lists for ``search.html``.
+
+    The form never carries ``cursor`` (a submit starts at the first page) or ``cmd``
+    (a submit leaves the single-command focus).
+    """
+    q = parsed.query
+    params = parsed.url_params()
+    has_findings = "" if q.has_findings is None else ("true" if q.has_findings else "false")
+    form: dict[str, object] = {
+        "type": parsed.type,
+        "system": params["system"] or "",
+        "user": q.user or "",
+        "window": parsed.window or "",
+        "from": "" if parsed.window is not None else (q.from_ or ""),
+        "to": "" if parsed.window is not None else (q.to or ""),
+        "severity": q.severity or "",
+        "max_severity": q.max_severity or "",
+        "has_findings": has_findings,
+        "category": q.category or "",
+        "rule_ids": list(q.rule_ids),
+        "status": q.status or "",
+        "min_duration": _number_str(q.min_duration),
+        "max_duration": _number_str(q.max_duration),
+        "q": params["q"] or "",
+        "mode": params["mode"] or "text",
+        "sort": q.sort,
+        "discovery": q.discovery,
+        "page_size": parsed.page_size if parsed.page_size_explicit else None,
+    }
+    categories = sorted({rule.category for rule in load_rules()})
+    if q.category and q.category not in categories:
+        categories.append(q.category)
+    return {
+        "form": form,
+        "recording_filters_open": any(form[name] for name in _RECORDING_FILTER_FIELDS),
+        "type_options": TYPE_LABELS,
+        "window_options": _SEARCH_WINDOW_OPTIONS,
+        "severity_options": _SEVERITY_OPTIONS,
+        "status_options": list(STATUS_VALUES),
+        "category_options": categories,
+        "mode_options": _MODE_OPTIONS,
+        "sort_options": _SORT_OPTIONS,
+        "rules": _dangerous_command_rules(),
+    }
+
+
+def _search_error_response(request: Request, exc: HTTPException) -> Response:
+    """Render the HTMX ``400`` partial (spec §5.3).
+
+    The detail is one of ``web.params``' fixed messages, which name the parameter
+    only; the submitted value is never echoed or logged.
+    """
+    return templates.TemplateResponse(
+        request,
+        "_search_error.html",
+        {"error_message": str(exc.detail)},
+        status_code=status.HTTP_400_BAD_REQUEST,
+        headers={"Vary": "HX-Request"},
+    )
+
+
 @router.get("/search")
-async def search(request: Request) -> object:
-    """Render the search page (or, for HTMX requests, the results fragment only).
+async def search(request: Request) -> Response:
+    """Render the unified search (spec §8.3): full page, or the results partial for HTMX.
 
-    Query params are parsed into :class:`SearchFilters` (blanks → ``None``), the search
-    runs, and the result page is rendered. When the ``HX-Request`` header is present the
-    response is the bare ``_results.html`` partial so HTMX can swap the results region
-    in place; otherwise the full ``search.html`` page (form + results) is returned.
+    Parameters are parsed strictly by :func:`parse_unified_query` (canonical names
+    plus legacy aliases; ``400`` on any invalid, repeated, or conflicting value). The
+    resolved kinds run through :func:`run_timeline` over the default sources, one
+    keyset page of ``page_size`` items. Exec recordings on the page are checked
+    against ``api_requests`` (batched Q13) so their row can link to their command.
 
-    Recording content is never rendered — results show metadata plus finding label,
+    Responses:
+        * ``HX-Request: true`` (not a history restore) → ``_results.html`` only.
+          A ``400`` renders ``_search_error.html`` with status ``400``.
+        * Otherwise → ``search.html`` (form + results). A ``400`` is FastAPI's JSON
+          ``{"detail": …}``.
+
+    Recording content is never rendered — rows carry metadata plus finding label,
     severity, and offset only (CLAUDE.md rules 5/6).
     """
     settings = request.app.state.settings
-    store = _get_search(request)
-    filters = _parse_filters(request, default_page_size=settings.search_page_size)
-    result = await store.search(
-        filters, regex_max_candidates=settings.search_regex_max_candidates
+    partial = _is_htmx_partial(request)
+    try:
+        parsed = parse_unified_query(request, default_page_size=settings.search_page_size)
+    except HTTPException as exc:
+        if partial and exc.status_code == status.HTTP_400_BAD_REQUEST:
+            return _search_error_response(request, exc)
+        raise
+
+    sources = build_sources(
+        request.app.state.db,
+        _get_casts(request),
+        content_budget=settings.search_regex_max_candidates,
+    )
+    try:
+        page = await run_timeline(
+            sources,
+            parsed.query,
+            parsed.kinds,
+            cursor=parsed.cursor,
+            limit=parsed.page_size,
+            excluded=parsed.excluded,
+        )
+    except ValueError:
+        # parse_unified_query already checks the cursor against the search; this is
+        # defense in depth. Fixed message, no value.
+        exc = _bad_request("'cursor' does not match the current search")
+        if partial:
+            return _search_error_response(request, exc)
+        raise exc from None
+
+    linked = await _linked_command_ids(request, page)
+
+    context = _search_context(parsed, page, linked_command_ids=linked)
+    if partial:
+        template = "_results.html"
+    else:
+        template = "search.html"
+        context.update(_search_form_context(parsed))
+    return templates.TemplateResponse(
+        request, template, context, headers={"Vary": "HX-Request"}
     )
 
-    context = {
-        "result": result,
-        "filters": filters,
-        "rules": _dangerous_command_rules(),
-        "severity_options": _SEVERITY_OPTIONS,
-        "sort_options": _SORT_OPTIONS,
-        "query_string": str(request.query_params),
-    }
 
-    template = (
-        "_results.html"
-        if request.headers.get("HX-Request", "").lower() == "true"
-        else "search.html"
-    )
-    return templates.TemplateResponse(request, template, context)
+# CSV export columns (spec §9). The first ten are Session 8's, unchanged in name
+# and order; the last five were appended in Session 10.
+CSV_COLUMNS: tuple[str, ...] = (
+    "conn_id",
+    "username",
+    "resource_address",
+    "status",
+    "started_at",
+    "ended_at",
+    "duration_seconds",
+    "finding_count",
+    "max_severity",
+    "findings",
+    "kind",
+    "command",
+    "method",
+    "path",
+    "request_count",
+)
+
+# Leading characters a spreadsheet may treat as a formula (or that hide one). A
+# text cell starting with any of them is written with a leading "'" (spec §9).
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+# Items requested per run_timeline call while walking an export (the UI maximum).
+_CSV_PAGE_SIZE = MAX_PAGE_SIZE
+
+_CSV_TRUNCATED_HEADER = "X-Gatorcast-Truncated"
 
 
-def _csv_row_for(item: SessionWithFindings) -> list[object]:
-    """Build one CSV row (metadata + finding SUMMARY only) for a result item.
+def _csv_safe(value: object) -> object:
+    """Neutralize a formula-like text cell by prefixing ``'`` (spec §9).
 
-    The ``findings`` cell joins ``"<label>@<offset>s"`` entries with ``;`` — label and
-    offset only, never any matched/recorded text (CLAUDE.md rule 6).
+    Applies to every column. Only text cells are changed; numbers are written as-is
+    (they are produced by this module, never taken from a client).
+
+    Args:
+        value: A cell value.
+
+    Returns:
+        ``value``, or ``"'" + value`` when it is a string starting with ``=``, ``+``,
+        ``-``, ``@``, tab, or carriage return.
     """
-    s = item.session
-    finding_descriptors = [
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _csv_recording_row(hit: RecordingHit) -> list[object]:
+    """Build the 15 CSV cells of a recording (ssh / exec / failed).
+
+    Columns 1–10 are exactly Session 8's (values as stored). The ``findings`` cell
+    joins ``"<label>@<offset>s"`` entries with ``"; "``: rule label and offset only,
+    never recorded text (CLAUDE.md rule 6). Columns 12–15 are empty.
+    """
+    s = hit.session
+    findings = "; ".join(
         f"{f.label}@{f.offset_seconds if f.offset_seconds is not None else '?'}s"
-        for f in item.findings
-    ]
+        for f in hit.findings
+    )
     return [
         s.conn_id,
         s.username or "",
@@ -745,67 +1165,166 @@ def _csv_row_for(item: SessionWithFindings) -> list[object]:
         s.duration_seconds if s.duration_seconds is not None else "",
         s.finding_count,
         s.max_severity or "",
-        "; ".join(finding_descriptors),
+        findings,
+        hit.kind,
+        "",
+        "",
+        "",
+        "",
     ]
 
 
-@router.get("/search/export.csv")
-async def search_export_csv(request: Request) -> StreamingResponse:
-    """Export the current filtered search as a CSV download (metadata + summary only).
+def _csv_command_row(hit: CommandHit) -> list[object]:
+    """Build the 15 CSV cells of a kubectl command (spec §9).
 
-    Uses the same filter parsing as :func:`search` but pages the full filtered set in a
-    single large page. Columns carry session metadata plus a finding SUMMARY (label +
-    offset); recorded content is never written (CLAUDE.md rule 6).
+    Only allowlisted stored values: the command label (``Kubectl-Command``, else the
+    User-Agent product token, else ``(unknown client)``; never the full User-Agent),
+    the primary request's method, and its path with the query string removed (so no
+    query value, and never ``command=``). API findings have no offset, so the
+    ``findings`` cell is their distinct labels joined by ``"; "``.
+    """
+    return [
+        hit.conn_id,
+        hit.username or "",
+        hit.resource_address or "",
+        "",
+        hit.started_at,
+        hit.ended_at,
+        round(hit.duration_seconds, 3),
+        hit.finding_count,
+        hit.max_severity or "",
+        "; ".join(hit.finding_labels),
+        KIND_KUBECTL,
+        hit.label,
+        hit.command.primary.method or "",
+        hit.command.primary_path,
+        hit.request_count,
+    ]
+
+
+class _CountingSidecars:
+    """Cast-store stand-in for one export: counts sidecar reads across pages.
+
+    The timeline's content budget is per page; an export walks many pages, so it
+    hands each page the budget left over from the export-wide total. Only
+    ``read_sidecar`` is used by the sessions source.
+    """
+
+    def __init__(self, casts: CastStore) -> None:
+        """Wrap ``casts``; no reads counted yet."""
+        self._casts = casts
+        self.reads = 0
+
+    async def read_sidecar(self, conn_id: str) -> str:
+        """Count the attempt, then delegate to :meth:`CastStore.read_sidecar`."""
+        self.reads += 1
+        return await self._casts.read_sidecar(conn_id)
+
+
+@router.get("/search/export.csv")
+async def search_export_csv(request: Request) -> Response:
+    """Export the current search as a CSV download (spec §9: the export follows the page).
+
+    Parameters are parsed by :func:`parse_unified_query` exactly as for ``/search``
+    (canonical names plus legacy aliases, ``400`` on invalid input); ``cursor`` and
+    ``page_size`` are validated, then ignored. Pages of :func:`run_timeline` are
+    walked from the first page and written as they arrive. The walk stops when every
+    source is exhausted, at :data:`_CSV_EXPORT_CAP` items, or at the first page a
+    budget cut short. Sidecar reads (content search) are bounded by
+    ``SEARCH_REGEX_MAX_CANDIDATES`` for the whole export, not per page.
+
+    The response carries ``X-Gatorcast-Truncated: true`` when the export stopped
+    before the end: the cap was reached, a budget stopped a page, the export-wide
+    sidecar budget ran out, or more flagged kubectl commands match than the flagged
+    cap lists.
+
+    Each row is a recording or a kubectl command, in page order, with the 15
+    :data:`CSV_COLUMNS`. Every text cell goes through :func:`_csv_safe`. Recorded
+    content is never written (CLAUDE.md rule 6).
     """
     settings = request.app.state.settings
-    store = _get_search(request)
-    filters = _parse_filters(request, default_page_size=settings.search_page_size)
-    filters.page = 1
-    filters.page_size = _CSV_EXPORT_CAP
-    result = await store.search(
-        filters, regex_max_candidates=settings.search_regex_max_candidates
-    )
+    parsed = parse_unified_query(request, default_page_size=settings.search_page_size)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(
-        [
-            "conn_id",
-            "username",
-            "resource_address",
-            "status",
-            "started_at",
-            "ended_at",
-            "duration_seconds",
-            "finding_count",
-            "max_severity",
-            "findings",
-        ]
-    )
-    for item in result.items:
-        writer.writerow(_csv_row_for(item))
-    buffer.seek(0)
+    writer.writerow(CSV_COLUMNS)
 
-    return StreamingResponse(
-        iter([buffer.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="gatorcast-search.csv"'},
-    )
+    sidecars = _CountingSidecars(_get_casts(request))
+    sidecar_budget = max(1, int(settings.search_regex_max_candidates))
+    written = 0
+    truncated = False
+    cursor: Cursor | None = None
+    while parsed.kinds:
+        remaining_reads = sidecar_budget - sidecars.reads
+        if remaining_reads <= 0:
+            truncated = True
+            break
+        sources = build_sources(
+            request.app.state.db,
+            sidecars,  # type: ignore[arg-type]  # duck-typed: only read_sidecar is used
+            content_budget=remaining_reads,
+        )
+        try:
+            page = await run_timeline(
+                sources,
+                parsed.query,
+                parsed.kinds,
+                cursor=cursor,
+                limit=min(_CSV_PAGE_SIZE, _CSV_EXPORT_CAP - written),
+                excluded=parsed.excluded,
+            )
+        except ValueError:
+            raise _bad_request("'cursor' does not match the current search") from None
+        for item in page.items:
+            if isinstance(item.data, RecordingHit):
+                row = _csv_recording_row(item.data)
+            elif isinstance(item.data, CommandHit):
+                row = _csv_command_row(item.data)
+            else:  # pragma: no cover - run_timeline only returns hydrated items
+                continue
+            writer.writerow([_csv_safe(cell) for cell in row])
+            written += 1
+        if page.flagged_cap_hit:
+            truncated = True
+        if page.next_cursor is None:
+            break
+        if page.budget_hit or written >= _CSV_EXPORT_CAP:
+            truncated = True
+            break
+        cursor = page.next_cursor
+
+    headers = {"Content-Disposition": 'attachment; filename="gatorcast-search.csv"'}
+    if truncated:
+        headers[_CSV_TRUNCATED_HEADER] = "true"
+        log.info("search.export_truncated", rows=written, sidecar_reads=sidecars.reads)
+    return Response(content=buffer.getvalue(), media_type="text/csv", headers=headers)
 
 
 @router.get("/systems")
 async def systems(request: Request) -> object:
-    """Render the systems index: distinct resource_address with counts/last-seen."""
+    """Render the systems index (spec §8.4).
+
+    One row per distinct ``resource_address`` with Type badges, the session count
+    and "Last session", the API-request count and "Last API request" (both in the
+    ``requested_at`` format), and the recording findings summary. Rows are sorted by
+    the newer of the two timestamps (``list_systems``). The counts and "Last API
+    request" link into search via :func:`search_url` (spec §8.1).
+    """
     repo = _get_repo(request)
     summaries = await repo.list_systems()
-    views = [
-        SystemView(
-            summary=summary,
-            label=_system_label(summary.resource_address),
-            address_slug=_system_slug(summary.resource_address),
+    views = []
+    for summary in summaries:
+        system = _search_system(summary.resource_address)
+        views.append(
+            SystemView(
+                summary=summary,
+                label=_system_label(summary.resource_address),
+                address_slug=_system_slug(summary.resource_address),
+                badges=_system_badges(summary),
+                sessions_url=search_url(type="recordings", system=system),
+                api_url=search_url(type=KIND_KUBECTL, system=system),
+            )
         )
-        for summary in summaries
-    ]
     return templates.TemplateResponse(
         request, "systems.html", {"systems": views}
     )
@@ -823,6 +1342,12 @@ async def system_sessions(request: Request, address_slug: str) -> object:
     row links to the activity page by its own bounds. An "Older" link pages to the
     previous window; an activity session straddling a window edge appears split at
     that edge. When the row cap is hit, a truncation notice is shown.
+
+    Cross-links (spec §8.5): a "Search this system" header link
+    (``/search?system=A``), a "kubectl commands in search" link by the activity
+    heading (``/search?type=kubectl&system=A``), and a trailing ``⌕`` link per user in
+    both tables (``/search?user=…``; username, else user key; none for the NULL-user
+    bucket). The NULL system bucket searches as ``system=_unknown``.
 
     Query params:
         activity_before: Optional ISO 8601 upper bound of the activity window
@@ -867,6 +1392,7 @@ async def system_sessions(request: Request, address_slug: str) -> object:
         recordings=recordings,
     )
 
+    system = _search_system(resource_address)
     return templates.TemplateResponse(
         request,
         "sessions.html",
@@ -874,6 +1400,8 @@ async def system_sessions(request: Request, address_slug: str) -> object:
             "sessions": [_session_view(s) for s in sessions_list],
             "system_label": _system_label(resource_address),
             "system_slug": address_slug,
+            "search_system_url": search_url(system=system),
+            "kubectl_search_url": search_url(type=KIND_KUBECTL, system=system),
             "activity_sessions": [
                 _activity_session_view(s, address_slug) for s in activity_sessions
             ],
@@ -900,7 +1428,9 @@ async def system_activity(request: Request, address_slug: str) -> object:
     recordings through ``request_id`` (``recordings_for_requests``) to
     ``/sessions/{conn_id}``. Discovery requests are hidden (and discovery-only
     commands omitted) unless ``discovery=1``. No player is used, and only
-    allowlisted stored columns are rendered.
+    allowlisted stored columns are rendered. The header's user label links to
+    ``/search?user=…`` (the username, else the user key; no link for the NULL-user
+    bucket, spec §8.5).
 
     Query params:
         user: Required. The activity session's ``user_key``, or ``_unknown`` for the
@@ -969,6 +1499,7 @@ async def system_activity(request: Request, address_slug: str) -> object:
             "system_slug": address_slug,
             "user_key": user_key,
             "user_label": _user_label(username, user_key),
+            "user_search_url": _user_search_url(username, user_key),
             "span_from": first.requested_at,
             "span_to": last.requested_at,
             "duration_seconds": duration,
@@ -997,6 +1528,11 @@ async def system_activity(request: Request, address_slug: str) -> object:
 async def session_detail(request: Request, conn_id: str) -> object:
     """Render the detail/replay page for a single session.
 
+    The User value links to ``/search?user=<username>`` when a username is known
+    (spec §8.5). For a kubectl exec/attach recording whose ``request_id`` matches a
+    stored ``api_requests`` row (Q13, a primary-key lookup), a "kubectl command" row
+    links to ``/search?cmd=<request_id>``, which opens that command expanded.
+
     Args:
         conn_id: The connection id of the session.
 
@@ -1014,6 +1550,12 @@ async def session_detail(request: Request, conn_id: str) -> object:
     search = _get_search(request)
     findings = await search.list_findings(conn_id)
 
+    command_url: str | None = None
+    if session.request_id:
+        known = await _get_activity(request).known_request_ids([session.request_id])
+        if session.request_id in known:
+            command_url = search_url(cmd=session.request_id)
+
     return templates.TemplateResponse(
         request,
         "session.html",
@@ -1023,6 +1565,7 @@ async def session_detail(request: Request, conn_id: str) -> object:
             "system_slug": _system_slug(session.resource_address),
             "has_cast": has_cast,
             "findings": findings,
+            "command_url": command_url,
         },
     )
 
