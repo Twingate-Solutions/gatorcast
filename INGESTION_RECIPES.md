@@ -45,6 +45,15 @@ carries no `resource_address`, so Gatorcast joins each request to its cluster th
 the start line's `conn_id`. **Ship both.** If the start line never arrives, the request
 is stored with an unknown cluster; a start line that arrives later fills it in.
 
+For web apps, the Gateway acts as a Layer 7 reverse proxy and emits the **same** `API request
+completed` line for every HTTP request, on the same `conn_id` as its start line. The start line
+for a web app carries `"resource_type":"WEB_APP"`, and it is the only line that does: the request
+line has no resource fields. Gatorcast joins them by `conn_id` and stores web requests separately
+from kubectl ones (see the README's [Web Apps](README.md#web-apps) section). **Ship the start
+line**: without it a web request cannot be told from a kubectl request and is stored under the
+stricter provisional policy. The Gateway puts no TLS information on any line; the configured TLS
+badges come from the `gwops` object described in [§1.4](#14-gwops-filtering-and-the-gwops-object).
+
 You do **not** need to filter these out of the Gateway's other output — Gatorcast
 classifies and drops everything it does not recognize. **Ship the Gateway's whole log
 stream; Gatorcast sorts it out.** The only hard requirement is that **whole lines arrive
@@ -55,8 +64,8 @@ What Gatorcast does with each line, as decided by `classify`:
 | Line | Match | Result |
 | --- | --- | --- |
 | Recording chunk | `logger` is `gateway.audit` **and** `asciicast` is a non-null string, with an integer `asciicast_sequence_num` | Chunk for that `conn_id`; `message` of `session finished` also seals the recording. A chunk with a missing or non-integer sequence number is dropped. |
-| Start line | `logger` is `gateway`, `message` is `Authenticated connection` | Hidden pending connection. Needs a recording chunk (becomes a session) or an API audit line (becomes kubectl activity) within `SESSION_MAX_IDLE_SECONDS`, or it becomes a visible `error` session. |
-| API audit line | `logger` is `gateway.audit`, no `asciicast`, `message` is `API request completed` or `API request failed` | Allowlisted kubectl activity metadata, deduplicated by `request_id`. |
+| Start line | `logger` is `gateway`, `message` is `Authenticated connection` | Hidden pending connection, with the normalized `resource_type` (and, for `WEB_APP`, the optional `gwops` object). Needs a recording chunk (becomes a session) or an API audit line (becomes kubectl or web activity) within `SESSION_MAX_IDLE_SECONDS`, or it becomes a visible `error` session. A `WEB_APP` connection with neither expires hidden instead and never becomes an `error` session. |
+| API audit line | `logger` is `gateway.audit`, no `asciicast`, `message` is `API request completed` or `API request failed` | Allowlisted metadata, deduplicated by `request_id`: kubectl activity or web activity, chosen from the connection's `resource_type`. |
 | Close line | `logger` is `gateway`, `message` is `Connection closed` or `Closed connection` | Seals the recording. A defensive fallback; the stock Gateway does not log a close event. |
 | Envelope record | No `logger`; `type` is `session_start`, `recording_chunk` or `session_end` | Same events as above, from the Gateway fork's recording sink. Additive; the recipes below do not need it. |
 | Anything else | | Dropped as noise. |
@@ -104,6 +113,14 @@ Key behaviors that make the recipes simple:
   digits, refuses connections beyond 128 concurrent, and reaps one that is silent for
   300 s. The shipped `docker-compose.yml` publishes the port as `127.0.0.1:6514`; change
   `127.0.0.1` to your internal interface address before pointing a remote shipper at it.
+- **Lines are split on `\n` only.** On the line-by-line path, a body is split on the line feed
+  alone (one trailing `\r` is dropped). Unicode line separators (U+0085, U+2028, U+2029) inside a
+  JSON string, such as a header value or terminal output, do not split a line, so a user
+  cannot tear their own audit line into unparseable fragments.
+- **Non-JSON lines in a batch are dropped without failing it.** A line such as Go's
+  `http: proxy error: tls: failed to verify certificate: …` (emitted just before the audit line
+  for the 502 it caused) is dropped with a `normalize.drop` warning. The batch still returns
+  `204` and its other lines are kept.
 - **An unparseable line is logged, not stored.** Gatorcast logs `normalize.drop` with the
   line length (never the content) and drops the line. A length at or near `49152` is the
   tell for journald splitting (see the warning in §2.1).
@@ -128,6 +145,77 @@ Throughout this doc the placeholders are:
 > `http://` and Gatorcast's own port, and keep it on a trusted network, because the bearer
 > token and the recordings then cross the wire in the clear. The Fluent Bit recipe in §7.3
 > sets `tls On` for the same reason; turn it off if you point it at Gatorcast directly.
+
+### 1.4 gwops filtering and the `gwops` object
+
+**gwops** is a wrapper that runs the Twingate Gateway as a child process, spools the stderr
+lines it keeps, and batch-POSTs them to Gatorcast's `POST /ingest` as `application/x-ndjson`
+(up to 500 lines or 16 MiB per POST, at least once, so lines can be redelivered byte-identical).
+Gatorcast tolerates that redelivery: request lines are deduplicated by `request_id`, and a
+repeated start line never rewrites what its first processing stored. The rest of this section
+describes gwops as of its backlog item B-20 and the live behaviour notes in
+[`docs/gateway-webapp-http-behaviour.md`](docs/gateway-webapp-http-behaviour.md). Check what your
+gwops build does before relying on any of it.
+
+**What gwops ships (the B-20 allowlist).** gwops decides on the parsed line, before it spools,
+so `/ingest` receives only audit and session data. A line is shipped only if it is at most
+16 MiB, starts with `{`, is valid UTF-8, parses as one JSON object, and matches one of:
+
+| Kept line | Rule | Covers |
+| --- | --- | --- |
+| Session recording | `logger == "gateway.audit"` and `asciicast` is a string | SSH and Kubernetes `session recording` / `session finished` |
+| HTTP audit | `logger == "gateway.audit"`, no `asciicast`, `message` is `API request completed` or `API request failed` | Kubernetes requests and web-app requests |
+| Connection start | `logger == "gateway"` and `message == "Authenticated connection"` | Every resource type. Gatorcast's only source of `resource_type` and `resource_address`. |
+
+Everything else is dropped and counted by gwops without logging its content: non-JSON lines
+(Go `http: proxy error`, klog, panics), token and listener errors, every other `gateway`
+service line, the operational error lines the SSH backend logs under the `gateway.audit` name,
+and SSH audit events (which log `env` values and full `exec` commands). A line over 16 MiB is
+dropped whole, and that recording is lost. gwops reports the counts in its `/status` under
+`shipper.dropped_lines`. Gatorcast still drops the same lines itself, as defence in depth and
+for shippers that do not filter, so an unfiltered stream is safe to send. If a gwops build does
+not filter yet, expect those extra lines in `/ingest` batches and `normalize.drop` warnings in
+Gatorcast's log.
+
+**What a kept line contains.** Kept lines are forwarded byte for byte; nothing is redacted. A
+web-app request line therefore holds the client's `Authorization`, `Cookie` and `X-Api-Key`
+values, the response's `Set-Cookie` values and the full URL including any query string. gwops
+keeps these at rest in its spool and sends them to Gatorcast. Gatorcast reads only `User-Agent`
+from web requests (and `Kubectl-*` from Kubernetes ones) and stores none of the rest, but the
+values still cross the wire. **Use TLS between gwops and Gatorcast**: point gwops at an
+`https://` URL on a TLS-terminating reverse proxy in front of Gatorcast (see the TLS note in
+§1.3). The gwops demo compose network uses plain HTTP, which is not appropriate beyond a lab.
+
+**The `gwops` object on `WEB_APP` start lines.** When Gatorcast delivery is configured on gwops
+(`recording.enabled` with a `gatorcast_url`), gwops adds one `gwops` object to the Gateway's own
+`Authenticated connection` line for every `WEB_APP` connection. It is spliced in before the
+line's closing brace, so every Gateway byte is unchanged. No other line type is changed, and
+there is no separate record.
+
+```json
+{"logger":"gateway","message":"Authenticated connection","conn_id":"<uuid>","resource_type":"WEB_APP","resource_address":"wiki.example.test","user":{"id":"u-1","username":"you@corp"},
+ "gwops":{"schema":1,"gateway_id":"R2F0ZXdheToxMjk0","match":"exact","app":"wiki","managed":true,
+          "downstream_tls":"tls13","downstream_port":443,"upstream_tls":"verify_full","upstream_port":443}}
+```
+
+| Field | Notes |
+| --- | --- |
+| `schema` | Must be `1`. A newer schema reads as TLS unknown until Gatorcast is upgraded. |
+| `gateway_id` | Opaque Twingate gateway id, or `null` before gwops has created or adopted the Gateway. |
+| `match` | `exact`, `none` (no web app at that address on this gateway, or gwops had not yet read the tenant) or `ambiguous` (more than one). The fields below are present for `exact` only. |
+| `app`, `managed` | gwops' name for the app (the tenant resource name for an app gwops does not declare), and whether gwops declares it. |
+| `downstream_tls` | `tls13` or `none`: the client-facing leg. |
+| `upstream_tls` | `verify_full`, `verify_ca`, `insecure` or `none`: the app-facing leg. |
+| `downstream_port`, `upstream_port` | Integers from 1 to 65535. |
+
+Gatorcast reads the object only on `WEB_APP` start lines, only these keys, and ignores every
+other key. An invalid object (wrong type, unknown value, bad port, wrong schema) is ignored
+and logged as one `classify.gwops_rejected` warning with a reason code and the `conn_id`, and
+the connection is stored with TLS unknown; the connection itself is never dropped. A line with
+no object is normal and logs nothing. The values are written once, when the start line is first
+processed, and are the configuration gwops read at that moment, not proof of the negotiated TLS
+mode. Other shippers (rsyslog, Vector, the Docker syslog driver) never add the object, so their
+web connections show TLS unknown.
 
 ---
 
@@ -758,6 +846,22 @@ Gateway does not log a close event; its real end signal is a recording chunk who
 also seals the recording. With neither, the recording still seals via the idle
 backstop after `SESSION_MAX_IDLE_SECONDS` (default 1 h), and a later chunk reopens it.
 
+To smoke-test web-app ingestion, send a `WEB_APP` start line (with a `gwops` object) and one
+request on the same `conn_id`. The system `wiki.example.test` then appears in `/systems` with a
+`Web` badge and a configured `HTTPS` badge, and `/search?type=web` lists the connection:
+
+```bash
+curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
+  -H "Authorization: Bearer <your INGEST_TOKEN>" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary $'{"logger":"gateway","message":"Authenticated connection","conn_id":"web-test-001","ts":"2026-10-08T12:00:00.000Z","resource_type":"WEB_APP","resource_address":"wiki.example.test","user":{"id":"u-1","username":"you@corp"},"gwops":{"schema":1,"gateway_id":"R2F0ZXdheToxMjk0","match":"exact","app":"wiki","managed":true,"downstream_tls":"tls13","downstream_port":443,"upstream_tls":"verify_full","upstream_port":443}}\n{"logger":"gateway.audit","message":"API request completed","conn_id":"web-test-001","request_id":"3f2b8c1e-9d4a-4c7b-8e2f-6a1b0c9d8e7f","ts":"2026-10-08T12:00:00.250Z","requested_at":"2026-10-08T12:00:00.200Z","method":"GET","url":"/report?month=09","user":{"id":"u-1","username":"you@corp"},"request":{"headers":{"User-Agent":["curl/8.0"]}},"response":{"status_code":200}}'
+```
+
+The stored URL is `/report?month=…(2)`: the query value is masked and the path is not.
+Use a current `ts` (or `?window=all` on the dashboard) so the connection falls inside the
+default 30-day window. For a fuller data set, `scripts/seed_demo.py` posts seven demo web apps
+(see [TESTING.md](TESTING.md#2-seeding-demo-data)).
+
 To replay actual Gateway journald output through the door for a realistic test:
 
 ```bash
@@ -815,6 +919,7 @@ and point the shipper at the private address.
 | Terraform-provisioned cloud VM | §3 / §4 / §5 (bakes §2.1 into boot) |
 | a Docker container | §6 syslog driver (or Fluent Bit for HTTP) |
 | a Kubernetes pod | §7 Fluent Bit DaemonSet → HTTP |
+| wrapped by gwops (web apps, recordings) | §1.4 (gwops ships to `/ingest` itself; give it an `https://` URL) |
 | anything — just testing | §8 curl |
 
 Whatever the platform, the contract is identical: **forward the Gateway's

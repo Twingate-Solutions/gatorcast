@@ -314,6 +314,41 @@ tbody tr:hover {
   border-color: #3f7a4f;
 }
 
+/* Neutral fallback: templates map a severity outside critical/high/medium/low here
+ * (sev_cls in _macros.html) so a stored value never becomes a class name. */
+.sev-none {
+  color: var(--text-dim);
+  background: transparent;
+  border-color: var(--border);
+}
+
+/* Stored-text isolation ------------------------------------------------ *
+ * Usernames, system addresses, URLs/paths, shell users and gwops app names are
+ * attacker-influenced. A bidi override or embedding inside one must not reorder
+ * the text around it. Templates wrap bare stored text in <bdi> (isolated by
+ * default); elements that already carry a class for stored text get the same
+ * isolation here, so their markup stays unwrapped. Long values wrap instead of
+ * widening the page. */
+bdi,
+.mono,
+.method,
+.request-url,
+.app-name,
+.command-label,
+.bar-label,
+.user-link {
+  unicode-bidi: isolate;
+}
+
+bdi {
+  overflow-wrap: break-word;
+}
+
+.app-name,
+.command-label {
+  overflow-wrap: anywhere;
+}
+
 /* Dashboard cards + panels -------------------------------------------- */
 
 .card-grid {
@@ -1331,4 +1366,220 @@ tr.is-discovery {
 
 .feed-head a {
   font-size: 0.85rem;
+}
+
+/* Web apps -------------------------------------------------------------
+ * Used by _macros.html (badge, config_block), _rows.html (web_row), systems.html,
+ * sessions.html, web_activity.html and dashboard.html. Every class below is a fixed
+ * name chosen from a map in routes.py; no stored value ever becomes a class.
+ *
+ *   .pill-web           Web kind / system badge (pink hue; ssh violet, exec teal,
+ *                       kubectl blue)
+ *   .pill-https         configured client TLS on (green outline)
+ *   .pill-http          configured client TLS off: neutral, NOT a warning (the
+ *                       client hop runs inside the Twingate tunnel)
+ *   .pill-tls-unknown   no configured TLS data (dashed, dim)
+ *   .marker-warn        upstream plaintext / unverified (amber, with a "!" glyph)
+ *   .marker-info        upstream CA-only (blue-grey, with an "i" glyph)
+ *   .pill-managed       gwops-managed app
+ *   .pill-unmanaged     app not managed by gwops (name is the resource name)
+ */
+:root {
+  --web: #e58fc2;
+  --web-dim: #a65b8a;
+}
+
+.pill-web {
+  color: var(--web);
+  border-color: var(--web-dim);
+}
+
+.pill-https {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.pill-http {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.pill-tls-unknown {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
+  border-style: dashed;
+}
+
+.pill-managed {
+  color: var(--teal);
+  border-color: var(--teal-dim);
+}
+
+.pill-unmanaged {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+.marker {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.marker-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.marker-info {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* Badge cluster in a row's Type cell or a table cell: wraps instead of overflowing. */
+.badge-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.4rem;
+}
+
+/* App element on a web row: "app: <name> [managed]". The tooltip carries the gateway id. */
+.web-app {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.4rem;
+  margin-bottom: 0.15rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.web-app .app-name {
+  font-weight: 600;
+}
+
+.web-app .app-name.is-unnamed {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+.web-row-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.5rem;
+  margin-top: 0.2rem;
+  font-size: 0.8rem;
+}
+
+.web-row-sub a {
+  font-weight: 600;
+}
+
+/* Configured web app TLS block (system page and visit view). */
+.config-block {
+  margin: 1.25rem 0;
+  padding: 0.75rem 1rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--web-dim);
+  border-radius: var(--radius);
+}
+
+.config-block h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.config-lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.config-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.6rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.config-line:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.config-line .config-main {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.4rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.config-line .config-meta {
+  margin-left: auto;
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.config-note {
+  margin: 0.6rem 0 0;
+  font-size: 0.78rem;
+}
+
+.web-activity-table .num {
+  white-space: nowrap;
+}
+
+.error-count {
+  color: var(--warn);
+}
+
+.web-search-form-filters {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.web-search-form-filters > summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+}
+
+.web-search-form-filters[open] > summary {
+  margin-bottom: 0.75rem;
+}
+
+.card-web {
+  border-left: 3px solid var(--web-dim);
+}
+
+.web-visit-table td.conn {
+  white-space: nowrap;
+}
+
+.web-row-link:focus-visible,
+.config-block a:focus-visible,
+.web-activity-table a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.web-activity-table td:nth-child(2),
+.web-activity-table td:nth-child(3) {
+  white-space: nowrap;
 }

@@ -55,6 +55,7 @@ from gatorcast.store.timeline import (
     SORT_NEWEST,
     SORTS,
     Cursor,
+    CursorMismatch,
     Position,
     UnifiedQuery,
     check_position,
@@ -85,6 +86,22 @@ SEVERITY_VALUES: Final[tuple[str, ...]] = tuple(
     name for name, _ in sorted(SEVERITY_RANK.items(), key=lambda kv: kv[1])
 )
 
+SCHEME_VALUES: Final[tuple[str, ...]] = ("https", "http", "unknown")
+UPSTREAM_VALUES: Final[tuple[str, ...]] = (
+    "verified", "ca_only", "unverified", "plaintext", "unknown",
+)
+# URL value → stored ``api_requests`` mode (spec §8.3). ``unknown`` is absent: it maps
+# to the ``*_null`` flag (``IS NULL``), not to a stored value.
+_SCHEME_STORED: Final[dict[str, str]] = {"https": "tls13", "http": "none"}
+_UPSTREAM_STORED: Final[dict[str, str]] = {
+    "verified": "verify_full",
+    "ca_only": "verify_ca",
+    "unverified": "insecure",
+    "plaintext": "none",
+}
+_STORED_SCHEME: Final[dict[str, str]] = {v: k for k, v in _SCHEME_STORED.items()}
+_STORED_UPSTREAM: Final[dict[str, str]] = {v: k for k, v in _UPSTREAM_STORED.items()}
+
 _SLUG_RE = re.compile(r"[a-z0-9-]{1,64}", re.ASCII)  # category, rule_ids
 # A command focus id: any stored request_id shape — the classify safe token (Gateway
 # UUIDs match it) or the derived ``h:<32 hex>`` id.
@@ -108,6 +125,8 @@ SEARCH_URL_ORDER: Final[tuple[str, ...]] = (
     "status",
     "min_duration",
     "max_duration",
+    "scheme",
+    "upstream",
     "q",
     "mode",
     "sort",
@@ -273,28 +292,29 @@ def decode_cursor(raw: str) -> Cursor:
         The decoded :class:`Cursor` (positions as tuples).
 
     Raises:
-        ValueError: On any failure. The message never contains the value.
+        CursorMismatch: On any failure (a ``ValueError`` subclass). The message
+            never contains the value.
     """
     if not raw or len(raw) > CURSOR_MAX_LEN or _B64URL_RE.fullmatch(raw) is None:
-        raise ValueError("cursor is not base64url")
+        raise CursorMismatch("cursor is not base64url")
     try:
         data = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
         obj = json.loads(data.decode("utf-8"), parse_constant=_reject_constant)
         model = _CursorModel.model_validate(obj)
     except (binascii.Error, UnicodeDecodeError, ValueError, ValidationError):
-        raise ValueError("cursor is malformed") from None
+        raise CursorMismatch("cursor is malformed") from None
     if type(model.v) is not int or model.v != CURSOR_VERSION:
-        raise ValueError("cursor version")
+        raise CursorMismatch("cursor version")
     if model.sort not in SORTS:
-        raise ValueError("cursor sort")
+        raise CursorMismatch("cursor sort")
     kinds = model.k
     if not kinds or kinds != sorted(set(kinds)) or any(k not in KIND_KEYS for k in kinds):
-        raise ValueError("cursor kinds")
+        raise CursorMismatch("cursor kinds")
     sources = {KIND_SOURCE[k] for k in kinds}
     positions: dict[str, Position | Literal["done"]] = {}
     for source, value in model.p.items():
         if source not in sources:
-            raise ValueError("cursor source")
+            raise CursorMismatch("cursor source")
         positions[source] = (
             POSITION_DONE if value == POSITION_DONE else check_position(source, model.sort, value)
         )
@@ -443,6 +463,8 @@ class ParsedSearch:
             "status": q.status,
             "min_duration": q.min_duration,
             "max_duration": q.max_duration,
+            "scheme": _tls_url_value(q.scheme, q.scheme_null, _STORED_SCHEME),
+            "upstream": _tls_url_value(q.upstream, q.upstream_null, _STORED_UPSTREAM),
             "q": text,
             "mode": mode if text is not None else None,
             "sort": q.sort,
@@ -523,6 +545,39 @@ def _check_regex(name: str, pattern: str) -> None:
         re.compile(pattern)
     except (re.error, RecursionError, OverflowError):
         raise _bad_request(f"'{name}' is not a valid regular expression") from None
+
+
+def _tls_filter(
+    request: Request, name: str, allowed: tuple[str, ...], stored: dict[str, str]
+) -> tuple[str | None, bool]:
+    """Parse a web TLS filter (``scheme`` / ``upstream``, spec §8.3).
+
+    Args:
+        request: The incoming request.
+        name: The parameter name.
+        allowed: The accepted URL values; ``unknown`` selects ``IS NULL``.
+        stored: URL value → stored mode for every allowed value except ``unknown``.
+
+    Returns:
+        ``(stored value, is_null)``: ``(None, False)`` when absent, ``(None, True)``
+        for ``unknown``, else ``(stored mode, False)``.
+
+    Raises:
+        HTTPException: ``400`` naming the parameter for a repeat or any other value.
+    """
+    value = _choice(request, name, allowed)
+    if value is None:
+        return None, False
+    if value == "unknown":
+        return None, True
+    return stored[value], False
+
+
+def _tls_url_value(stored: str | None, is_null: bool, to_url: dict[str, str]) -> str | None:
+    """Map a stored TLS mode (or the NULL flag) back to its URL value, or ``None``."""
+    if is_null:
+        return "unknown"
+    return None if stored is None else to_url[stored]
 
 
 def _rule_ids(request: Request) -> tuple[str, ...]:
@@ -647,6 +702,8 @@ def parse_unified_query(
     status_ = _choice(request, "status", STATUS_VALUES)
     min_duration = _duration(request, "min_duration")
     max_duration = _duration(request, "max_duration")
+    scheme, scheme_null = _tls_filter(request, "scheme", SCHEME_VALUES, _SCHEME_STORED)
+    upstream, upstream_null = _tls_filter(request, "upstream", UPSTREAM_VALUES, _UPSTREAM_STORED)
 
     # Content search: q (+ mode), or the legacy keyword / regex pair.
     q = _free_text(request, "q", _MAX_Q_LEN)
@@ -692,6 +749,10 @@ def parse_unified_query(
         status=status_,
         min_duration=min_duration,
         max_duration=max_duration,
+        scheme=scheme,
+        scheme_null=scheme_null,
+        upstream=upstream,
+        upstream_null=upstream_null,
         text=text,
         regex=regex,
         sort=sort,
@@ -704,7 +765,7 @@ def parse_unified_query(
     if raw_cursor is not None:
         try:
             cursor = decode_cursor(raw_cursor)
-        except ValueError:
+        except CursorMismatch:
             raise _bad_request("'cursor' is invalid") from None
         if cursor.sort != sort or cursor.kinds != tuple(sorted(kinds)):
             raise _bad_request("'cursor' does not match the current search")

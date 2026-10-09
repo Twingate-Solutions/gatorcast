@@ -477,3 +477,107 @@ def test_fixture_requests_only_exec_fires() -> None:
     others = {rid: ids for rid, ids in fired.items() if rid != "22222222-2222-4222-8222-222222222222"}
     assert len(others) == 7
     assert all(ids == [] for ids in others.values())
+
+
+# --- Session 11: rule scoping by resource type (WEBAPP_SPEC 7.1) -------------------------------
+
+# Requests that trip a Kubernetes rule on a Kubernetes connection (rule ids in comments).
+_KUBE_LOOKALIKES = [
+    ("DELETE", "/items/42"),  # kube-delete: any DELETE
+    ("delete", "/items/42"),  # lowercase method: compared upper-cased
+    ("GET", "/api/v1/namespaces/default/secrets/db"),  # kube-secrets
+    ("PATCH", "/api/v1/nodes/node-1"),  # kube-cordon
+    ("POST", "/api/v1/namespaces/default/pods/web-1/eviction"),  # kube-evict
+    ("GET", "/api/v1/namespaces/default/pods/web-1/exec"),  # kube-exec
+    ("POST", "/api/v1/nodes/node-1/proxy/exec/web"),  # kube-node-proxy-exec
+]
+
+
+def test_builtin_api_rules_default_to_kubernetes_only() -> None:
+    assert all(r.resource_types == frozenset({"KUBERNETES"}) for r in load_api_rules())
+
+
+def test_api_rule_resource_types_defaults_to_kubernetes() -> None:
+    rule = ApiRule("r", "kube-api", "low", "R", None, re.compile(r"^/x$"))
+    assert rule.resource_types == frozenset({"KUBERNETES"})
+
+
+@pytest.mark.parametrize(("method", "url"), _KUBE_LOOKALIKES)
+def test_no_builtin_rule_fires_on_a_web_app_request(method: str, url: str) -> None:
+    """WEB_APP rows get no Kubernetes findings, however kubernetes-shaped the request."""
+    assert detect_api(method, url, resource_type="WEB_APP") == []
+
+
+@pytest.mark.parametrize(("method", "url"), _KUBE_LOOKALIKES)
+def test_the_same_requests_fire_on_kubernetes(method: str, url: str) -> None:
+    assert detect_api(method, url, resource_type="KUBERNETES") != []
+
+
+@pytest.mark.parametrize(("method", "url"), _KUBE_LOOKALIKES)
+def test_resource_type_none_is_treated_as_kubernetes(method: str, url: str) -> None:
+    """An unresolved, fail-closed or NULL connection keeps the Kubernetes rules."""
+    assert detect_api(method, url, resource_type=None) == detect_api(method, url, resource_type="KUBERNETES")
+    assert detect_api(method, url) == detect_api(method, url, resource_type="KUBERNETES")
+
+
+@pytest.mark.parametrize("resource_type", ["SSH", "DATABASE", "WEB_APP"])
+def test_other_resource_types_get_no_kubernetes_findings(resource_type: str) -> None:
+    assert detect_api("DELETE", "/api/v1/namespaces/default/secrets/db", resource_type=resource_type) == []
+
+
+@pytest.mark.parametrize("resource_type", ["kubernetes", "Kubernetes", "KUBERNETES"])
+def test_resource_type_comparison_is_case_insensitive(resource_type: str) -> None:
+    assert [f.rule_id for f in detect_api("DELETE", "/api/v1/namespaces/d/pods/p", resource_type=resource_type)] == [
+        "kube-delete"
+    ]
+
+
+def test_explicit_rule_scoped_to_a_resource_type_fires_only_there() -> None:
+    web_rule = ApiRule(
+        "web-admin",
+        "web-app",
+        "medium",
+        "Admin path",
+        None,
+        re.compile(r"^/admin"),
+        resource_types=frozenset({"WEB_APP"}),
+    )
+    assert [f.rule_id for f in detect_api("GET", "/admin/users", [web_rule], resource_type="WEB_APP")] == [
+        "web-admin"
+    ]
+    assert detect_api("GET", "/admin/users", [web_rule], resource_type="KUBERNETES") == []
+    assert detect_api("GET", "/admin/users", [web_rule]) == []  # None means Kubernetes
+
+
+def test_rule_can_apply_to_more_than_one_resource_type() -> None:
+    both = ApiRule(
+        "both",
+        "x",
+        "low",
+        "Both",
+        None,
+        re.compile(r"^/x$"),
+        resource_types=frozenset({"KUBERNETES", "WEB_APP"}),
+    )
+    for rtype in ("KUBERNETES", "WEB_APP", None):
+        assert [f.rule_id for f in detect_api("GET", "/x", [both], resource_type=rtype)] == ["both"]
+    assert detect_api("GET", "/x", [both], resource_type="SSH") == []
+
+
+def test_web_fixture_requests_produce_no_findings_under_web_scope() -> None:
+    """Every request line in the web fixture is silent as WEB_APP; the Kubernetes ones are not."""
+    from tests.samples import webapp_lines_for
+
+    fired_web = 0
+    fired_k8s = 0
+    for key in ("web_rule_lookalikes", "hygiene_requests"):
+        for line in webapp_lines_for(key):
+            event = classify(json.loads(line))
+            if not isinstance(event, ApiRequest):
+                continue
+            assert detect_api(event.method, event.url, resource_type="WEB_APP") == []
+            fired_web += 1
+            if detect_api(event.method, event.url, resource_type="KUBERNETES"):
+                fired_k8s += 1
+    assert fired_web > 15
+    assert fired_k8s >= 5  # the look-alikes really would have fired as kubectl rows

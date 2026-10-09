@@ -512,3 +512,110 @@ def test_group_commands_recordings_deduplicated() -> None:
 def test_group_commands_empty() -> None:
     """No rows → no commands."""
     assert group_commands([], {}) == []
+
+
+# --- Session 11: the discovery predicate is a parameter (WEBAPP_SPEC 7.2) ---------------------
+
+
+def _web_row(at: float, *, url: str, conn_id: str = "web-conn", method: str = "GET") -> ApiRequestRow:
+    """A web-policy row: no Kubectl-Command / Kubectl-Session, a browser User-Agent."""
+    return _row(
+        at,
+        method=method,
+        url=url,
+        conn_id=conn_id,
+        kubectl_session=None,
+        kubectl_command=None,
+        user_agent="Mozilla/5.0 (test)",
+    )
+
+
+def _never_discovery(method: str, url: str) -> bool:
+    """The predicate a web visit passes."""
+    return False
+
+
+def test_get_api_on_a_web_app_is_counted_as_a_command_with_the_web_predicate() -> None:
+    """A web app's ``GET /api`` is an ordinary request, not kubectl discovery."""
+    rows = [
+        _web_row(0, url="/api", conn_id="web-1"),
+        _web_row(1, url="/api?timeout=32s", conn_id="web-2"),
+        _web_row(2, url="/home", conn_id="web-3"),
+    ]
+    [s] = group_activity(rows, 900, 14400, discovery=_never_discovery)
+    assert s.request_count == 3
+    assert s.command_count == 3  # nothing is hidden as discovery
+
+
+def test_the_same_rows_with_the_default_predicate_hide_get_api_as_discovery() -> None:
+    """The default (kubectl) predicate is unchanged: GET /api and /api?timeout=... are discovery."""
+    rows = [
+        _web_row(0, url="/api", conn_id="web-1"),
+        _web_row(1, url="/api?timeout=32s", conn_id="web-2"),
+        _web_row(2, url="/home", conn_id="web-3"),
+    ]
+    [s] = group_activity(rows, 900, 14400)
+    assert s.request_count == 3  # discovery is counted, not hidden
+    assert s.command_count == 1  # only /home is a visible command
+
+
+def test_group_activity_default_predicate_is_is_discovery() -> None:
+    rows = [_row(0, url="/api?timeout=32s", kubectl_session="ks-1"), _row(1, kubectl_session="ks-2")]
+    assert group_activity(rows, 900, 14400) == group_activity(rows, 900, 14400, discovery=is_discovery)
+
+
+def test_group_activity_passes_each_rows_method_and_url_to_the_predicate() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def spy(method: str, url: str) -> bool:
+        seen.append((method, url))
+        return False
+
+    rows = [_web_row(0, url="/a", method="DELETE"), _web_row(1, url="/b?x=1", method="GET")]
+    group_activity(rows, 900, 14400, discovery=spy)
+    assert ("DELETE", "/a") in seen and ("GET", "/b?x=1") in seen
+
+
+def test_discovery_predicate_does_not_change_session_timing_or_splitting() -> None:
+    """Discovery counts toward timing under either predicate; only command_count differs."""
+    rows = [_web_row(0, url="/api"), _web_row(800, url="/home"), _web_row(2000, url="/api")]
+    default = group_activity(rows, 900, 14400)
+    web = group_activity(rows, 900, 14400, discovery=_never_discovery)
+    assert [(s.started_at, s.ended_at, s.request_count) for s in default] == [
+        (s.started_at, s.ended_at, s.request_count) for s in web
+    ]
+    assert len(default) == 2
+
+
+def test_web_rows_without_kubectl_headers_group_into_commands_by_connection() -> None:
+    """With no Kubectl-Session a command is the connection (spec 7.2: web keys are c:<conn_id>)."""
+    rows = [
+        _web_row(0, url="/a", conn_id="web-1"),
+        _web_row(1, url="/b", conn_id="web-1"),
+        _web_row(2, url="/c", conn_id="web-2"),
+    ]
+    commands = group_commands(rows, {})
+    assert [len(c.requests) for c in commands] == [2, 1]
+
+
+# --- Session 12 fix loop (O): pick_label is public -----------------------------------------------------
+
+
+def test_pick_label_is_importable_and_prefers_the_primary_kubectl_command() -> None:
+    from gatorcast.pipeline.activity import UNKNOWN_CLIENT_LABEL, pick_label
+    from gatorcast.store.activity import ApiRequestRow
+
+    def row(request_id: str, *, command: str | None, agent: str | None) -> ApiRequestRow:
+        return ApiRequestRow(
+            request_id=request_id, conn_id="c", resource_address="r", user_key="u", user_id="u",
+            username="u", requested_at="2026-10-01T10:00:00.000Z", method="GET", url="/x",
+            status_code=200, outcome="completed", kubectl_command=command, kubectl_session=None,
+            user_agent=agent, created_at=None,
+        )
+
+    primary = row("p", command="kubectl delete", agent="kubectl/v1")
+    first = row("f", command="kubectl get", agent=None)
+    assert pick_label(primary, [first, primary]) == "kubectl delete"
+    assert pick_label(row("p", command=None, agent=None), [first]) == "kubectl get"  # first present command
+    assert pick_label(row("p", command=None, agent="Mozilla/5.0 (X11)"), []) == "Mozilla"  # UA product token
+    assert pick_label(row("p", command=None, agent=None), []) == UNKNOWN_CLIENT_LABEL

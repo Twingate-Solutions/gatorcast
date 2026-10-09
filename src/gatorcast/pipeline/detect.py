@@ -274,6 +274,10 @@ class ApiRule:
     ``None`` to apply to any method. ``path`` is searched against the normalized,
     lower-cased URL path only (see :func:`gatorcast.pipeline.urlnorm.match_path`),
     never the query string, so write patterns in lower case.
+
+    ``resource_types`` is the set of normalized (uppercase) Twingate resource types
+    the rule applies to; it defaults to Kubernetes only, so the built-in rules never
+    fire on web-app traffic (WEBAPP_SPEC §7.1).
     """
 
     id: str
@@ -282,6 +286,7 @@ class ApiRule:
     label: str
     methods: frozenset[str] | None
     path: re.Pattern[str]
+    resource_types: frozenset[str] = frozenset({"KUBERNETES"})
 
 
 API_CATEGORY = "kube-api"
@@ -353,7 +358,13 @@ def load_api_rules() -> list[ApiRule]:
     return BUILTIN_API_RULES
 
 
-def detect_api(method: str, url: str, rules: list[ApiRule] | None = None) -> list[Finding]:
+def detect_api(
+    method: str,
+    url: str,
+    rules: list[ApiRule] | None = None,
+    *,
+    resource_type: str | None = None,
+) -> list[Finding]:
     """Evaluate API rules against one request's method and URL path.
 
     The URL is normalized with the same helper classify uses (fragment dropped,
@@ -367,10 +378,18 @@ def detect_api(method: str, url: str, rules: list[ApiRule] | None = None) -> lis
     exactly one :class:`Finding` with ``offset_seconds=None``; the URL is never
     copied into the finding.
 
+    Rules whose ``resource_types`` does not contain the request's resource type are
+    skipped. ``resource_type=None`` (an unresolved, fail-closed, or NULL connection
+    row) is treated as Kubernetes, so the Kubernetes-policy rows keep their
+    Kubernetes rules (WEBAPP_SPEC §4.4, §7.1). A non-None value is compared
+    upper-cased, so ``"kubernetes"`` and ``"KUBERNETES"`` behave the same.
+
     Args:
         method: The HTTP method of the request (e.g. ``"DELETE"``).
         url: The raw or stored request URL; only its normalized path is matched.
         rules: Optional explicit rule set; defaults to :func:`load_api_rules`.
+        resource_type: The connection's normalized resource type, or ``None`` for
+            the Kubernetes default.
 
     Returns:
         A list of findings, one per matching rule, in rule-declaration order.
@@ -378,8 +397,11 @@ def detect_api(method: str, url: str, rules: list[ApiRule] | None = None) -> lis
     active = load_api_rules() if rules is None else rules
     verb = method.upper()
     path = match_path(url)
+    scope = "KUBERNETES" if resource_type is None else resource_type.upper()
     findings: list[Finding] = []
     for rule in active:
+        if scope not in rule.resource_types:
+            continue
         if rule.methods is not None and verb not in rule.methods:
             continue
         if rule.path.search(path) is None:

@@ -24,7 +24,7 @@ import gatorcast.store.search as search_mod
 from gatorcast.db import init_db
 from gatorcast.models import ApiRequest
 from gatorcast.pipeline.detect import Finding, max_severity
-from gatorcast.store.activity import ActivityStore
+from gatorcast.store.activity import ActivityStore, RequestStorage
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchFilters, SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -549,6 +549,7 @@ async def seed_api(
         username=username,
         method=method,
         url=url,
+        url_web=url,
         status_code=200,
         kubectl_command="kubectl get",
         kubectl_session=kubectl_session,
@@ -724,4 +725,78 @@ async def test_flagged_command_stats_plan(db, windowed: bool) -> None:
     q_access = [d for d in details if d.startswith(("SEARCH q ", "SCAN q "))]
     assert len(q_access) >= expected, plan
     assert all(d.startswith("SEARCH q USING INDEX idx_api_req_cmd") for d in q_access), plan
-    assert "idx_api_req_sys_user_time" not in plan
+    assert "idx_api_req_sys_user_time" not in plan  # retired in Session 11
+    assert "idx_api_req_sys_kind_user_time" not in plan
+
+
+# --- Session 11: web rows never count toward the kubectl dashboard figures (WEBAPP_SPEC 8.6) ---
+
+
+async def seed_web(
+    activity: ActivityStore,
+    request_id: str,
+    requested_at: str,
+    *,
+    conn_id: str = "web-conn",
+    findings: tuple[Finding, ...] = (),
+    resource_address: str | None = "wiki.corp.internal",
+) -> None:
+    """Store one web-policy request (api_kind 'web'), optionally with findings."""
+    req = ApiRequest(
+        conn_id=conn_id,
+        request_id=request_id,
+        requested_at=requested_at,
+        user_id="U-alice",
+        username="alice@x",
+        method="DELETE",
+        url="/items/42",
+        url_web="/items/42",
+        status_code=200,
+        user_agent="Mozilla/5.0 (test)",
+    )
+    storage = RequestStorage(
+        api_kind="web", url=req.url, user_agent=req.user_agent, kubectl_command=None, kubectl_session=None
+    )
+    await activity.insert_request_with_findings(req, resource_address, findings, storage=storage)
+
+
+async def test_dashboard_api_requests_total_ignores_web_rows(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    await _seed_commands(activity)
+    before = await search_store.dashboard_stats()
+    for i in range(6):
+        await seed_web(activity, f"w{i}", f"2026-06-10T12:00:0{i}.000Z")
+
+    after = await search_store.dashboard_stats()
+    windowed = await search_store.dashboard_stats(started_after=_CUTOFF)
+
+    assert after.api_requests_total == before.api_requests_total == 13
+    assert windowed.api_requests_total == 12
+
+
+async def test_dashboard_flagged_commands_ignore_web_rows_even_with_findings(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    """A web row that somehow carries a finding is not a flagged kubectl command."""
+    await _seed_commands(activity)
+    before = await search_store.dashboard_stats()
+    await seed_web(activity, "w-flagged", "2026-06-10T12:00:00.000Z", findings=(_api_finding("critical"),))
+
+    after = await search_store.dashboard_stats()
+
+    assert after.api_flagged_commands == before.api_flagged_commands == 8
+    assert after.api_commands_by_severity == before.api_commands_by_severity
+    assert after.api_requests_total == before.api_requests_total
+
+
+async def test_dashboard_figures_are_zero_when_only_web_rows_exist(
+    search_store: SearchStore, activity: ActivityStore
+) -> None:
+    for i in range(3):
+        await seed_web(activity, f"w{i}", f"2026-06-10T12:00:0{i}.000Z", findings=(_api_finding("high"),))
+    stats = await search_store.dashboard_stats()
+    assert stats.api_requests_total == 0
+    assert stats.api_flagged_commands == 0
+    assert stats.api_commands_by_severity == {}
+    assert stats.api_flagged_truncated is False

@@ -60,10 +60,17 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from gatorcast.logging import get_logger
-from gatorcast.models import ApiRequest, RecordingChunk, SessionEnd, SessionStart
+from gatorcast.models import (
+    RESOURCE_TYPE_INVALID,
+    ApiRequest,
+    RecordingChunk,
+    SessionEnd,
+    SessionStart,
+)
 from gatorcast.pipeline.detect import Finding, detect, detect_api, load_rules, max_severity
 from gatorcast.pipeline.extract import extract_plaintext
-from gatorcast.store.activity import ActivityStore
+from gatorcast.pipeline.webmask import store_provisional_url
+from gatorcast.store.activity import ActivityStore, ConnectionRow, RequestStorage
 from gatorcast.store.casts import CastStore
 from gatorcast.store.search import SearchStore
 from gatorcast.store.sessions import SessionRepository
@@ -181,7 +188,10 @@ def parse_asciicast(text: str) -> AsciicastMeta:
         An ``AsciicastMeta``. ``ok`` is False (with ``error`` set) when the header
         is absent or not a valid version-2 header.
     """
-    lines = text.splitlines()
+    # Split on "\n" only: str.splitlines() also breaks on U+0085, U+2028, U+2029 and
+    # \v, \f, \x1c-\x1e, which can sit raw inside an event's JSON string (terminal
+    # output) and would tear that event into unparseable fragments.
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
 
     header_line: str | None = None
     body_start = 0
@@ -275,6 +285,72 @@ class InProgress:
     def has_data(self) -> bool:
         """True once any recording content (a chunk or a baseline) is present."""
         return bool(self.chunks) or bool(self.baseline)
+
+
+def _session_resource_type(connection_type: str | None) -> str | None:
+    """Return the connection's stored type as it may be copied to a ``sessions`` row.
+
+    The session row follows the connection's *stored* type (first write wins), never
+    the type on a later start line. The internal ``RESOURCE_TYPE_INVALID`` marker is
+    not a real type, so it is not copied: the session shows no type.
+    """
+    return None if connection_type == RESOURCE_TYPE_INVALID else connection_type
+
+
+def _choose_storage(
+    event: ApiRequest, conn: ConnectionRow | None
+) -> tuple[RequestStorage, bool]:
+    """Pick the storage form for one API request from its connection row.
+
+    Implements the WEBAPP_SPEC §4.4 policy table (CLAUDE.md rule 2).
+
+    Args:
+        event: The classified API request.
+        conn: The request's connection row, or ``None`` when there is none.
+
+    Returns:
+        ``(storage, run_rules)``: the :class:`RequestStorage` to write and whether
+        the Kubernetes API rules apply to this request.
+    """
+    if conn is None or not (
+        conn.start_seen or conn.started_at is not None or conn.resource_type is not None
+    ):
+        # No row, or the minimal row ``set_state`` inserts for a request that beat
+        # its start line (also a lost start line, or a pre-upgrade minimal row). The
+        # same "no start line processed" test as ``upsert_connection_start``.
+        # Provisional kubectl row, fail closed (CLAUDE.md rule 2): the connection may
+        # turn out KUBERNETES or WEB_APP, or never be typed, so the URL is the
+        # stricter of both forms (Kubernetes path cut at ``proxy``, ``command``
+        # never stored, remaining values masked). It is final: a later WEB_APP start
+        # line converts ``api_kind`` only. Headers keep the kubectl form (spec 4.4).
+        return (
+            RequestStorage(
+                api_kind="kubectl",
+                url=store_provisional_url(event.url),
+                user_agent=event.user_agent,
+                kubectl_command=event.kubectl_command,
+                kubectl_session=event.kubectl_session,
+            ),
+            True,
+        )
+    if conn.resource_type is None or conn.resource_type == "KUBERNETES":
+        # KUBERNETES, or a processed start line with no resource_type (field
+        # absent, or a pre-upgrade connection): the unchanged Kubernetes policy.
+        return RequestStorage.kubectl(event), True
+    # WEB_APP or any other non-null type: web form, User-Agent only, no rules. The
+    # connection's configured TLS modes (NULL when unknown) are copied onto the row.
+    return (
+        RequestStorage(
+            api_kind="web",
+            url=event.url_web,
+            user_agent=event.user_agent,
+            kubectl_command=None,
+            kubectl_session=None,
+            downstream_tls=conn.downstream_tls,
+            upstream_tls=conn.upstream_tls,
+        ),
+        False,
+    )
 
 
 class Assembler:
@@ -404,7 +480,16 @@ class Assembler:
                 username=event.username,
                 resource_address=event.resource_address,
                 started_at=event.ts,
+                resource_type=event.resource_type,
+                # Snapshot fixed on the first processing of the start line only
+                # (WEBAPP_SPEC §4.4). Never log the gwops object.
+                gwops=event.gwops,
             )
+            # First write wins (CLAUDE.md rule 2): the connection keeps the type it
+            # was first stored with, so everything below follows the stored row, not
+            # this event (a repeated or forged line cannot retype a connection).
+            stored = await self._activity.get_connection(event.conn_id)
+            stored_type = stored.resource_type if stored is not None else event.resource_type
             buf = self._buffers.get(event.conn_id)
             if buf is None:
                 # Pending connection only. A chunk promotes it; an audit line marks
@@ -432,6 +517,7 @@ class Assembler:
                 username=buf.username,
                 resource_address=buf.resource_address,
                 started_at=buf.first_ts,
+                resource_type=_session_resource_type(stored_type),
             )
 
     async def _on_chunk(self, event: RecordingChunk) -> None:
@@ -495,7 +581,8 @@ class Assembler:
         Seeds the new buffer (identity, cluster, start time) from the connection's
         start line, recovers a backstop ``error`` row if there is one (a late chunk
         reverts it to ``provisional``), creates/refreshes the ``provisional`` session
-        row, and marks the connection ``recording`` (``has_api`` is kept). A chunk
+        row (carrying the connection's ``resource_type``), and marks the connection
+        ``recording`` (``has_api`` is kept). A chunk
         with no start line seen inserts a minimal ``recording`` connection, so a
         start line arriving later never leaves it ``pending``. Caller holds the lock.
 
@@ -522,6 +609,7 @@ class Assembler:
             username=buf.username,
             resource_address=buf.resource_address,
             started_at=buf.first_ts,
+            resource_type=_session_resource_type(conn.resource_type if conn is not None else None),
         )
         await self._activity.set_state(conn_id, "recording")
         log.info(
@@ -629,26 +717,52 @@ class Assembler:
     async def _on_api(self, event: ApiRequest) -> None:
         """Store one API audit line and advance its connection's state.
 
+        The connection row is read first, and its ``resource_type`` picks the
+        storage policy (WEBAPP_SPEC §4.4, see :func:`_choose_storage`):
+
+          * ``KUBERNETES``, or a processed start line with no ``resource_type``
+            (pre-upgrade / field absent) → ``kubectl`` row: ``event.url``, the three
+            allowlisted headers, Kubernetes rules run, TLS ``NULL``;
+          * ``WEB_APP`` or any other non-null type → ``web`` row: ``event.url_web``,
+            ``User-Agent`` only, no rules, TLS modes copied from the connection;
+          * no connection row, or only the minimal row (no start line processed:
+            ``start_seen`` unset and ``started_at``/``resource_type`` ``NULL``: the
+            request beat its start line) →
+            provisional ``kubectl`` row that fails closed:
+            ``store_provisional_url(event.url)`` (the stricter of both policies:
+            Kubernetes path form, no ``command``, masked query values), all three
+            headers, rules run on ``event.url``'s path, TLS ``NULL``. A later
+            ``WEB_APP`` start line converts it (``upsert_connection_start``).
+
         Deduplicated by ``request_id``: a redelivered line is a no-op (no second
-        row, no duplicate findings, no state change). The API rules run on the
-        method + path first (pure and cheap, only when detection is enabled); the
-        request — with the connection's cluster, ``NULL`` until the start line
-        backfills it — and its findings are then stored in one transaction, so a
-        crash or DB error between them can never leave a request whose findings a
-        redelivery would skip as a duplicate. If detection itself raises, the
-        request is still stored (without findings) and the exception type is
-        logged. The connection then moves to ``api`` — or stays ``recording`` if it
-        carries a recording (e.g. an exec's status-101 line). A connection the
-        backstop had expired to ``error`` loses its phantom start-only error row:
-        it was API-only after all. Never logs the URL, header values, or the raw
-        line.
+        row, no duplicate findings, no state change). When the policy runs rules
+        (and detection is enabled) they evaluate the method + path first (pure and
+        cheap); the request — with the connection's cluster, ``NULL`` until the
+        start line backfills it — and its findings are then stored in one
+        transaction, so a crash or DB error between them can never leave a request
+        whose findings a redelivery would skip as a duplicate. If detection itself
+        raises, the request is still stored (without findings) and the exception
+        type is logged. The connection then moves to ``api`` (including from
+        ``empty``, which has no visible row) — or stays ``recording`` if it carries
+        a recording (e.g. an exec's status-101 line). A connection the backstop had
+        expired to ``error`` loses its phantom start-only error row: it was
+        API-only after all. Never logs the URL, header values, or the raw line.
         """
         async with self._lock:
             conn_id = event.conn_id
+            conn = await self._activity.get_connection(conn_id)
+            storage, run_rules = _choose_storage(event, conn)
             findings: list[Finding] = []
-            if self._detection_enabled:
+            if run_rules and self._detection_enabled:
                 try:
-                    findings = list(detect_api(event.method, event.url))
+                    findings = list(
+                        detect_api(
+                            event.method,
+                            event.url,
+                            resource_type=(conn.resource_type if conn is not None else None)
+                            or None,
+                        )
+                    )
                 except Exception as exc:
                     # Detection failure forfeits only the findings; the request is
                     # still stored below. Exception type only (rule 5).
@@ -659,10 +773,9 @@ class Assembler:
                         error=type(exc).__name__,
                     )
 
-            conn = await self._activity.get_connection(conn_id)
             resource_address = conn.resource_address if conn is not None else None
             inserted = await self._activity.insert_request_with_findings(
-                event, resource_address, findings
+                event, resource_address, findings, storage=storage
             )
             if not inserted:
                 log.debug("assembler.api_duplicate", conn_id=conn_id)
@@ -686,6 +799,7 @@ class Assembler:
                 "assembler.api_request",
                 conn_id=conn_id,
                 findings=finding_count,
+                api_kind=storage.api_kind,
                 recording=is_recording,
             )
 
@@ -715,8 +829,10 @@ class Assembler:
             note in INGESTION_RECIPES §2.1). A genuinely-late chunk still recovers it
             (``_promote`` reverts ``error`` → ``provisional``); a late API audit
             deletes the row instead (``_on_api``). Aged on SQLite wall-clock
-            ``last_seen_at``, so it is correct across restarts. ``api`` connections
-            are never expired: they have no visible row to resolve.
+            ``last_seen_at``, so it is correct across restarts. A pending
+            ``WEB_APP`` connection becomes ``empty`` instead and gets no row
+            (WEBAPP_SPEC §6). ``api`` connections are never expired: they have no
+            visible row to resolve.
 
         The backstop must exceed the Gateway's flush interval: a quiet-but-active
         session is *expected* to be chunkless until its first flush, so
@@ -745,15 +861,23 @@ class Assembler:
     async def _expire_pending_connections(self) -> None:
         """Turn pending connections past the backstop into visible ``error`` rows.
 
-        Caller holds the lock. Each expired connection gets a session row built
-        from its start line (``upsert_start``) and is then marked ``error``
-        (``mark_error_if_provisional``) — the same visible row a start-only session
-        produced before connections were tracked separately. Logged as a counter.
+        Caller holds the lock. ``expire_pending`` returns every expired connection
+        with its new state. Each ``error`` connection gets a session row built from
+        its start line (``upsert_start``, carrying ``resource_type``) and is then
+        marked ``error`` (``mark_error_if_provisional``) — the same visible row a
+        start-only session produced before connections were tracked separately.
+        ``empty`` connections (``WEB_APP`` with no traffic: a browser pre-connect or
+        refused tunnel) get no session row; they are only counted in a debug log.
+        Logged as counters, never ids or values.
         """
         expired = await self._activity.expire_pending(self._max_idle)
         errored = 0
+        hidden = 0
         for conn in expired:
             self._pending_shell_user.pop(conn.conn_id, None)
+            if conn.state == "empty":
+                hidden += 1
+                continue
             if conn.conn_id in self._buffers or conn.conn_id in self._sealed:
                 # Defensive: this conn_id is actually recording (e.g. a session
                 # re-adopted at startup whose start line was redelivered). Never
@@ -765,9 +889,12 @@ class Assembler:
                 username=conn.username,
                 resource_address=conn.resource_address,
                 started_at=conn.started_at,
+                resource_type=_session_resource_type(conn.resource_type),
             )
             await self._repo.mark_error_if_provisional(conn.conn_id)
             errored += 1
+        if hidden:
+            log.debug("assembler.web_pending_hidden", count=hidden)
         if errored:
             log.warning("assembler.pending_expired", count=errored)
 

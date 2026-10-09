@@ -14,6 +14,9 @@
   never sends both. Alpine is the vendored build; no inline event-handler attributes
   (same pattern as sessions.html).
 
+  The "Web filters (configured TLS)" block (scheme, upstream) sits in a <details> that
+  opens when either is set (`web_filters_open`).
+
   The Export CSV link lives in _results.html, not here, so it follows each swap.
   Results never include recording content (CLAUDE.md rules 5/6).
 #}
@@ -146,7 +149,36 @@
           </select>
         </label>
       </div>
-      <p class="form-hint dim">These filters apply to recordings only; kubectl commands are skipped when one is set.</p>
+      <p class="form-hint dim">These filters apply to recordings only; kubectl commands and web connections are skipped when one is set.</p>
+    </details>
+
+    {#
+      Web filters (WEBAPP_SPEC §8.3): configured TLS as reported by gwops, not the
+      negotiated mode. Both selects are named inputs inside the form, so the native
+      GET and the hx-get submission carry them whether or not the <details> is open.
+      Options are (value, label) pairs from the route; "" is Any.
+    #}
+    <details class="web-search-form-filters"{% if web_filters_open %} open{% endif %}>
+      <summary>Web filters (configured TLS) <span class="dim">(web connections only)</span></summary>
+      <div class="field-grid">
+        <label>
+          Configured client TLS
+          <select name="scheme">
+            {% for value, label in scheme_options %}
+              <option value="{{ value }}"{% if form.scheme == value %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Configured upstream TLS
+          <select name="upstream">
+            {% for value, label in upstream_options %}
+              <option value="{{ value }}"{% if form.upstream == value %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <p class="form-hint dim">These filters apply to web connections only; other kinds are skipped when one is set. They match the TLS mode gwops reported as configured, not the negotiated mode.</p>
     </details>
 
     <label class="checkbox">

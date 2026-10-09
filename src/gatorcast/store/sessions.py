@@ -27,8 +27,8 @@ from gatorcast.models import Session
 class SystemSummary(BaseModel):
     """Aggregate view of one target system (distinct ``resource_address``).
 
-    A system is listed when it has recording sessions, kubectl API requests, or
-    both. ``finding_count``/``max_severity`` summarize recording findings only;
+    A system is listed when it has recording sessions, kubectl API requests, web
+    requests, or any mix. ``finding_count``/``max_severity`` summarize recording findings only;
     API-request findings are shown on the system's kubectl activity table.
 
     Timestamps are all in the ``api_requests.requested_at`` format
@@ -42,7 +42,15 @@ class SystemSummary(BaseModel):
     Counts (spec §7.5): ``session_count`` is every ``sessions`` row (recordings and
     failed connections); ``ssh_count`` is SSH recordings that hold recording data
     (chunks, or a ``.cast`` on disk); ``exec_count`` is kubectl exec/attach
-    recordings (``request_id`` set).
+    recordings (``request_id`` set). ``kubectl_request_count`` and
+    ``web_request_count`` are the system's stored ``api_requests`` rows of each
+    ``api_kind`` (WEBAPP_SPEC §8.5).
+
+    ``web_downstream_tls`` / ``web_upstream_tls`` are the configured TLS modes stored
+    on the system's newest web request (WEBAPP_SPEC §8.5), or ``None`` (unknown, or
+    no web requests). Configured state reported by gwops, never proof of the
+    negotiated mode. They are raw stored values: the route maps them to fixed labels
+    and classes and never renders them directly.
     """
 
     resource_address: str | None
@@ -50,11 +58,14 @@ class SystemSummary(BaseModel):
     last_seen: str | None
     finding_count: int = 0
     max_severity: str | None = None
-    api_request_count: int = 0
+    kubectl_request_count: int = 0
+    web_request_count: int = 0
     ssh_count: int = 0
     exec_count: int = 0
     last_session_at: str | None = None
     last_api_at: str | None = None
+    web_downstream_tls: str | None = None
+    web_upstream_tls: str | None = None
 
     @property
     def has_ssh(self) -> bool:
@@ -63,8 +74,13 @@ class SystemSummary(BaseModel):
 
     @property
     def has_kubernetes(self) -> bool:
-        """True when the system earns the Kubernetes badge (exec recordings or API requests)."""
-        return self.exec_count > 0 or self.api_request_count > 0
+        """True when the system earns the Kubernetes badge (exec recordings or kubectl requests)."""
+        return self.exec_count > 0 or self.kubectl_request_count > 0
+
+    @property
+    def has_web(self) -> bool:
+        """True when the system earns the Web badge (at least one web request)."""
+        return self.web_request_count > 0
 
 
 # Maps the SQL severity-rank back to a label (0 / no findings → None).
@@ -79,8 +95,10 @@ _SEVERITY_RANK_CASE = (
 
 # Q12 (unified search spec §7.4, §7.5): the systems list. A UNION ALL of a
 # per-system aggregate over ``sessions`` (a small table, scanned) and one over
-# ``api_requests`` answered by a covering scan of ``idx_api_req_sys_time``
-# (``resource_address, requested_at``), folded by the outer GROUP BY. No new index.
+# ``api_requests`` answered by a covering scan of ``idx_api_req_sys_kind_time``
+# (``resource_address, api_kind, requested_at``), folded by the outer GROUP BY. The
+# kind split is two conditional aggregates, not a ``WHERE api_kind`` filter (a filter
+# flips the plan to a non-covering scan with a temp b-tree). No new index.
 # Both timestamps are in the ``requested_at`` format (the sessions side through
 # ``SESSION_AT_SQL``), so they compare directly with no per-row ``datetime()``.
 # Rows sort by the newer of the two, then by address for a stable order.
@@ -94,7 +112,8 @@ SELECT
     SUM(session_count)      AS session_count,
     SUM(ssh_count)          AS ssh_count,
     SUM(exec_count)         AS exec_count,
-    SUM(api_request_count)  AS api_request_count,
+    SUM(kubectl_request_count) AS kubectl_request_count,
+    SUM(web_request_count)  AS web_request_count,
     MAX(last_session_at)    AS last_session_at,
     MAX(last_api_at)        AS last_api_at,
     SUM(finding_count)      AS finding_count,
@@ -106,7 +125,8 @@ FROM (
         SUM(s.request_id IS NULL AND (COALESCE(s.chunk_count, 0) > 0
                                       OR s.cast_path IS NOT NULL)) AS ssh_count,
         SUM(s.request_id IS NOT NULL)                        AS exec_count,
-        0                                                    AS api_request_count,
+        0                                                    AS kubectl_request_count,
+        0                                                    AS web_request_count,
         MAX({session_at("s")})                               AS last_session_at,
         NULL                                                 AS last_api_at,
         COALESCE(SUM(s.finding_count), 0)                    AS finding_count,
@@ -115,13 +135,39 @@ FROM (
     GROUP BY s.resource_address
     UNION ALL
     SELECT
-        r.resource_address, 0, 0, 0, COUNT(*), NULL, MAX(r.requested_at), 0, 0
+        r.resource_address, 0, 0, 0,
+        SUM(r.api_kind = 'kubectl'), SUM(r.api_kind = 'web'),
+        NULL, MAX(r.requested_at), 0, 0
     FROM api_requests AS r
     GROUP BY r.resource_address
 )
 GROUP BY resource_address
 ORDER BY MAX(COALESCE(MAX(last_session_at), ''), COALESCE(MAX(last_api_at), '')) DESC,
          resource_address
+"""
+
+# The configured TLS modes on one system's newest web request (WEBAPP_SPEC §8.5): one
+# indexed probe per web system, a reverse walk of ``idx_api_req_sys_kind_time``
+# ``(resource_address, api_kind, requested_at, request_id)`` that stops at the first
+# row (no sort). ``IS ?`` matches the NULL (unknown) bucket too. Static SQL.
+NEWEST_WEB_TLS_SQL = """
+SELECT downstream_tls, upstream_tls
+FROM api_requests INDEXED BY idx_api_req_sys_kind_time
+WHERE resource_address IS ? AND api_kind = 'web'
+ORDER BY requested_at DESC, request_id DESC
+LIMIT 1
+"""
+
+# Which API kinds one system has ever stored (the system page decides which activity
+# tables to show, WEBAPP_SPEC §8.5). Two existence probes on the leading
+# ``(resource_address, api_kind)`` prefix of ``idx_api_req_sys_kind_time``; each stops
+# at its first row. Static SQL; the address is bound twice.
+SYSTEM_API_KINDS_SQL = """
+SELECT
+    EXISTS (SELECT 1 FROM api_requests INDEXED BY idx_api_req_sys_kind_time
+            WHERE resource_address IS ? AND api_kind = 'kubectl') AS has_kubectl,
+    EXISTS (SELECT 1 FROM api_requests INDEXED BY idx_api_req_sys_kind_time
+            WHERE resource_address IS ? AND api_kind = 'web') AS has_web
 """
 
 
@@ -136,17 +182,20 @@ class PurgedSession(BaseModel):
 _SESSION_COLUMNS = (
     "conn_id, username, resource_address, shell_user, started_at, ended_at, "
     "duration_seconds, width, height, chunk_count, size_bytes, cast_path, status, "
-    "finding_count, max_severity, request_id, sealed_terminal"
+    "finding_count, max_severity, request_id, sealed_terminal, resource_type"
 )
 
 
 def _row_to_session(row: aiosqlite.Row) -> Session:
     """Map a ``sessions`` table row to the ``Session`` model.
 
-    ``sealed_terminal`` is read only when the row carries that column, so a caller
-    selecting its own narrower column list still maps cleanly (it gets ``None``).
+    ``sealed_terminal`` and ``resource_type`` are read only when the row carries
+    that column, so a caller selecting its own narrower column list still maps
+    cleanly (it gets ``None``).
     """
-    sealed = row["sealed_terminal"] if "sealed_terminal" in row.keys() else None
+    keys = row.keys()
+    sealed = row["sealed_terminal"] if "sealed_terminal" in keys else None
+    resource_type = row["resource_type"] if "resource_type" in keys else None
     return Session(
         conn_id=row["conn_id"],
         username=row["username"],
@@ -165,6 +214,7 @@ def _row_to_session(row: aiosqlite.Row) -> Session:
         max_severity=row["max_severity"],
         request_id=row["request_id"],
         sealed_terminal=None if sealed is None else bool(sealed),
+        resource_type=resource_type,
     )
 
 
@@ -187,6 +237,8 @@ class SessionRepository:
         username: str | None,
         resource_address: str | None,
         started_at: str | None,
+        *,
+        resource_type: str | None = None,
     ) -> None:
         """Insert or refresh a provisional row for a buffering session.
 
@@ -200,9 +252,17 @@ class SessionRepository:
             username: Envelope SSO identity, if known.
             resource_address: Target system address, if known.
             started_at: Session start timestamp (start event / first chunk), if known.
+            resource_type: Normalized Gateway resource type from the connection's
+                start line, if known. A non-null value wins over the stored one;
+                ``None`` never clears it.
         """
         await self._upsert_provisional(
-            conn_id, username, resource_address, started_at, request_id=None
+            conn_id,
+            username,
+            resource_address,
+            started_at,
+            request_id=None,
+            resource_type=resource_type,
         )
 
     async def _upsert_provisional(
@@ -213,28 +273,32 @@ class SessionRepository:
         started_at: str | None,
         *,
         request_id: str | None,
+        resource_type: str | None = None,
     ) -> None:
         """Shared INSERT-or-refresh of a provisional row (see :meth:`upsert_start`).
 
         ``request_id`` is first-wins (``COALESCE(sessions.request_id, ?)``): once a
         k8s exec/attach chunk has set it, later chunks never overwrite it.
+        ``resource_type`` is ``COALESCE(excluded, existing)``: a non-null value wins,
+        ``None`` never clears.
         """
         await self._db.execute(
             """
             INSERT INTO sessions (
-                conn_id, username, resource_address, started_at, request_id, status,
-                created_at, updated_at
+                conn_id, username, resource_address, started_at, request_id,
+                resource_type, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
             ON CONFLICT(conn_id) DO UPDATE SET
                 username         = COALESCE(excluded.username, sessions.username),
                 resource_address = COALESCE(excluded.resource_address, sessions.resource_address),
                 started_at       = COALESCE(sessions.started_at, excluded.started_at),
                 request_id       = COALESCE(sessions.request_id, excluded.request_id),
+                resource_type    = COALESCE(excluded.resource_type, sessions.resource_type),
                 updated_at       = datetime('now')
             WHERE sessions.status = 'provisional'
             """,
-            (conn_id, username, resource_address, started_at, request_id),
+            (conn_id, username, resource_address, started_at, request_id, resource_type),
         )
         await self._db.commit()
 
@@ -643,7 +707,8 @@ class SessionRepository:
         The union of systems that have recording sessions and clusters that have
         only kubectl API activity: :data:`LIST_SYSTEMS_SQL`, a ``UNION ALL`` of the
         per-system ``sessions`` aggregate and a ``GROUP BY resource_address`` over
-        ``api_requests`` (a covering scan of ``idx_api_req_sys_time``), folded by an
+        ``api_requests`` (a covering scan of ``idx_api_req_sys_kind_time``, with
+        ``SUM(api_kind = 'kubectl')`` / ``SUM(api_kind = 'web')`` splitting the count), folded by an
         outer ``GROUP BY``. ``GROUP BY`` keeps the NULL (unknown) bucket as one group.
 
         ``last_session_at`` is the newest recording start and ``last_api_at`` the
@@ -651,6 +716,10 @@ class SessionRepository:
         ``last_seen`` is the larger of the two. Rows are ordered by that value,
         newest first (ties by address). ``finding_count`` and ``max_severity``
         summarize recording findings only.
+
+        For each system with web requests, ``web_downstream_tls`` /
+        ``web_upstream_tls`` come from its newest web request
+        (:data:`NEWEST_WEB_TLS_SQL`, one indexed probe per web system).
 
         Returns:
             A list of ``SystemSummary`` rows, most-recent activity first.
@@ -663,21 +732,70 @@ class SessionRepository:
             last_session_at = row["last_session_at"]
             last_api_at = row["last_api_at"]
             present = [t for t in (last_session_at, last_api_at) if t]
+            web_count = int(row["web_request_count"] or 0)
+            downstream_tls: str | None = None
+            upstream_tls: str | None = None
+            if web_count > 0:
+                downstream_tls, upstream_tls = await self._newest_web_tls(
+                    row["resource_address"]
+                )
             summaries.append(
                 SystemSummary(
                     resource_address=row["resource_address"],
                     session_count=int(row["session_count"] or 0),
                     ssh_count=int(row["ssh_count"] or 0),
                     exec_count=int(row["exec_count"] or 0),
-                    api_request_count=int(row["api_request_count"] or 0),
+                    kubectl_request_count=int(row["kubectl_request_count"] or 0),
+                    web_request_count=web_count,
                     last_session_at=last_session_at,
                     last_api_at=last_api_at,
                     last_seen=max(present) if present else None,
                     finding_count=int(row["finding_count"] or 0),
                     max_severity=_RANK_TO_SEVERITY.get(int(row["sev_rank"] or 0)),
+                    web_downstream_tls=downstream_tls,
+                    web_upstream_tls=upstream_tls,
                 )
             )
         return summaries
+
+    async def _newest_web_tls(self, resource_address: str | None) -> tuple[str | None, str | None]:
+        """Return ``(downstream_tls, upstream_tls)`` of a system's newest web request.
+
+        Args:
+            resource_address: The system, or ``None`` for the unknown bucket.
+
+        Returns:
+            The two stored modes (either may be ``None``), or ``(None, None)`` when
+            the system has no web request.
+        """
+        cursor = await self._db.execute(NEWEST_WEB_TLS_SQL, (resource_address,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None, None
+        return row["downstream_tls"], row["upstream_tls"]
+
+    async def system_api_kinds(self, resource_address: str | None) -> tuple[bool, bool]:
+        """Tell whether a system has ever stored kubectl and web requests.
+
+        One statement (:data:`SYSTEM_API_KINDS_SQL`): two indexed existence probes
+        on ``idx_api_req_sys_kind_time``. Used by the system page to choose which
+        activity tables to show (WEBAPP_SPEC §8.5); reads no request content.
+
+        Args:
+            resource_address: The system, or ``None`` for the unknown bucket.
+
+        Returns:
+            ``(has_kubectl, has_web)``.
+        """
+        cursor = await self._db.execute(
+            SYSTEM_API_KINDS_SQL, (resource_address, resource_address)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:  # pragma: no cover - a scalar SELECT always returns one row
+            return False, False
+        return bool(row["has_kubectl"]), bool(row["has_web"])
 
     async def list_sessions(self, resource_address: str | None) -> list[Session]:
         """List sessions for one system, newest first.

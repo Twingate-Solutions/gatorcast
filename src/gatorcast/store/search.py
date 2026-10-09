@@ -121,6 +121,11 @@ class DashboardStats(BaseModel):
     * ``api_flagged_truncated`` is true when more than ``_FLAGGED_CMD_CAP``
       flagged commands were found; the figures are then lower bounds and
       ``api_flagged_commands`` is clamped to the cap (rendered as ``5000+``).
+
+    ``web_requests_total`` counts stored web **requests** (``api_kind = 'web'``),
+    windowed on ``api_requests.requested_at`` (WEBAPP_SPEC §8.6). Like
+    ``api_requests_total`` it is a request count, while its linked ``type=web``
+    search lists connections.
     """
 
     total_sessions: int
@@ -133,6 +138,12 @@ class DashboardStats(BaseModel):
     api_flagged_commands: int = 0
     api_commands_by_severity: dict[str, int] = {}
     api_flagged_truncated: bool = False
+    web_requests_total: int = 0
+
+
+# ``api_kind`` → its SQL literal, for the request totals. Fixed strings only, so the
+# kind never reaches SQL from input and each kind's statement text is static.
+_API_KIND_LITERALS: dict[str, str] = {"kubectl": "'kubectl'", "web": "'web'"}
 
 
 # Columns for a FindingRow, in model field order.
@@ -193,9 +204,10 @@ _FLAGGED_CMD_CAP = 5000
 # "q is a row of the command identified by hit row h" (spec §6.3 SAME_CMD). The
 # command key is rendered by db.cmd_key so SQLite matches it to idx_api_req_cmd.
 # The unary ``+`` on the two scope columns stops the planner from choosing
-# idx_api_req_sys_user_time instead (a range over the user's whole history on that
-# cluster); they stay residual filters on the idx_api_req_cmd range.
-# Static SQL: no user value is interpolated.
+# idx_api_req_sys_kind_user_time instead (a range over the user's whole history on
+# that cluster); they stay residual filters on the idx_api_req_cmd range. No
+# ``api_kind`` term: a command key is single-kind, and adding one flips the probe
+# to a full kind scan. Static SQL: no user value is interpolated.
 _SAME_CMD_AS_HIT = (
     f"{cmd_key('q')} = h.ck "
     "AND +q.resource_address IS h.resource_address AND +q.user_key IS h.user_key"
@@ -210,6 +222,8 @@ def flagged_command_stats_sql(*, windowed: bool) -> str:
     ``:cutoff`` (``…SS.mmmZ`` format). ``CROSS JOIN`` fixes SQLite's join order so
     both ``hit`` and the per-command rank are driven as the spec's plan requires
     (``api_findings`` → ``api_requests`` primary key; ``idx_api_req_cmd`` → findings).
+    ``hit`` is restricted to ``api_kind = 'kubectl'`` (a command key is single-kind,
+    so the per-command probes need no kind term).
     Static SQL: only fixed fragments are interpolated, never a user value.
 
     Args:
@@ -218,7 +232,11 @@ def flagged_command_stats_sql(*, windowed: bool) -> str:
     Returns:
         The SQL text.
     """
-    hit_where = "WHERE r.requested_at >= :cutoff" if windowed else ""
+    hit_where = (
+        "WHERE r.api_kind = 'kubectl' AND r.requested_at >= :cutoff"
+        if windowed
+        else "WHERE r.api_kind = 'kubectl'"
+    )
     in_window = "(c.start_at >= :cutoff)" if windowed else "1"
     return f"""
         WITH hit AS (
@@ -615,7 +633,8 @@ class SearchStore:
         """Compute aggregate counts for the dashboard, optionally time-windowed.
 
         Every count is defined so it equals the item count of the unified search
-        the dashboard links it to (spec §8.2), except ``api_requests_total``:
+        the dashboard links it to (spec §8.2), except the request totals
+        ``api_requests_total`` and ``web_requests_total``:
 
         * Sessions are windowed on ``SESSION_AT_SQL`` (``COALESCE(started_at,
           created_at)`` rendered in the ``requested_at`` format), the predicate
@@ -636,8 +655,8 @@ class SearchStore:
         Returns:
             A :class:`DashboardStats` with total/flagged session counts, a per-session
             highest-severity breakdown, a per-category finding breakdown, the top 10
-            users and systems by session count, the API request total, and the
-            flagged-command figures — all within the window.
+            users and systems by session count, the kubectl and web request
+            totals, and the flagged-command figures — all within the window.
 
         Raises:
             ValueError: If ``started_after`` is not parseable ISO 8601.
@@ -705,6 +724,7 @@ class SearchStore:
         top_systems = [LabeledCount(label=r["label"], count=int(r["n"])) for r in sys_rows]
 
         api_total = await self._api_request_total(cutoff)
+        web_total = await self._api_request_total(cutoff, api_kind="web")
         flagged_cmds, cmds_by_severity, truncated = await self._api_command_stats(cutoff)
 
         return DashboardStats(
@@ -718,23 +738,33 @@ class SearchStore:
             api_flagged_commands=flagged_cmds,
             api_commands_by_severity=cmds_by_severity,
             api_flagged_truncated=truncated,
+            web_requests_total=web_total,
         )
 
-    async def _api_request_total(self, cutoff: str | None) -> int:
-        """Count stored kubectl API requests (discovery included) for the dashboard.
+    async def _api_request_total(self, cutoff: str | None, api_kind: str = "kubectl") -> int:
+        """Count stored API requests of one kind for the dashboard.
 
-        Windowed on ``api_requests.requested_at`` (``idx_api_req_time``). This is a
-        request count, not a command count, so it is not the item count of its
-        linked ``type=kubectl`` search (spec §8.2: "kubectl API requests").
+        Restricted to ``api_kind`` and windowed on ``api_requests.requested_at``
+        (``idx_api_req_kind_time``). This is a request count, not a command or
+        connection count, so it is not the item count of its linked
+        ``type=kubectl`` / ``type=web`` search (spec §8.2 "kubectl API requests";
+        WEBAPP_SPEC §8.6 "Web requests"). kubectl discovery requests are included.
 
         Args:
             cutoff: A cutoff already in the stored ``…SS.mmmZ`` format, or ``None``
                 for all time.
+            api_kind: ``'kubectl'`` (default) or ``'web'``; mapped to a fixed SQL
+                literal.
 
         Returns:
             The number of stored requests at or after the cutoff.
+
+        Raises:
+            KeyError: If ``api_kind`` is not a known kind.
         """
-        r_where = " WHERE requested_at >= ?" if cutoff else ""
+        r_where = f" WHERE api_kind = {_API_KIND_LITERALS[api_kind]}"
+        if cutoff:
+            r_where += " AND requested_at >= ?"
         p: tuple[object, ...] = (cutoff,) if cutoff else ()
         cursor = await self._db.execute(f"SELECT COUNT(*) AS n FROM api_requests{r_where}", p)
         row = await cursor.fetchone()

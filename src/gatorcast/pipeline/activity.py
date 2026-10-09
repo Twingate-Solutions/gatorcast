@@ -24,7 +24,7 @@ Three concepts:
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
@@ -99,6 +99,11 @@ def is_discovery(method: str, url: str) -> bool:
     if method.upper() != "GET":
         return False
     return _DISCOVERY_PATH.fullmatch(request_path(url)) is not None
+
+
+# A discovery predicate: ``(method, url) -> bool``. :func:`is_discovery` is the
+# kubectl default; a web caller passes one that always returns False (spec §7.2).
+DiscoveryPredicate = Callable[[str, str], bool]
 
 
 def _row_is_discovery(row: ApiRequestRow) -> bool:
@@ -219,10 +224,11 @@ class _SessionBuilder:
         self,
         findings: Mapping[str, Sequence[FindingLike]],
         recordings: Mapping[str, str],
+        discovery: DiscoveryPredicate,
     ) -> ActivitySession:
         """Freeze the accumulated rows into an :class:`ActivitySession`."""
         rows = self.rows
-        visible_commands = {_command_key(r) for r in rows if not _row_is_discovery(r)}
+        visible_commands = {_command_key(r) for r in rows if not discovery(r.method, r.url)}
         session_findings = [f for r in rows for f in findings.get(r.request_id, ())]
         return ActivitySession(
             user_key=self.user_key,
@@ -248,6 +254,7 @@ def group_activity(
     *,
     findings: Mapping[str, Sequence[FindingLike]] | None = None,
     recordings: Mapping[str, str] | None = None,
+    discovery: DiscoveryPredicate = is_discovery,
 ) -> list[ActivitySession]:
     """Group one cluster's API requests into activity sessions.
 
@@ -267,6 +274,10 @@ def group_activity(
             ``max_severity``.
         recordings: Optional ``request_id → recording conn_id`` map
             (``ActivityStore.recordings_for_requests``) to fill ``recording_count``.
+        discovery: ``(method, url) -> bool`` predicate deciding which requests are
+            discovery, for ``command_count``. Defaults to :func:`is_discovery`
+            (kubectl); a web caller passes one that always returns False so
+            ``GET /api`` on a web app is not treated as discovery (spec §7.2).
 
     Returns:
         The activity sessions, newest first (ties broken by ``user_key``).
@@ -293,7 +304,7 @@ def group_activity(
             cur = _SessionBuilder(row, t)
             builders.append(cur)
         cur.add(row, t)
-    sessions = [b.build(findings, recordings) for b in builders]
+    sessions = [b.build(findings, recordings, discovery) for b in builders]
     sessions.sort(key=lambda s: s.user_key or "")
     sessions.sort(key=lambda s: s.start_t, reverse=True)
     return sessions
@@ -378,12 +389,20 @@ def _user_agent_product(user_agent: str | None) -> str | None:
     return product or None
 
 
-def _pick_label(primary: ApiRequestRow, requests: Sequence[ApiRequestRow]) -> str:
+def pick_label(primary: ApiRequestRow, requests: Sequence[ApiRequestRow]) -> str:
     """Choose a command's label.
 
     ``Kubectl-Command`` (the primary's, else the first present), else the
     User-Agent product token (the primary's, else the first present), else
-    :data:`UNKNOWN_CLIENT_LABEL`.
+    :data:`UNKNOWN_CLIENT_LABEL`. Public because the timeline hydration
+    (``store.timeline``) recomputes the label when it picks the primary itself.
+
+    Args:
+        primary: The command's primary request.
+        requests: The command's (listed) requests, ``requested_at`` order.
+
+    Returns:
+        The label text.
     """
     for r in (primary, *requests):
         if r.kubectl_command:
@@ -436,7 +455,7 @@ def group_commands(
             Command(
                 key=_display_key(key),
                 kubectl_session=key[1] if key[0] == "session" else None,
-                label=_pick_label(primary, requests),
+                label=pick_label(primary, requests),
                 primary=primary,
                 requests=tuple(requests),
                 discovery_count=sum(1 for r in requests if _row_is_discovery(r)),

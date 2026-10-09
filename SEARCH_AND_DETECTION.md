@@ -13,10 +13,10 @@ For the overall design and how recordings are stored/encrypted, see
 
 ## Features at a glance
 
-- **Dashboard** (`/dashboard`; the site root `/` redirects to it) — total and flagged session counts, severity/category breakdowns, and top users/systems, a **kubectl API requests** card (total requests, flagged commands, severity breakdown of those commands), and a **recent activity** feed, all server-rendered (offline, no external JS). It is **time-windowed** with a 7 / 30 / 90 / All-time toggle (default 30 days). Every tile, chip and top user is a **drill-down link** into search with an explicit `type` and the active window, so each figure lines up with its list. See [Dashboard and systems index](#dashboard-and-systems-index).
-- **Search** (`/search`) — one timeline over SSH recordings, kubectl exec recordings, failed connections and kubectl commands. Filter by type, user, system, date range, duration, status, severity, finding category, has-findings, a dangerous-command rule multiselect, a free-text **keyword** and a custom **regex** (recordings only), and sort by newest, longest or highest risk. Filters live in the URL (shareable), paging is forward-only with a keyset cursor, and `/search?user=<name>` is the per-user view. **CSV export** (`/search/export.csv`) follows the page and writes recordings and kubectl commands with a finding summary. See [Search in detail](#search-in-detail).
-- **Systems index** (`/systems`) — SSH / Kubernetes type badges, separate **Last session** and **Last API request** columns, and a **Findings column** that flags each system with its highest-severity badge and total finding count (or `—` if clean). The column counts recording findings only; clusters with only kubectl activity are listed too.
-- **Findings** — a built-in rule set scans each reassembled recording for **dangerous commands** and **on-screen secrets** (full list below). Findings expose only the **rule label, category, severity, and replay offset** — never the matched text. A separate small rule set flags risky **kubectl API requests** (see [kubectl API rules](#kubectl-api-rules)).
+- **Dashboard** (`/dashboard`; the site root `/` redirects to it) — total and flagged session counts, severity/category breakdowns, and top users/systems, a **kubectl API requests** card (total requests, flagged commands, severity breakdown of those commands), a **Web requests** tile, and a **recent activity** feed, all server-rendered (offline, no external JS). It is **time-windowed** with a 7 / 30 / 90 / All-time toggle (default 30 days). Every tile, chip and top user is a **drill-down link** into search with an explicit `type` and the active window, so each figure lines up with its list. See [Dashboard and systems index](#dashboard-and-systems-index).
+- **Search** (`/search`) — one timeline over SSH recordings, kubectl exec recordings, failed connections, kubectl commands and web connections. Filter by type, user, system, date range, duration, status, severity, finding category, has-findings, a dangerous-command rule multiselect, a free-text **keyword** and a custom **regex** (recordings only), and sort by newest, longest or highest risk. Filters live in the URL (shareable), paging is forward-only with a keyset cursor, and `/search?user=<name>` is the per-user view. **CSV export** (`/search/export.csv`) follows the page and writes recordings, kubectl commands and web connections (22 columns) with a finding summary. See [Search in detail](#search-in-detail).
+- **Systems index** (`/systems`) — SSH / Kubernetes / Web type badges (with the configured TLS of a web app), separate **Last session** and **Last request** columns, and a **Findings column** that flags each system with its highest-severity badge and total finding count (or `—` if clean). The column counts recording findings only; clusters with only kubectl activity are listed too.
+- **Findings** — a built-in rule set scans each reassembled recording for **dangerous commands** and **on-screen secrets** (full list below). Findings expose only the **rule label, category, severity, and replay offset** — never the matched text. A separate small rule set flags risky **kubectl API requests** (see [kubectl API rules](#kubectl-api-rules)). **Web-app traffic is not evaluated by any rule** (see [Detection scope](#detection-scope)).
 - **Seek-to-finding** — clicking a finding on the session page jumps the asciinema player to that moment. The jump also works as a **deep link** (`/sessions/{id}?t=<seconds>`): opening or refreshing that URL loads the player already positioned at the timestamp (and autoplaying), so a "jump" from the search results lands in the right place.
 
 ---
@@ -152,6 +152,18 @@ CSV export. A command's findings are those of all its requests; its severity is 
 highest among them. Search filters `severity`, `max_severity`, `has_findings`,
 `category=kube-api` and `rule_ids` (the `kube-*` ids) evaluate them.
 
+### Detection scope
+
+Detection applies to **recordings and Kubernetes requests only**.
+
+- **The six `kube-api` rules run on Kubernetes requests only.** Each API rule carries the resource types it applies to (`ApiRule.resource_types`, default `KUBERNETES`). The assembler runs the rules on a request stored under the Kubernetes policy: a connection whose type is `KUBERNETES`, a connection whose start line was processed without a type, or a request that arrived before its start line. A `DELETE` or a `…/secrets` path on a web app produces no finding.
+- **Web requests produce no findings.** No built-in rule evaluates them, so web rows carry no findings, no severity and no finding count, and nothing from them reaches `api_findings`. A request that arrived before its start line is checked as a Kubernetes request; if its start line then says `WEB_APP`, the request becomes a web request and its `kube-api` findings are deleted.
+- **Kubectl discovery applies to kubectl rows only.** The rule that hides `GET /api`, `/apis/…`, `/openapi/…` and `/version` by default is part of the kubectl source. A web app's `GET /api` is an ordinary request, and the `discovery` parameter is ignored for web connections.
+- **Findings filters return no web rows.** `has_findings=true`, `severity`, `max_severity`, `category` and `rule_ids` cannot be satisfied by a web connection, so under `type=any` or `type=web` the web kind returns nothing and the page shows the notice "Web connections are not evaluated by detection rules." `has_findings=false` matches every web connection.
+- **`DETECTION_ENABLED=false`** changes nothing for web, since it never had findings.
+
+Candidate web rules (not built): suspicious admin paths (`/admin`, `/wp-admin`, `/actuator`, `/.env`, `/.git`), bursts of 401/403 from one user on one app, mass `DELETE`s in a visit, any request to an app with a plaintext or unverified upstream, and non-standard methods such as `TRACE`. They are tracked in the technical plan's backlog.
+
 ### Testing the rules
 
 The repo includes [`scripts/seed_demo.py`](scripts/seed_demo.py), which posts a
@@ -166,9 +178,9 @@ rule — nothing destructive ever runs.
 The script posts to `http://127.0.0.1:8080/ingest` with the bearer token
 `test-ingest-token`, so run the service with `INGEST_TOKEN=test-ingest-token` (or
 edit `BASE` and `TOKEN` at the top of the script). Each session ends with a close
-event, so it seals immediately and is also searchable by content. The script does
-not send any kubectl API-request audit lines, so it does not exercise the
-[kubectl API rules](#kubectl-api-rules). Those are covered by
+event, so it seals immediately and is also searchable by content. The script
+posts web-app request lines (seven demo `WEB_APP` apps) but no Kubernetes API-request audit lines, so it does not exercise the
+[kubectl API rules](#kubectl-api-rules), and web traffic is not evaluated by any rule. Those are covered by
 [`tests/test_detect.py`](tests/test_detect.py), which has a positive and a
 negative case for each of the six API rules (including encoded, fragment and
 query-string variants) and for a subset of the recording rules:
@@ -189,7 +201,7 @@ Findings are rows, not stored text. Two tables hold them:
 | Table | For | Columns |
 | --- | --- | --- |
 | `findings` | Recordings | `id`, `conn_id`, `rule_id`, `category`, `severity`, `label`, `offset_seconds`, `created_at` |
-| `api_findings` | kubectl API requests | `id`, `request_id` (foreign key, `ON DELETE CASCADE`), `rule_id`, `category` (always `kube-api`), `severity`, `label`, `created_at` |
+| `api_findings` | kubectl API requests (never web requests) | `id`, `request_id` (foreign key, `ON DELETE CASCADE`), `rule_id`, `category` (always `kube-api`), `severity`, `label`, `created_at` |
 
 - **Categories:** `dangerous-command`, `secret-exposure` (recordings) and `kube-api` (API requests).
 - **Severity:** `critical`, `high`, `medium`, `low`, ranked 4 to 1.
@@ -212,7 +224,8 @@ Findings are rows, not stored text. Two tables hold them:
 - **Findings by category** counts finding rows, so a session with two findings in a category counts twice. Its link lists sessions, so the count and the list length can differ.
 - **Top users** and **Top systems** list the ten with the most sessions. A top user links to every kind of activity for that user, including kubectl commands, so the list can be longer than the session count.
 - **kubectl API requests card.** The total counts stored **requests** (discovery included), windowed on `requested_at`. The flagged figure and the severity chips count **commands**, each flagged command once at its highest finding severity, windowed on the command's first request. Because the total counts requests, it is the one figure that is not the length of its linked list. Over 5,000 flagged commands the flagged figures are lower bounds, shown as `5000+`.
-- **Recent activity.** The newest 15 items across every kind, discovery-only commands hidden, not windowed. A recording row links to its replay, a failed connection to its session page, and a command to `/search?cmd=<request id>`.
+- **Web requests tile.** Counts stored web **requests**, windowed on `requested_at`. It links to `type=web`, which lists **connections**, so like the kubectl total it is not the length of its list. The kubectl card counts kubectl requests only; web requests are not in it.
+- **Recent activity.** The newest 15 items across every kind, web connections included, discovery-only commands hidden, not windowed. A recording row links to its replay, a failed connection to its session page, and a command to `/search?cmd=<request id>`.
 - **Drill-down links** carry an explicit `type` and the active window (`window=<7|30|90|all>`, emitted as given):
 
   | Element | Link |
@@ -222,6 +235,7 @@ Findings are rows, not stored text. Two tables hold them:
   | Session severity badge | `/search?type=recordings&max_severity=<severity>` |
   | Category | `/search?type=recordings&category=<category>` |
   | kubectl API requests | `/search?type=kubectl` |
+  | Web requests | `/search?type=web` |
   | Flagged commands | `/search?type=kubectl&has_findings=true` |
   | API severity badge | `/search?type=kubectl&max_severity=<severity>` |
   | Top user | `/search?user=<user>` |
@@ -230,25 +244,25 @@ Findings are rows, not stored text. Two tables hold them:
 
 ### Systems index
 
-`/systems` lists one row per distinct `resource_address`, including clusters that have only kubectl API activity. Sessions with no known system are grouped as `(unknown)`. Columns:
+`/systems` lists one row per distinct `resource_address`, including clusters that have only kubectl API activity and web apps. Sessions with no known system are grouped as `(unknown)`. Columns:
 
 | Column | Meaning |
 | --- | --- |
 | System | The address, linked to the system page |
-| Type | `SSH` when the system has an SSH recording that holds recording data, `Kubernetes` when it has an exec recording or any API request. A system with only start-only `error` rows gets no badge. |
+| Type | `SSH` when the system has an SSH recording that holds recording data, `Kubernetes` when it has an exec recording or any kubectl request, `Web` when it has web requests. A web app also shows the configured scheme badge (`HTTPS`, `HTTP` or `TLS unknown`) and, when its upstream leg is not fully verified, a marker (`Plaintext upstream`, `Unverified upstream` or `CA-only upstream`) of its newest web request. These are **configured** values, not proof, and each carries a tooltip saying so. A web-only system never gets the Kubernetes badge. A system with only start-only `error` rows gets no badge. |
 | Sessions | Number of sessions, in-progress, `error` and failed connections included, linked to `/search?type=recordings&system=<address>` |
 | Last session | The newest recording start (`started_at`, else `created_at`) |
-| API requests | Number of stored kubectl API requests, linked to `/search?type=kubectl&system=<address>`, or `—` |
-| Last API request | The newest `requested_at`, linked to the same search, or `—` |
+| Requests | One link per kind present: the number of stored kubectl requests (`N kubectl ›`, to `/search?type=kubectl&system=<address>`) and of web requests (`N web ›`, to `/search?type=web&system=<address>`), or `—` |
+| Last request | The newest `requested_at` across both kinds, or `—` |
 | Findings | Highest severity across the system's sessions and the total of their `finding_count`, or `—` when clean. Recording findings only. |
 
-Both timestamps use the `requested_at` format (`YYYY-MM-DDTHH:MM:SS.mmmZ`), so they compare directly. Rows are ordered by the newer of the two, newest first, then by address. The system page adds "Search this system" and "kubectl commands in search" links and a trailing ⌕ link beside each username.
+Both timestamps use the `requested_at` format (`YYYY-MM-DDTHH:MM:SS.mmmZ`), so they compare directly. Rows are ordered by the newer of the two, newest first, then by address. The system page adds "Search this system" and "kubectl commands in search" links and a trailing ⌕ link beside each username. For a web app it also shows the **Configured web app TLS (from gwops)** block and a **Web activity** table (see [Web connections in search](#web-connections-in-search) and the README's [Web Apps](README.md#web-apps) section). `/systems/{slug}/web` opens one visit.
 
 ---
 
 ## Search in detail
 
-`/search` is one query over every event kind. Four kinds exist, derived when queried and never stored:
+`/search` is one query over every event kind. Five kinds exist, derived when queried and never stored:
 
 | Kind | `type` value | What it is |
 | --- | --- | --- |
@@ -256,8 +270,9 @@ Both timestamps use the `requested_at` format (`YYYY-MM-DDTHH:MM:SS.mmmZ`), so t
 | kubectl exec | `exec` | A `sessions` row with a `request_id` (an exec/attach recording) |
 | Failed connection | `failed` | A `sessions` row with status `error`, no chunks and no `.cast`: a connection that delivered neither chunks nor API audits before the backstop |
 | kubectl command | `kubectl` | A group of API requests sharing a cluster, a user and a command key (`Kubectl-Session`, else the connection) |
+| Web connection | `web` | The web requests of one `WEB_APP` connection (`conn_id`), placed by its first request |
 
-`type=recordings` ("All sessions") selects the first three, which is every `sessions` row. `type=any` (the default, also for a link that carries only legacy parameters) selects all four.
+`type=recordings` ("All sessions") selects the first three, which is every `sessions` row. `type=any` (the default, also for a link that carries only legacy parameters) selects all five. The form labels `type=web` "Web requests".
 
 Every filter is an optional query parameter. A blank value is ignored. Filters combine with AND, and a repeated parameter is a `400` (except `rule_ids`). Canonical names:
 
@@ -268,17 +283,18 @@ Every filter is an optional query parameter. A blank value is ignored. Filters c
 | `user` | `username` equals the value, or the connection's `user_id` does. | `username` or `user_id` equals the value. |
 | `window` | `7`, `30`, `90` or `all`: days back from now. Do not combine with `from` or `to`. | Same. |
 | `from`, `to` | Inclusive ISO 8601 bounds on the recording start (`started_at`, else first-seen time). A naive time is UTC. `from` later than `to` is a `400`. | Inclusive bounds on the command's **first** request. A command that starts inside the window shows all its requests, even those after `to`. |
-| `status` | `complete`, `provisional` or `error`. | **Excludes the kind.** |
-| `min_duration`, `max_duration` | Duration in seconds, inclusive; finite number at least 0. | **Excludes the kind.** |
+| `status` | `complete`, `provisional` or `error`. | **Excludes the kind** (web connections too). |
+| `min_duration`, `max_duration` | Duration in seconds, inclusive; finite number at least 0. | **Excludes the kind** (web connections too). |
 | `severity` | At-or-above: at least one finding at that severity or higher. | The command has a finding at or above it. |
 | `max_severity` | Exact: the highest severity equals the value. The dashboard's chips use it. | The command's highest finding severity equals the value. |
 | `category` | A finding in that category. The form offers `dangerous-command` and `secret-exposure`. | A finding in that category (`kube-api` is the only one). |
 | `rule_ids` | Repeatable (at most 50). A finding from any selected rule. The form lists the dangerous-command rules only. | A finding from any selected `kube-*` rule. |
 | `has_findings` | `true` for `finding_count > 0`, `false` for none (failed connections have none, so they match `false`). | `true` for any API finding, `false` for none. |
-| `q`, `mode` | `mode=text` (default): case-insensitive substring over the sidecar. `mode=regex`: `re.search` over the sidecar. See [How content search works](#how-content-search-works-no-full-text-index). | `mode=text`: case-insensitive substring over any request's URL path (query string excluded) or `Kubectl-Command`. `mode=regex` **excludes the kind**. |
-| `sort` | `newest` (default), `duration` (longest first, unknown last), `risk` (highest `max_severity`, then newest). | `newest`, `risk`. `sort=duration` **excludes the kind**. |
-| `discovery` | Ignored. | `0` (default) hides discovery-only commands and discovery requests; `1` shows them. |
-| `cmd` | **Excludes the kind.** | Focus on the one command this request id belongs to. |
+| `q`, `mode` | `mode=text` (default): case-insensitive substring over the sidecar. `mode=regex`: `re.search` over the sidecar. See [How content search works](#how-content-search-works-no-full-text-index). | `mode=text`: case-insensitive substring over any request's URL path (query string excluded) or `Kubectl-Command`. `mode=regex` **excludes the kind** (web connections too). |
+| `sort` | `newest` (default), `duration` (longest first, unknown last), `risk` (highest `max_severity`, then newest). | `newest`, `risk`. `sort=duration` **excludes the kind** (web connections too). |
+| `discovery` | Ignored. | `0` (default) hides discovery-only commands and discovery requests; `1` shows them. Ignored for web connections. |
+| `cmd` | **Excludes the kind.** | Focus on the one command or web connection this request id belongs to. |
+| `scheme`, `upstream` | **Excludes the kind** (web connections only). | **Excludes the kind** (web connections only). |
 | `page_size`, `cursor` | Page size 1 to 200 (default `SEARCH_PAGE_SIZE`, 50) and the paging cursor. | Same. |
 
 A kind that cannot evaluate an active filter is **excluded**, not shown unfiltered, and the page names the filter ("kubectl commands not searched: the Status filter applies to recordings only."). A kind that can evaluate a filter and finds no match just returns no rows, with no notice. If every selected kind is excluded the page is empty and still `200`. `status=error` therefore never lists kubectl commands.
@@ -289,7 +305,9 @@ For recordings, `category`, `severity` and `rule_ids` each test for a matching f
 
 **Validation.** Every failure is a `400` whose detail names the parameter only (for example `'sort' is not a valid value`), and the submitted value is never echoed or logged. Unknown parameters are ignored. For an HTMX request the `400` is rendered into the results area.
 
-**Per-user view and command focus.** `/search?user=<name>` lists that user's SSH, exec and kubectl activity on every system. `/search?cmd=<request_id>` resolves any request of a command to the whole command, shows it expanded, and ignores every other filter except `discovery`. An unknown id shows "Command not found. It may have been removed by retention."
+**Per-user view and focus.** `/search?user=<name>` lists that user's SSH, exec, kubectl and web activity on every system. `/search?cmd=<request_id>` resolves any request of a kubectl command or a web connection to the whole command or connection, shows it expanded, and ignores every other filter except `discovery`. An unknown id shows "Command or web connection not found. It may have been removed by retention." and the clear link returns to the unfiltered search.
+
+**Web connections** are described in [Web connections in search](#web-connections-in-search) below.
 
 **Result rows.** Recording rows show the status, duration, shell user, risk and finding badges with jump links, and **Replay**. A failed connection shows **Details ›** (its session page) instead. A kubectl row shows the command label, the primary request, the request count (with the hidden discovery count), the risk badge with finding labels, and any linked recordings. It expands to a request table of its first 200 requests, with a link to the activity view. Under `type=any` a kubectl exec recording appears both as its own row and as the **Replay** link inside its command row.
 
@@ -299,16 +317,16 @@ For recordings, `category`, `severity` and `rule_ids` each test for a matching f
 
 | Limit | Value | When it is hit |
 | --- | --- | --- |
-| kubectl rows examined | 20,000 per page | A selective command-level filter (text, `has_findings=false`) on a busy cluster. The page says "Scanned 20,000 kubectl requests without filling the page." |
+| kubectl and web rows examined | 20,000 per page, per kind | A selective filter (text, `has_findings=false`, `scheme`, `upstream`) on a busy cluster or web app. The page says "Scanned 20,000 kubectl requests without filling the page.", or "web requests", or both. |
 | Recording sidecars read | `SEARCH_REGEX_MAX_CANDIDATES` (2,000) per page | A content search that matches rarely. The page says "Scanned 2,000 recordings without filling the page." |
 | Flagged commands considered | 5,000 per query | The page says "More than 5,000 flagged kubectl commands match. Narrow by system, user, or time." Commands beyond the cap are not listed. |
-| Requests listed per command | 200 | The expanded row says it is showing the first 200; counts and severity still cover every request. |
+| Requests listed per command or web connection | 200 | The expanded row says it is showing the first 200; counts and severity still cover every request. |
 
 When a budget stops a page, the page can be short or empty and **Continue scanning ›** replaces **Next ›**. Continuing resumes after the stretch already examined, without skipping or repeating results. A text search that matches rarely can need several clicks; that is the cost of having no full-text index.
 
-**CSV export.** `/search/export.csv` follows the page: the same filters and kinds, one row per recording or kubectl command, mixed in page order. It ignores `cursor` and `page_size`, returns up to 10,000 rows in one file named `gatorcast-search.csv`, and stops at the first page a budget cut short. Sidecar reads for the whole export are capped at `SEARCH_REGEX_MAX_CANDIDATES`. When the export stops early (the row cap, a scan budget, the sidecar limit, or more flagged commands than the cap), the response carries `X-Gatorcast-Truncated: true`; the log line `search.export_truncated` carries counters only.
+**CSV export.** `/search/export.csv` follows the page: the same filters and kinds, one row per recording, kubectl command or web connection, mixed in page order. It ignores `cursor` and `page_size`, returns up to 10,000 rows in one file named `gatorcast-search.csv`, and stops at the first page a budget cut short. Sidecar reads for the whole export are capped at `SEARCH_REGEX_MAX_CANDIDATES`. When the export stops early (the row cap, a scan budget, the sidecar limit, or more flagged commands than the cap), the response carries `X-Gatorcast-Truncated: true`; the log line `search.export_truncated` carries counters only.
 
-There are 15 columns. The first ten keep their names and order:
+There are 22 columns. The first 15 keep their names, order and values from 0.4.0. The first ten:
 
 | # | Column | Recording | kubectl command |
 | --- | --- | --- | --- |
@@ -328,7 +346,45 @@ There are 15 columns. The first ten keep their names and order:
 | 14 | `path` | empty | the primary request's path, query string removed |
 | 15 | `request_count` | empty | requests in the command, discovery included |
 
-The export never contains recorded text, a query string, or a header value outside the allowlist. **Formula guard:** any text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, in every column.
+Column 11 (`kind`) is `web` for a web connection. Its `command` is empty, `method` is the primary request's method, `path` is the primary request's stored path with no query, `request_count` is the number of requests, `status`, `findings` and `max_severity` are empty, and `finding_count` is `0`. Columns 16 to 22 were added in 0.5.0:
+
+| # | Column | Recording or failed connection | kubectl command | Web connection |
+| --- | --- | --- | --- | --- |
+| 16 | `resource_type` | the session's stored type, or empty | `KUBERNETES` | `WEB_APP` |
+| 17 | `configured_scheme` | empty | empty | `https` (configured client-facing TLS 1.3), `http` (configured plaintext), or `unknown` |
+| 18 | `configured_upstream_tls` | empty | empty | `verified`, `ca_only`, `unverified`, `plaintext` or `unknown` (the configured app-facing leg) |
+| 19 | `query` | empty | empty | the stored query of the primary request, values masked, without the `?` |
+| 20 | `gwops_gateway_id` | empty | empty | the gateway id gwops reported, for any `match` that carried one; empty when it was `null`, absent or the object was rejected |
+| 21 | `gwops_app` | empty | empty | gwops' app name, for an `exact` match; otherwise empty |
+| 22 | `gwops_managed` | empty | empty | `true` or `false`, for an `exact` match; otherwise empty |
+
+Columns 17 and 18 carry the `configured_` prefix because a CSV has no tooltips: they are configured state reported by gwops, not proof of the negotiated mode, and they use the same vocabulary as the `scheme` and `upstream` filters. `unknown` covers a connection with no `gwops` object, a rejected object, `match: none` and `match: ambiguous`; a rejected object exports exactly like an absent one. Columns 20 to 22 are display detail, empty for non-web rows.
+
+The export never contains recorded text, a header value outside the allowlist, or a query value in the clear. **It does contain the primary request's path unmasked for web rows**, so a token embedded in a web path appears in the CSV (an accepted risk; see the README's [Web Apps](README.md#accepted-risks-and-limits)). **Formula guard:** any text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, in every column, so a masked value that starts with `-`, a free-text `gwops_app`, and a `gwops_gateway_id` that starts with `+` or `-` cannot become a spreadsheet formula.
+
+### Web connections in search
+
+`type=web` lists one row per web connection, newest first, with the same keyset paging as every other kind. A web row shows the configured scheme badge and upstream marker, the user and system, the gwops app name with a `managed` or `unmanaged` marker (when gwops matched the app exactly; the gateway id is in a tooltip), the primary request (the first `POST`, `PUT`, `PATCH` or `DELETE`, else the first request), the request count and span, **Visit ›** and **Focus ›**. It expands to its requests (the first 200). The stored URL is the unmasked path and the masked query.
+
+How each filter treats web connections:
+
+| Parameter | Web connections |
+| --- | --- |
+| `type` | `web`, or `any` (which includes it). |
+| `system`, `user`, `window`, `from`, `to` | As for kubectl commands: exact system, username or user id, and bounds on the connection's **first** request. |
+| `scheme` | `https` matches a configured client-facing TLS 1.3 connection, `http` a configured plaintext one, `unknown` a connection with no TLS data. |
+| `upstream` | `verified` matches `verify_full`, `ca_only` matches `verify_ca`, `unverified` matches `insecure`, `plaintext` matches `none`, and `unknown` a connection with no TLS data. |
+| `q`, `mode=text` | Case-insensitive substring over the stored URL of any request on the connection (the unmasked path and the masked query). Folding is ASCII only, so a non-ASCII needle with capital letters does not match its lower-case variants. The query is searched in its masked form, so a masked value cannot be searched for. |
+| `mode=regex`, `status`, `min_duration`, `max_duration`, `sort=duration` | **Exclude the kind**, with a notice. |
+| `sort` | `newest` (default) or `risk`. Web connections have no findings, so under `risk` they sort with the other unflagged items, newest first. |
+| `severity`, `max_severity`, `category`, `rule_ids`, `has_findings=true` | Match nothing, with the notice "Web connections are not evaluated by detection rules." |
+| `has_findings=false` | Matches every web connection. |
+| `discovery` | Ignored. |
+| `cmd` | Focuses the connection that holds the request, expanded. |
+
+`scheme` and `upstream` filter on **configured** TLS (what gwops reported when the connection authenticated), and `unknown` does not say why the data is missing. Both exclude every other kind, so a search with either set lists web connections only.
+
+**Visits.** A row's **Visit ›** link opens `/systems/{slug}/web`, bounded by that connection's first and last request for the same user and system, so the parallel connections a browser opens for one page load appear together. The system page's **Web activity** table lists whole visits: one user's requests to one app, split when the gap exceeds `KUBECTL_ACTIVITY_GAP_SECONDS` or a visit's span reaches `KUBECTL_ACTIVITY_MAX_SECONDS`. Visits are computed when the page is viewed and nothing is cached.
 
 ---
 
@@ -423,6 +479,8 @@ precedence over `.env`; edit them there. The four search and detection settings
 above are not in the compose file, so set them in `.env`.
 
 The dashboard windows (7 / 30 / 90 days, all time), the CSV export cap (10,000 rows),
-the top-N size (10), the dashboard feed size (15), the kubectl scan budget (20,000
-rows per page), the flagged-command cap (5,000) and the per-command request list
-(200) are fixed in code, not configurable.
+the top-N size (10), the dashboard feed size (15), the scan budget (20,000
+rows per page, per kind), the flagged-command cap (5,000), the per-command request list
+(200), the visit view's request cap (2,000) and the system page's cap of 10 configured-TLS lines
+are fixed in code, not configurable. `KUBECTL_ACTIVITY_GAP_SECONDS` and
+`KUBECTL_ACTIVITY_MAX_SECONDS` also set the split of web visits.

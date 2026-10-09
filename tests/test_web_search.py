@@ -17,6 +17,7 @@ import contextlib
 import csv
 import html as html_lib
 import io
+import json
 import re
 from pathlib import Path
 
@@ -364,7 +365,18 @@ CSV_HEADER = [
     "method",
     "path",
     "request_count",
+    "resource_type",
+    "configured_scheme",
+    "configured_upstream_tls",
+    "query",
+    "gwops_gateway_id",
+    "gwops_app",
+    "gwops_managed",
 ]
+# Columns 1-15 are unchanged since Session 10; 16-22 were appended in Session 12.
+CSV_HEADER_FIRST_15 = CSV_HEADER[:15]
+CSV_HEADER_NEW_7 = CSV_HEADER[15:]
+NO_WEB_CELLS = [""] * 6  # columns 17-22 of every non-web row
 
 FORMULA_CHARS = ["=", "+", "-", "@", "\t", "\r"]
 
@@ -393,8 +405,12 @@ def test_csv_requires_auth(tmp_path: Path) -> None:
     assert resp.status_code == 401
 
 
-def test_csv_header_is_exactly_15_columns(tmp_path: Path) -> None:
-    """The header row is the 15 spec §9 columns, in order, even with no results."""
+def test_csv_header_is_exactly_22_columns(tmp_path: Path) -> None:
+    """The header row is the 22 columns, in order, even with no results.
+
+    The first 15 keep their Session 10 names and order; the seven Session 12 columns
+    (WEBAPP_SPEC §8.7) follow.
+    """
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         resp = _export(client)
@@ -403,11 +419,25 @@ def test_csv_header_is_exactly_15_columns(tmp_path: Path) -> None:
     assert 'filename="gatorcast-search.csv"' in resp.headers["content-disposition"]
     rows = _csv_rows(resp)
     assert rows == [CSV_HEADER]
+    assert len(rows[0]) == 22
+    assert rows[0][:15] == [
+        "conn_id", "username", "resource_address", "status", "started_at", "ended_at",
+        "duration_seconds", "finding_count", "max_severity", "findings", "kind", "command",
+        "method", "path", "request_count",
+    ]
+    assert rows[0][15:] == [
+        "resource_type", "configured_scheme", "configured_upstream_tls", "query",
+        "gwops_gateway_id", "gwops_app", "gwops_managed",
+    ]
     assert "x-gatorcast-truncated" not in resp.headers
 
 
 def test_csv_legacy_export_columns_1_to_10_unchanged(tmp_path: Path) -> None:
-    """A Session 8 legacy-param export keeps columns 1–10 exactly; 11 = kind, 12–15 empty."""
+    """A Session 8 legacy-param export keeps columns 1–10 exactly; 11 = kind, 12–15 empty.
+
+    The row is now 22 cells wide: column 16 is the session's stored ``resource_type``
+    (empty for a session that never had one) and 17–22 are empty for a recording.
+    """
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         _seed_flagged(app, conn_id="csv1", username="gwen@x", resource_address="db.host")
@@ -417,7 +447,7 @@ def test_csv_legacy_export_columns_1_to_10_unchanged(tmp_path: Path) -> None:
     assert rows[0] == CSV_HEADER
     assert len(rows) == 2
     row = rows[1]
-    assert len(row) == 15
+    assert len(row) == 22
     # Exactly what the Session 8 export wrote for this session.
     assert row[:10] == [
         "csv1",
@@ -431,12 +461,34 @@ def test_csv_legacy_export_columns_1_to_10_unchanged(tmp_path: Path) -> None:
         "high",
         "Recursive delete (rm -rf)@0.2s",
     ]
-    assert row[10:] == ["ssh", "", "", "", ""]
+    assert row[10:15] == ["ssh", "", "", "", ""]
+    assert row[15:] == [""] + NO_WEB_CELLS
     assert UNIQUE_MARKER not in resp.text
 
 
+def test_csv_recording_column_16_is_the_session_resource_type(tmp_path: Path) -> None:
+    """Column 16 of a recording is its stored ``resource_type``; 17–22 stay empty (§8.7)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_flagged(app, conn_id="csv-ssh", username="gwen@x", resource_address="db.host")
+        _run(app.state.db.execute(
+            "UPDATE sessions SET resource_type = 'SSH' WHERE conn_id = ?", ("csv-ssh",)
+        ))
+        _run(app.state.db.commit())
+        resp = _export(client)
+    assert resp.status_code == 200
+    rows = _csv_rows(resp)
+    assert rows[0] == CSV_HEADER
+    assert len(rows) == 2
+    assert rows[1][10] == "ssh"
+    assert rows[1][15:] == ["SSH"] + NO_WEB_CELLS
+
+
 def test_csv_kubectl_row_fills_columns_11_to_15(tmp_path: Path) -> None:
-    """A kubectl command fills 11–15; no query string, no full User-Agent."""
+    """A kubectl command fills 11–15 and column 16 (``KUBERNETES``); 17–22 are empty.
+
+    No query string and no full User-Agent anywhere (the query column is web-only).
+    """
     from tests.fixtures.timeline import PROD, add_request, at
 
     full_ua = "kubectl/v1.30.0 (linux/amd64) kubernetes/UASENTINEL"
@@ -465,6 +517,7 @@ def test_csv_kubectl_row_fills_columns_11_to_15(tmp_path: Path) -> None:
     assert resp.status_code == 200
     rows = _csv_rows(resp)
     assert rows[0] == CSV_HEADER
+    assert all(len(r) == 22 for r in rows)
     assert rows[1] == [
         "conn-k1",
         "ann@x",
@@ -481,8 +534,10 @@ def test_csv_kubectl_row_fills_columns_11_to_15(tmp_path: Path) -> None:
         "DELETE",
         "/api/v1/namespaces/default/pods/web-2",
         "2",
+        "KUBERNETES",
+        *NO_WEB_CELLS,
     ]
-    assert rows[2][10:] == ["kubectl", "k9s", "GET", "/api/v1/nodes", "1"]
+    assert rows[2][10:] == ["kubectl", "k9s", "GET", "/api/v1/nodes", "1", "KUBERNETES", *NO_WEB_CELLS]
     # Allowlist: no query-string values and no full User-Agent anywhere.
     assert "UASENTINEL" not in resp.text
     assert "gracePeriodSeconds" not in resp.text
@@ -750,7 +805,7 @@ def test_session_detail_lists_findings_with_offset(tmp_path: Path) -> None:
 # Unified search page (Session 10 T5, spec §8.3 / §8.6 / §12)
 # ---------------------------------------------------------------------------
 
-ALL_TYPE_VALUES = ["any", "recordings", "ssh", "exec", "failed", "kubectl"]
+ALL_TYPE_VALUES = ["any", "recordings", "ssh", "exec", "failed", "kubectl", "web"]
 ALL_TYPE_LABELS = [
     "Any",
     "All sessions",
@@ -758,6 +813,7 @@ ALL_TYPE_LABELS = [
     "kubectl exec recordings",
     "Failed connections",
     "kubectl commands",
+    "Web requests",
 ]
 
 
@@ -834,7 +890,7 @@ def _walk_pages(client: TestClient, url: str, *, label: str = "Next ›", limit:
 
 
 def test_search_heading_and_type_select_options(tmp_path: Path) -> None:
-    """The page is titled "Search" and the Type select lists all six options."""
+    """The page is titled "Search" and the Type select lists all seven options (web added)."""
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         resp = _get(client, "/search")
@@ -967,12 +1023,25 @@ def test_search_cmd_focus_renders_one_open_command(tmp_path: Path) -> None:
     assert "<details open>" in _blocks(from_later_request.text)[0]
 
 
-def test_search_cmd_unknown_says_command_not_found(tmp_path: Path) -> None:
-    """An unknown cmd is a 200 with "Command not found" and no rows."""
+def test_search_cmd_unknown_says_command_or_web_connection_not_found(tmp_path: Path) -> None:
+    """An unknown cmd is a 200 naming both kinds, with no rows.
+
+    ``cmd`` now focuses whichever kind holds the request (WEBAPP_SPEC §8.1), so the
+    not-found text says "Command or web connection", and the banner heading is
+    kind-neutral; the clear link goes to the unfiltered search (kind unknown).
+    """
     with _scenario_client(tmp_path) as (_app, client, _sc):
         resp = _get(client, "/search?cmd=no-such-request")
     assert resp.status_code == 200
-    assert "Command not found" in resp.text
+    assert (
+        "Command or web connection not found. It may have been removed by retention."
+        in resp.text
+    )
+    assert "Command not found" not in resp.text
+    assert "Showing no command or web connection" in resp.text
+    banner = re.search(r'<p class="notice notice-focus">(.*?)</p>', resp.text, re.DOTALL)
+    assert banner is not None and "no-such-request" not in banner.group(1)
+    assert 'href="/search"' in banner.group(1)  # the clear link: no kind to return to
     assert _blocks(resp.text) == []
     assert "Showing 0" in resp.text
 
@@ -1182,7 +1251,10 @@ def test_search_legacy_recording_only_filters_exclude_kubectl_with_notice(tmp_pa
     for resp in (by_status, by_regex):
         assert resp.status_code == 200
         assert all(_badge(b) != "pill-kubectl" for b in _blocks(resp.text))
-        assert "kubectl commands not searched" in resp.text
+        # Web connections are excluded by the same filters (WEBAPP_SPEC §8.1), so the
+        # notice now names both skipped kinds.
+        assert "kubectl commands and Web requests not searched" in resp.text
+        assert 'class="pill pill-web"' not in resp.text
 
 
 def test_search_legacy_page_param_lands_on_first_page(tmp_path: Path) -> None:
@@ -1300,10 +1372,19 @@ def test_search_notice_for_excluded_kinds_and_all_excluded(tmp_path: Path) -> No
     with _scenario_client(tmp_path) as (_app, client, _sc):
         mixed = _get(client, "/search?status=complete&page_size=200")
         nothing = _get(client, "/search?type=kubectl&status=complete")
-    assert "kubectl commands not searched: the Status filter applies to recordings only." in mixed.text
+    assert (
+        "kubectl commands and Web requests not searched: the Status filter applies to "
+        "recordings only."
+    ) in mixed.text
     assert nothing.status_code == 200
     assert "No type can be searched with these filters." in nothing.text
     assert _blocks(nothing.text) == []
+    # type=web with a recordings-only filter excludes the only requested kind as well.
+    with _scenario_client(tmp_path / "web") as (_app, client, _sc):
+        web_nothing = _get(client, "/search?type=web&status=complete")
+    assert web_nothing.status_code == 200
+    assert "No type can be searched with these filters." in web_nothing.text
+    assert _blocks(web_nothing.text) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1616,3 +1697,1778 @@ def test_dashboard_feed_is_not_windowed(tmp_path: Path) -> None:
     assert [_ident(b) for b in _feed_blocks(body)] == [("rec", "ancient")]
     assert _tiles(body)["Total sessions"][1] == "0"
     assert UNIQUE_MARKER not in body
+
+
+# ---------------------------------------------------------------------------
+# Session 11 -> 12: web rows never appear under type=kubectl; from Session 12 they are
+# listed under type=web and type=any (WEBAPP_SPEC 8.1, 8.6)
+# ---------------------------------------------------------------------------
+
+WEB_PATH_SENTINEL = "/web-only-path-xyzzy"
+KUBECTL_PATH = "/api/v1/namespaces/default/pods/shown-in-search"
+
+
+def _seed_kubectl_and_web_requests(app) -> None:
+    """One kubectl request and several web requests on the same system and user."""
+    from gatorcast.models import ApiRequest
+    from gatorcast.store.activity import RequestStorage
+
+    def req(request_id: str, at: str, url: str, **extra) -> ApiRequest:
+        return ApiRequest(
+            conn_id="cccccccc-0000-4000-8000-000000000001",
+            request_id=request_id,
+            requested_at=at,
+            user_id="VXNlcjox",
+            username="user@example.com",
+            method="GET",
+            url=url,
+            url_web=url,
+            status_code=200,
+            user_agent="agent/1.0",
+            **extra,
+        )
+
+    kube = req("k-1", "2026-10-01T10:00:00.000Z", KUBECTL_PATH,
+               kubectl_command="kubectl get", kubectl_session="5e55e55e-0000-4000-8000-000000000001")
+    asyncio.run(app.state.activity.insert_request(kube, "shared.example.internal"))
+    for i in range(4):
+        web = req(f"w-{i}", f"2026-10-01T10:00:0{i + 1}.000Z", WEB_PATH_SENTINEL)
+        storage = RequestStorage(api_kind="web", url=WEB_PATH_SENTINEL, user_agent="agent/1.0",
+                                 kubectl_command=None, kubectl_session=None)
+        asyncio.run(app.state.activity.insert_request(web, "shared.example.internal", storage=storage))
+
+
+@pytest.mark.parametrize("query", ["type=kubectl&window=all"])
+def test_search_kubectl_type_lists_kubectl_commands_and_no_web_rows(
+    tmp_path: Path, query: str
+) -> None:
+    """``type=kubectl`` still lists only the kubectl command: web rows stay out of it."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        resp = client.get(f"/search?{query}", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert "shown-in-search" in resp.text
+    assert WEB_PATH_SENTINEL not in resp.text
+    assert 'class="pill pill-web"' not in resp.text
+
+
+@pytest.mark.parametrize("query", ["type=any&window=all", "window=all"])
+def test_search_any_lists_the_kubectl_command_and_the_web_connection(
+    tmp_path: Path, query: str
+) -> None:
+    """Under ``any`` (explicit or default) web rows now appear beside the kubectl command.
+
+    The kubectl request and the four web requests share one ``conn_id``; each source
+    reads its own ``api_kind``, so the page has one kubectl row and one web row (four
+    requests), not a merged or duplicated pair.
+    """
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        resp = client.get(f"/search?{query}", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert "shown-in-search" in resp.text
+    blocks = _blocks(resp.text)
+    assert len(blocks) == 2
+    web_blocks = [b for b in blocks if 'class="pill pill-web"' in b]
+    assert len(web_blocks) == 1
+    assert WEB_PATH_SENTINEL in web_blocks[0]
+    assert "4 requests" in web_blocks[0]
+    assert "shown-in-search" not in web_blocks[0]
+
+
+def test_search_type_web_lists_only_the_web_connection(tmp_path: Path) -> None:
+    """``type=web`` lists the web connection and never the kubectl command."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        resp = client.get("/search?type=web&window=all", headers=_auth_header())
+
+    assert resp.status_code == 200
+    assert len(_blocks(resp.text)) == 1
+    assert WEB_PATH_SENTINEL in resp.text
+    assert "shown-in-search" not in resp.text
+
+
+def test_search_for_the_web_path_text_finds_nothing_under_kubectl(tmp_path: Path) -> None:
+    """Text search under ``type=kubectl`` matches no web path; under ``type=web`` it does."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        kube = client.get(
+            "/search?type=kubectl&window=all&q=web-only-path", headers=_auth_header()
+        )
+        web = client.get("/search?type=web&window=all&q=web-only-path", headers=_auth_header())
+    assert kube.status_code == 200
+    assert "shown-in-search" not in kube.text
+    assert WEB_PATH_SENTINEL not in kube.text
+    assert web.status_code == 200
+    assert WEB_PATH_SENTINEL in web.text
+
+
+def test_search_csv_export_lists_kubectl_and_web_rows_under_any(tmp_path: Path) -> None:
+    """The ``any`` export has the kubectl row and the web row; ``type=kubectl`` has no web row."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        any_resp = client.get("/search/export.csv?type=any&window=all", headers=_auth_header())
+        kube_resp = client.get(
+            "/search/export.csv?type=kubectl&window=all", headers=_auth_header()
+        )
+
+    assert any_resp.status_code == 200
+    rows = list(csv.reader(io.StringIO(any_resp.text)))
+    assert len(rows) == 3  # header + the kubectl command + the web connection
+    assert {r[10] for r in rows[1:]} == {"kubectl", "web"}
+    web_row = next(r for r in rows[1:] if r[10] == "web")
+    assert web_row[13] == WEB_PATH_SENTINEL
+    assert web_row[14] == "4"
+    assert web_row[15] == "WEB_APP"
+
+    assert kube_resp.status_code == 200
+    kube_rows = list(csv.reader(io.StringIO(kube_resp.text)))
+    assert len(kube_rows) == 2  # header + the one kubectl command
+    assert "shown-in-search" in kube_resp.text
+    assert WEB_PATH_SENTINEL not in kube_resp.text
+
+
+def test_search_by_system_and_user_under_kubectl_still_excludes_web_rows(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_kubectl_and_web_requests(app)
+        resp = client.get(
+            "/search?type=kubectl&window=all&system=shared.example.internal&user=user@example.com",
+            headers=_auth_header(),
+        )
+    assert resp.status_code == 200
+    assert "shown-in-search" in resp.text
+    assert WEB_PATH_SENTINEL not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Session 12 (web apps): the ``web`` search kind over HTTP (WEBAPP_SPEC §8.1-§8.7)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _web_client(tmp_path: Path, *, with_scenario: bool = False, settings: Settings | None = None):
+    """Yield ``(app, client)`` with :func:`build_web_scenario` loaded (plus the §12 scenario).
+
+    The web scenario's request time-of-day values are on 2026-10-01 (the fixture day),
+    so every search uses no window (all time) unless a test says otherwise.
+    """
+    from tests.fixtures.timeline import build_scenario, build_web_scenario
+
+    app = create_app(settings or _settings(tmp_path))
+    with TestClient(app) as client:
+        if with_scenario:
+            asyncio.run(build_scenario(app.state.db))
+        asyncio.run(build_web_scenario(app.state.db))
+        yield app, client
+
+
+def _web_start_ids() -> dict[str, str]:
+    """Start (first) request id → connection id for the web scenario."""
+    from tests.fixtures.timeline import WEB_START_IDS
+
+    return {rid: conn for conn, rid in WEB_START_IDS.items()}
+
+
+def _web_blocks(body: str) -> dict[str, str]:
+    """Map connection id → its web ``<tbody class="result">`` block on a results page.
+
+    Rows are identified by their Focus link (``/search?cmd=<start request id>``), which
+    is omitted only on a ``cmd=`` focus page (use :func:`_blocks` there).
+    """
+    by_start = _web_start_ids()
+    out: dict[str, str] = {}
+    for block in _blocks(body):
+        if 'class="pill pill-web"' not in block:
+            continue
+        match = re.search(r'href="/search\?cmd=([^"&]+)"', block)
+        assert match is not None, block[:300]
+        out[by_start[match.group(1)]] = block
+    return out
+
+
+def _web_ids_in(client: TestClient, url: str) -> set[str]:
+    """Connection ids of every web row on every page of ``url`` (walks Next links)."""
+    found: set[str] = set()
+    for body in _walk_pages(client, url):
+        found |= set(_web_blocks(body))
+    return found
+
+
+def _cell_text(fragment: str) -> str:
+    """Visible text of an HTML fragment (tags dropped, entities unescaped, spaces collapsed)."""
+    return re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
+
+ALL_WEB_CONNS = {"wc-h", "wc-a", "wc-j", "wc-b", "wc-c", "wc-d", "wc-e", "wc-f", "wc-i", "wc-k", "wc-g"}
+
+
+def test_search_type_web_lists_one_row_per_connection_newest_first(tmp_path: Path) -> None:
+    """``type=web`` lists every web connection once, by first-request time, newest first."""
+    with _web_client(tmp_path) as (_app, client):
+        bodies = _walk_pages(client, "/search?type=web&page_size=3")
+    assert len(bodies) == 4  # 11 connections, 3 per page
+    seen: list[str] = []
+    times: list[str] = []
+    for body in bodies:
+        blocks = _blocks(body)
+        assert all('class="pill pill-web"' in b for b in blocks)
+        seen += list(_web_blocks(body))
+        times += [_block_at(b) for b in blocks]
+    assert sorted(seen) == sorted(ALL_WEB_CONNS)
+    assert len(set(seen)) == len(seen)
+    assert times == sorted(times, reverse=True)
+    assert times[0] == "2026-10-01T23:59:00.000Z" and times[-1] == "2026-10-01T08:59:59.000Z"
+
+
+def test_search_web_row_for_an_exact_managed_app(tmp_path: Path) -> None:
+    """Managed ``exact`` row: kind pill, HTTPS badge, app name, managed pill, gateway-id title."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    block = blocks["wc-a"]
+    summary, _, detail = block.partition('<tr class="command-requests result-detail">')
+    assert '<span class="pill pill-web">Web connection</span>' in summary
+    assert re.search(r'<span class="pill pill-https" title="HTTPS \(configured\): [^"]*not proof', summary)
+    assert "marker" not in summary  # verify_full: no upstream marker
+    assert '<div class="web-app" title="gateway gw-aaa">' in summary
+    assert '<span class="dim">app:</span>' in summary
+    assert '<span class="app-name">Wiki Prod</span>' in summary
+    assert '<span class="pill pill-managed"' in summary and ">managed</span>" in summary
+    assert '<td class="mono"><a href="/systems/wiki.corp.internal">wiki.corp.internal</a></td>' in summary
+    assert "<a class=\"user-link\" href=\"/search?user=alice%40example.com\">alice@example.com</a>" in summary
+    # Primary request = the first POST; the row shows its method, stored URL, and status.
+    assert '<span class="method mono">POST</span>' in summary
+    assert '<span class="mono request-url">/login</span>' in summary
+    assert '<span class="status status-2xx">200</span>' in summary
+    assert "3 requests" in _cell_text(summary)
+    # Never a User-Agent or command label.
+    assert "Mozilla" not in block and "command-label" not in block
+    # Details: every request of the connection, in a native <details> (closed).
+    assert "<summary>Requests (3)</summary>" in detail
+    assert "<details>" in detail and "<details open>" not in detail
+    for url in ("/home", "/login", "/static/app.js"):
+        assert f'<td class="mono request-url">{url}</td>' in detail
+
+
+def test_search_web_row_visit_and_focus_links(tmp_path: Path) -> None:
+    """The Visit link carries the user key and the connection's own bounds; Focus carries ``cmd``."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    hrefs = _hrefs(blocks["wc-a"])
+    assert "/search?cmd=ww-a1" in hrefs
+    visit = [h for h in hrefs if "/web?" in h]
+    assert visit == [
+        "/systems/wiki.corp.internal/web?user=uid-alice"
+        "&from=2026-10-01T10%3A00%3A30.000Z&to=2026-10-01T10%3A00%3A32.000Z"
+    ]
+    # No stored gwops value (app, gateway id) ever appears in any href.
+    assert not any("Wiki" in h or "gw-aaa" in h for h in hrefs)
+
+
+def test_search_web_row_for_an_exact_unmanaged_app_with_upstream_marker(tmp_path: Path) -> None:
+    """Unmanaged ``exact`` row: ``unmanaged`` pill, parentheses in the name, CA-only marker."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    summary = blocks["wc-b"].partition('<tr class="command-requests')[0]
+    assert '<div class="web-app" title="gateway gw-bbb">' in summary
+    assert '<span class="app-name">Docs (beta)</span>' in summary
+    assert '<span class="pill pill-unmanaged"' in summary and ">unmanaged</span>" in summary
+    assert "pill-managed" not in summary
+    assert 'class="marker marker-info"' in summary and "CA-only upstream" in summary
+    # DELETE is the primary request (the first mutating method), not the earlier GET.
+    assert '<span class="method mono">DELETE</span>' in summary
+    assert '<span class="mono request-url">/items/42</span>' in summary
+
+
+def test_search_web_row_with_null_app_says_unnamed(tmp_path: Path) -> None:
+    """An ``exact`` snapshot with a NULL app shows the fixed ``(unnamed)`` label and keeps the pill."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    with _web_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wc-null-app", user_id="uid-x", username="x@example.com",
+            resource_address="unnamed.corp.internal", state="api", resource_type="WEB_APP",
+            gwops_match="exact", gwops_gateway_id="gw-n", gwops_app=None, gwops_managed=False,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "ww-null-1", conn_id="wc-null-app", requested_at=at("15:00:00.000"),
+            resource_address="unnamed.corp.internal", user_id="uid-x", username="x@example.com",
+            url="/", api_kind="web", kubectl_session=None, kubectl_command=None,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+        body = _get(client, "/search?type=web&system=unnamed.corp.internal").text
+    (block,) = _blocks(body)
+    assert '<div class="web-app" title="gateway gw-n">' in block
+    assert '<span class="app-name is-unnamed">(unnamed)</span>' in block
+    assert ">unmanaged</span>" in block
+
+
+def test_search_web_row_with_null_gateway_id_title_is_the_fixed_text(tmp_path: Path) -> None:
+    """gwops Mode B (NULL gateway id): the title is "gateway id not yet assigned"; row is in (unknown)."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    summary = blocks["wc-g"].partition('<tr class="command-requests')[0]
+    assert '<div class="web-app" title="gateway id not yet assigned">' in summary
+    assert '<span class="app-name">Legacy</span>' in summary
+    assert "None" not in summary
+    assert '<a href="/systems/_unknown">(unknown)</a>' in summary
+    # No username: the user key (the id) is the label.
+    assert "uid-dave" in summary
+
+
+@pytest.mark.parametrize("conn", ["wc-d", "wc-e", "wc-f", "wc-i"], ids=["none", "ambiguous", "absent", "no-conn-row"])
+def test_search_web_row_without_an_exact_match_shows_no_app_element(tmp_path: Path, conn: str) -> None:
+    """``none``, ``ambiguous``, absent, and connection-row-less rows carry no app element."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    summary = blocks[conn].partition('<tr class="command-requests')[0]
+    for absent in ("web-app", "app:", "app-name", "pill-managed", "pill-unmanaged", "gateway gw", "(unnamed)"):
+        assert absent not in summary, (conn, absent)
+    # The request line and the links are still there.
+    assert 'class="request-cell"' in summary and "web-row-link" in summary
+
+
+def test_search_web_row_tls_unknown_badge_for_none_ambiguous_and_absent(tmp_path: Path) -> None:
+    """Rows with no usable snapshot show ``TLS unknown`` and no upstream marker."""
+    with _web_client(tmp_path) as (_app, client):
+        blocks = _web_blocks(_get(client, "/search?type=web&page_size=200").text)
+    for conn in ("wc-d", "wc-e", "wc-f"):
+        cluster = re.search(r'<div class="badge-cluster">(.*?)</div>', blocks[conn], re.S)
+        assert cluster is not None
+        assert _cell_text(cluster.group(1)) == "Web connection TLS unknown"
+    # Configured modes (not the connection row) decide the badge of a row with a start-row snapshot.
+    cluster_h = re.search(r'<div class="badge-cluster">(.*?)</div>', blocks["wc-h"], re.S)
+    assert _cell_text(cluster_h.group(1)) == "Web connection HTTP ! Unverified upstream"
+
+
+def test_search_web_row_escapes_app_name_and_gateway_id_in_text_and_title(tmp_path: Path) -> None:
+    """HTML metacharacters and quotes in the app name and gateway id never become markup.
+
+    The gateway id is charset-restricted at ingest, so a hostile one cannot arrive
+    through ``/ingest``; it is stored directly here to prove the template escapes the
+    double-quoted ``title`` attribute regardless (WEBAPP_SPEC §8.5, §10).
+    """
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    app_name = "<img src=x onerror=alert(1)> \"q\" 'a' & </div>"
+    gateway = 'gw"><script>alert(2)</script>'
+    with _web_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wc-xss", user_id="uid-x", username="x@example.com",
+            resource_address="xss.corp.internal", state="api", resource_type="WEB_APP",
+            gwops_match="exact", gwops_gateway_id=gateway, gwops_app=app_name, gwops_managed=False,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "ww-xss-1", conn_id="wc-xss", requested_at=at("15:00:00.000"),
+            resource_address="xss.corp.internal", user_id="uid-x", username="x@example.com",
+            url="/", api_kind="web", kubectl_session=None, kubectl_command=None,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+        body = _get(client, "/search?type=web&system=xss.corp.internal").text
+    assert "<img src=x" not in body and "<script>alert" not in body
+    assert "onerror=alert(1)>" not in body
+    (block,) = _blocks(body)
+    title = re.search(r'<div class="web-app" title="([^"]*)">', block)
+    assert title is not None, "the title attribute was broken by a stored value"
+    assert html_lib.unescape(title.group(1)) == f"gateway {gateway}"
+    assert "&lt;script&gt;alert(2)&lt;/script&gt;" in block  # also escaped inside the attribute
+    name = re.search(r'<span class="app-name">(.*?)</span>', block, re.S)
+    assert name is not None
+    assert html_lib.unescape(name.group(1)) == app_name
+    assert "&lt;img src=x onerror=alert(1)&gt;" in name.group(1)
+
+
+def test_search_web_focus_banner_and_open_details(tmp_path: Path) -> None:
+    """``cmd=<request id>`` focuses one web connection: banner, clear link ``type=web``, open details."""
+    with _web_client(tmp_path) as (_app, client):
+        # Any request of the connection resolves to it (here the connection's LAST request).
+        focus = _get(client, "/search?cmd=ww-a3")
+        by_start = _get(client, "/search?cmd=ww-a1")
+    for resp in (focus, by_start):
+        assert resp.status_code == 200
+        blocks = _blocks(resp.text)
+        assert len(blocks) == 1
+        assert 'class="pill pill-web"' in blocks[0]
+        assert "<details open>" in blocks[0]
+        assert "Showing one web connection" in resp.text
+        assert "Showing one kubectl command" not in resp.text
+        banner = re.search(r'<p class="notice notice-focus">(.*?)</p>', resp.text, re.S)
+        assert banner is not None
+        assert 'href="/search?type=web"' in banner.group(1)
+        assert "Command or web connection not found" not in resp.text
+        # The row itself no longer offers a Focus link (it is the focus), but keeps Visit.
+        assert ">Focus" not in blocks[0] and "Visit" in blocks[0]
+        assert '<span class="app-name">Wiki Prod</span>' in blocks[0]
+
+
+def test_search_cmd_focus_on_a_web_request_hides_the_recording_exclusion_notice(
+    tmp_path: Path,
+) -> None:
+    """``cmd`` excludes the recording kinds, but under a focus that notice is not listed."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, "/search?cmd=ww-b2")
+    assert resp.status_code == 200
+    assert len(_blocks(resp.text)) == 1 and "Docs (beta)" in resp.text
+    assert "not searched" not in resp.text
+
+
+def test_search_any_interleaves_web_rows_with_other_kinds(tmp_path: Path) -> None:
+    """``type=any`` merges web rows by time with recordings and kubectl commands."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, "/search?page_size=200")
+    blocks = _blocks(resp.text)
+    kinds = set(re.findall(r'class="pill (pill-(?:ssh|exec|failed|kubectl|web))"', resp.text))
+    assert kinds == {"pill-ssh", "pill-exec", "pill-failed", "pill-kubectl", "pill-web"}
+    times = [_block_at(b) for b in blocks]
+    assert times == sorted(times, reverse=True)
+    web = _web_blocks(resp.text)
+    assert set(web) == ALL_WEB_CONNS
+    kinds_in_order = [re.search(r'class="pill (pill-[a-z]+)"', b).group(1) for b in blocks]
+    first_web = kinds_in_order.index("pill-web")
+    last_web = len(kinds_in_order) - 1 - kinds_in_order[::-1].index("pill-web")
+    # A genuine merge: other kinds sit between the first and the last web row.
+    assert any(k != "pill-web" for k in kinds_in_order[first_web:last_web])
+
+
+def test_search_web_rows_are_absent_under_every_other_type(tmp_path: Path) -> None:
+    """Web rows only appear under ``web`` and ``any``: not ``recordings``, ``ssh``, ``exec``, ``failed``, ``kubectl``."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        bodies = {
+            t: _get(client, f"/search?type={t}&page_size=200").text
+            for t in ("recordings", "ssh", "exec", "failed", "kubectl")
+        }
+    for t, body in bodies.items():
+        assert 'class="pill pill-web"' not in body, t
+        assert "/zebra-path" not in body and "/wiki/start" not in body, t
+
+
+# --- scheme / upstream filters ---------------------------------------------------------
+
+SCHEME_EXPECTED = {
+    "https": {"wc-a", "wc-j", "wc-b", "wc-i", "wc-k", "wc-g"},
+    "http": {"wc-h", "wc-c"},
+    "unknown": {"wc-d", "wc-e", "wc-f"},
+}
+UPSTREAM_EXPECTED = {
+    "verified": {"wc-a", "wc-i", "wc-k"},
+    "ca_only": {"wc-b"},
+    "unverified": {"wc-h", "wc-j"},
+    "plaintext": {"wc-c", "wc-g"},
+    "unknown": {"wc-d", "wc-e", "wc-f"},
+}
+
+
+@pytest.mark.parametrize("value", sorted(SCHEME_EXPECTED))
+def test_search_scheme_filter_matches_the_start_rows_configured_client_tls(
+    tmp_path: Path, value: str
+) -> None:
+    """``scheme`` filters on the connection's START row: https = tls13, http = none, unknown = NULL.
+
+    ``wc-k``'s second request differs (``none``), but its start row says ``tls13``.
+    """
+    with _web_client(tmp_path) as (_app, client):
+        got = _web_ids_in(client, f"/search?type=web&scheme={value}&page_size=2")
+    assert got == SCHEME_EXPECTED[value]
+
+
+@pytest.mark.parametrize("value", sorted(UPSTREAM_EXPECTED))
+def test_search_upstream_filter_matches_the_start_rows_configured_upstream_tls(
+    tmp_path: Path, value: str
+) -> None:
+    """``upstream``: verified = verify_full, ca_only = verify_ca, unverified = insecure, plaintext = none."""
+    with _web_client(tmp_path) as (_app, client):
+        got = _web_ids_in(client, f"/search?type=web&upstream={value}&page_size=2")
+    assert got == UPSTREAM_EXPECTED[value]
+
+
+def test_search_scheme_and_upstream_combine_with_and(tmp_path: Path) -> None:
+    """Both filters at once keep only connections matching both."""
+    with _web_client(tmp_path) as (_app, client):
+        both = _web_ids_in(client, "/search?type=web&scheme=https&upstream=plaintext")
+        none = _web_ids_in(client, "/search?type=web&scheme=http&upstream=verified")
+        unknown_both = _web_ids_in(client, "/search?type=web&scheme=unknown&upstream=unknown")
+    assert both == {"wc-g"}
+    assert none == set()
+    assert unknown_both == {"wc-d", "wc-e", "wc-f"}
+
+
+def test_search_scheme_filter_combines_with_system_user_and_text(tmp_path: Path) -> None:
+    """The TLS filters narrow, never widen, the existing system / user / text filters."""
+    with _web_client(tmp_path) as (_app, client):
+        wiki_https = _web_ids_in(
+            client, "/search?type=web&scheme=https&system=wiki.corp.internal"
+        )
+        bob_ca = _web_ids_in(client, "/search?type=web&upstream=ca_only&user=bob%40example.com")
+        zebra_unknown = _web_ids_in(client, "/search?type=web&scheme=unknown&q=zebra")
+        zebra_https = _web_ids_in(client, "/search?type=web&scheme=https&q=zebra")
+    assert wiki_https == {"wc-a", "wc-j", "wc-b", "wc-i", "wc-k"}
+    assert bob_ca == {"wc-b"}
+    assert zebra_unknown == {"wc-f"}
+    assert zebra_https == set()
+
+
+@pytest.mark.parametrize(
+    ("query", "name", "echo"),
+    [
+        ("scheme=SENTINELBAD", "scheme", "SENTINELBAD"),
+        ("scheme=HTTPS", "scheme", "HTTPS"),
+        ("scheme=tls13", "scheme", "tls13"),
+        ("upstream=SENTINELBAD", "upstream", "SENTINELBAD"),
+        ("upstream=verify_full", "upstream", "verify_full"),
+        ("scheme=https&scheme=http", "scheme", "https"),
+        ("upstream=verified&upstream=plaintext", "upstream", "plaintext"),
+    ],
+)
+def test_search_invalid_or_repeated_scheme_and_upstream_are_400(
+    tmp_path: Path, query: str, name: str, echo: str
+) -> None:
+    """Invalid, wrong-case, raw-mode, or repeated values: 400 naming the parameter, never the value."""
+    with _web_client(tmp_path) as (_app, client):
+        page = _get(client, f"/search?type=web&{query}")
+        partial = _get(client, f"/search?type=web&{query}", **{"HX-Request": "true"})
+        csv_resp = _export(client, f"type=web&{query}")
+    for resp in (page, partial, csv_resp):
+        assert resp.status_code == 400, query
+        assert f"'{name}'" in html_lib.unescape(resp.text), query
+        assert echo not in resp.text, f"{query} echoed {echo}"
+    assert "detail" in page.json() and "detail" in csv_resp.json()
+    assert "<html" not in partial.text.lower()
+
+
+def test_search_blank_scheme_and_upstream_mean_any(tmp_path: Path) -> None:
+    """The form submits ``scheme=&upstream=`` for "Any": blank values are no filter, not a 400."""
+    with _web_client(tmp_path) as (_app, client):
+        blank = _web_ids_in(client, "/search?type=web&scheme=&upstream=")
+    assert blank == ALL_WEB_CONNS
+
+
+def test_search_any_with_scheme_excludes_other_kinds_with_a_notice(tmp_path: Path) -> None:
+    """``type=any&scheme=http``: only web rows, and one notice naming the skipped kinds and filter."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, "/search?type=any&scheme=http&page_size=200")
+    assert resp.status_code == 200
+    web = _web_blocks(resp.text)
+    assert set(web) == SCHEME_EXPECTED["http"]
+    assert len(_blocks(resp.text)) == len(web)  # nothing but web rows
+    notices = re.findall(r'<p class="notice"><span aria-hidden="true">ⓘ</span> (.*?)</p>', resp.text, re.S)
+    assert notices == [
+        "SSH sessions, kubectl exec recordings, Failed connections and kubectl commands "
+        "not searched: the HTTP/HTTPS filter applies to web connections only."
+    ]
+
+
+def test_search_upstream_filter_notice_names_the_upstream_label(tmp_path: Path) -> None:
+    """The ``upstream`` filter has its own notice wording (``Upstream TLS filter``)."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, "/search?upstream=verified&page_size=200")
+    assert "not searched: the Upstream TLS filter applies to web connections only." in resp.text
+    assert set(_web_blocks(resp.text)) == UPSTREAM_EXPECTED["verified"]
+
+
+@pytest.mark.parametrize("type_", ["kubectl", "recordings", "ssh", "exec", "failed"])
+def test_search_scheme_with_a_non_web_type_excludes_everything(tmp_path: Path, type_: str) -> None:
+    """A web-only filter with a type that cannot evaluate it: no type can be searched."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, f"/search?type={type_}&scheme=https")
+    assert resp.status_code == 200
+    assert "No type can be searched with these filters." in resp.text
+    assert _blocks(resp.text) == []
+
+
+def test_search_web_has_no_findings_so_finding_filters_return_no_web_rows(tmp_path: Path) -> None:
+    """Web evaluates the finding filters but has no rules: ``has_findings=true`` lists no web row."""
+    with _web_client(tmp_path) as (_app, client):
+        flagged = _get(client, "/search?type=web&has_findings=true")
+        severe = _get(client, "/search?type=web&severity=low")
+        unflagged = _web_ids_in(client, "/search?type=web&has_findings=false")
+    assert flagged.status_code == 200 and _blocks(flagged.text) == []
+    assert severe.status_code == 200 and _blocks(severe.text) == []
+    assert unflagged == ALL_WEB_CONNS
+
+
+def test_search_web_text_matches_the_stored_url_case_insensitively(tmp_path: Path) -> None:
+    """``q`` is a case-insensitive substring over the stored URL: unmasked path, masked query."""
+    from urllib.parse import quote
+
+    with _web_client(tmp_path) as (_app, client):
+        path_hit = _web_ids_in(client, "/search?type=web&q=ZEBRA-PATH")
+        deep_hit = _web_ids_in(client, "/search?type=web&q=static/app.js")
+        masked = _web_ids_in(client, "/search?type=web&q=" + quote("term=se…(9)"))
+        miss = _web_ids_in(client, "/search?type=web&q=nothing-matches-this")
+    assert path_hit == {"wc-f"}
+    assert deep_hit == {"wc-a"}  # a request that is not the connection's primary one
+    assert masked == {"wc-b"}
+    assert miss == set()
+
+
+def test_search_web_user_agent_is_never_rendered_or_searchable(tmp_path: Path) -> None:
+    """The stored User-Agent is not on any web row and ``q`` does not match it."""
+    from tests.fixtures.timeline import WEB_UA
+
+    with _web_client(tmp_path) as (_app, client):
+        page = _get(client, "/search?type=web&page_size=200")
+        by_ua = _get(client, "/search?type=web&q=Mozilla")
+    assert WEB_UA not in page.text and "Mozilla" not in page.text
+    assert _blocks(by_ua.text) == []
+
+
+def test_search_form_has_web_filters_block_with_both_selects(tmp_path: Path) -> None:
+    """The form carries a "Web filters (configured TLS)" block with two labelled selects."""
+    with _web_client(tmp_path) as (_app, client):
+        body = _get(client, "/search").text
+        open_body = _get(client, "/search?scheme=https").text
+    block = re.search(r'<details class="web-search-form-filters"( open)?>(.*?)</details>', body, re.S)
+    assert block is not None and block.group(1) is None  # closed when no web filter is set
+    assert "Web filters (configured TLS)" in block.group(2)
+    assert "Configured client TLS" in block.group(2) and "Configured upstream TLS" in block.group(2)
+    scheme = re.search(r'<select name="scheme">(.*?)</select>', block.group(2), re.S)
+    upstream = re.search(r'<select name="upstream">(.*?)</select>', block.group(2), re.S)
+    assert scheme is not None and upstream is not None
+    opts = lambda s: re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', s.group(1))  # noqa: E731
+    assert opts(scheme) == [("", "Any"), ("https", "HTTPS"), ("http", "HTTP"), ("unknown", "Unknown")]
+    assert opts(upstream) == [
+        ("", "Any"), ("verified", "Verified"), ("ca_only", "CA only"),
+        ("unverified", "Unverified"), ("plaintext", "Plaintext"), ("unknown", "Unknown"),
+    ]
+    # It opens, and the chosen value is sticky, when a web filter is active.
+    assert re.search(r'<details class="web-search-form-filters" open>', open_body)
+    assert '<option value="https" selected>HTTPS</option>' in open_body
+
+
+def test_search_form_keeps_the_upstream_choice_sticky(tmp_path: Path) -> None:
+    """The upstream select shows the chosen value; Export CSV carries both filters."""
+    with _web_client(tmp_path) as (_app, client):
+        body = _get(client, "/search?type=web&scheme=http&upstream=plaintext").text
+    assert '<option value="plaintext" selected>Plaintext</option>' in body
+    assert '<option value="http" selected>HTTP</option>' in body
+    assert 'href="/search/export.csv?type=web&amp;scheme=http&amp;upstream=plaintext"' in body
+
+
+def test_search_web_cursor_pages_keep_the_filters_and_bind_the_kind_set(tmp_path: Path) -> None:
+    """A Next link under ``scheme`` carries it; the cursor binds the kind set and sort, not the values.
+
+    Same precedent as the other filters: a cursor replayed against a different TYPE is
+    a 400, while the filter values themselves are re-applied from the URL.
+    """
+    with _web_client(tmp_path) as (_app, client):
+        first = _get(client, "/search?type=web&scheme=https&page_size=2")
+        nxt = _next_href(first.text)
+        assert nxt is not None and "scheme=https" in nxt and "type=web" in nxt
+        other_kinds = _get(client, nxt.replace("type=web&scheme=https", "type=recordings"))
+        second = _get(client, nxt)
+    assert other_kinds.status_code == 400
+    assert second.status_code == 200
+    got = set(_web_blocks(first.text)) | set(_web_blocks(second.text))
+    assert got <= SCHEME_EXPECTED["https"] and len(got) == 4
+
+
+# --- Q19: a rejected gwops object looks exactly like an absent one ----------------------
+
+
+def _q19_lines(conn_id: str, request_id: str, requested_at: str, gwops: object | None) -> list[str]:
+    """One WEB_APP start line (``gwops`` omitted when ``None``) and one request line."""
+    ident = {"id": "u-q19", "username": "q19@example.com", "groups": []}
+    start: dict[str, object] = {
+        "logger": "gateway", "message": "Authenticated connection", "conn_id": conn_id,
+        "user": ident, "resource_type": "WEB_APP", "resource_address": "q19.corp.internal",
+    }
+    if gwops is not None:
+        start["gwops"] = gwops
+    audit = {
+        "logger": "gateway.audit", "message": "API request completed", "request_id": request_id,
+        "requested_at": requested_at, "method": "GET", "url": "/report?month=09", "conn_id": conn_id,
+        "user": ident, "request": {"headers": {"User-Agent": ["agent/1.0"]}},
+        "response": {"headers": {}, "status_code": 200},
+    }
+    return [json.dumps(start), json.dumps(audit)]
+
+
+_Q19_VALID = {
+    "schema": 1, "gateway_id": "gw-q19", "match": "exact", "app": "Q19 App", "managed": True,
+    "downstream_tls": "tls13", "downstream_port": 443, "upstream_tls": "verify_full", "upstream_port": 443,
+}
+Q19_REJECTED = {
+    "schema-2": {**_Q19_VALID, "schema": 2},
+    "not-an-object": "gwops-says-hello",
+    "bad-mode": {**_Q19_VALID, "downstream_tls": "TLS13"},
+    "bad-port": {**_Q19_VALID, "upstream_port": "443"},
+    "bad-gateway-id": {**_Q19_VALID, "gateway_id": "has space"},
+    "null": None,
+}
+
+
+def _ingest_q19(client: TestClient, app, gwops: object, *, null_key: bool = False) -> None:
+    """POST an absent-object connection and a rejected-object connection, then drain."""
+    absent = _q19_lines("q19-absent", "q19-req-a", "2026-10-01T10:00:00.000Z", None)
+    rejected = _q19_lines("q19-second", "q19-req-r", "2026-10-01T10:05:00.000Z", gwops)
+    if null_key:  # `"gwops": null` (key present, value null) must also read as absent
+        start = json.loads(rejected[0])
+        start["gwops"] = None
+        rejected[0] = json.dumps(start)
+    resp = client.post(
+        "/ingest", content="\n".join([*absent, *rejected]) + "\n",
+        headers={"Authorization": "Bearer ingest-token-q19", "Content-Type": "application/x-ndjson"},
+    )
+    assert resp.status_code == 204
+    client.portal.call(app.state.ingest_queue.join)
+
+
+def _normalize_q19(text: str) -> str:
+    """Strip everything that legitimately differs between the two connections."""
+    text = re.sub(r"\d{4}-\d{2}-\d{2}T[0-9A-Za-z%.:]+Z", "TS", text)
+    text = text.replace("q19-req-a", "REQ").replace("q19-req-r", "REQ")
+    text = text.replace("q19-absent", "CONN").replace("q19-second", "CONN")
+    text = text.replace("q19-abse", "CONN").replace("q19-seco", "CONN")  # the visit view's 8-char id
+    return text
+
+
+@pytest.mark.parametrize("name", sorted(Q19_REJECTED))
+def test_a_rejected_gwops_object_is_indistinguishable_from_an_absent_one_on_every_surface(
+    tmp_path: Path, name: str
+) -> None:
+    """Q19: page, row, visit, dashboard feed, and CSV show a rejected object exactly as an absent one.
+
+    Two connections on one system send identical traffic; one start line has no
+    ``gwops`` key, the other a rejected object. The system page's configuration block
+    groups them into ONE line (the same "No gwops data" configuration), their search
+    rows and CSV rows are equal after removing ids and times, and the word "reject" /
+    "invalid" appears nowhere.
+    """
+    settings = _settings(tmp_path).model_copy(update={"ingest_token": "ingest-token-q19"})
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _ingest_q19(client, app, Q19_REJECTED[name], null_key=name == "null")
+        search = _get(client, "/search?type=web&page_size=200")
+        system = _get(client, "/systems/q19.corp.internal?activity_before=2026-10-02T00:00:00Z")
+        dashboard = _get(client, "/dashboard?window=all")
+        csv_resp = _export(client, "type=web")
+        visit_urls = sorted({h for h in _hrefs(search.text) if "/web?" in h})
+        visits = [_get(client, u) for u in visit_urls]
+        rows_in_db = asyncio.run(
+            app.state.activity.gwops_for_connections(["q19-absent", "q19-second"])
+        )
+    # The stored snapshots are identical: no object, no TLS, no gateway id, no app.
+    assert rows_in_db["q19-absent"] == rows_in_db["q19-second"]
+    assert all(v is None for v in rows_in_db["q19-second"].model_dump().values())
+
+    blocks = _blocks(search.text)
+    assert len(blocks) == 2
+    # The final block of a page carries the page tail; cut each at its detail row.
+    first_block, second_block = (b.split("</details>")[0] for b in blocks)
+    assert _normalize_q19(first_block) == _normalize_q19(second_block)
+    assert "pill-tls-unknown" in first_block and "web-app" not in first_block
+
+    cfg = re.search(r'<section class="config-block".*?</section>', system.text, re.S)
+    assert cfg is not None
+    lines = re.findall(r'<li class="config-line">(.*?)</li>', cfg.group(0), re.S)
+    assert len(lines) == 1  # one configuration: the two connections are not told apart
+    assert "No gwops data on these connections" in _cell_text(lines[0])
+    assert "2 connections" in _cell_text(lines[0])
+
+    assert len(visits) == 2
+    for visit in visits:
+        assert visit.status_code == 200
+        vcfg = re.search(r'<section class="config-block".*?</section>', visit.text, re.S)
+        assert vcfg is not None and "No gwops data on these connections" in vcfg.group(0)
+        assert "1 connection" in _cell_text(vcfg.group(0))
+    assert _normalize_q19(visits[0].text.split("<h1")[1]) == _normalize_q19(visits[1].text.split("<h1")[1])
+
+    assert dashboard.text.count('class="pill pill-web"') == 2
+    feed_blocks = [b.split("</tbody>")[0] for b in _blocks(dashboard.text.split('id="feed-heading"')[1])]
+    assert len(feed_blocks) == 2
+    assert _normalize_q19(feed_blocks[0]) == _normalize_q19(feed_blocks[1])
+
+    rows = _csv_rows(csv_resp)
+    assert len(rows) == 3
+    first, second = (_normalize_q19(",".join(r)) for r in rows[1:])
+    assert first == second
+    for row in rows[1:]:
+        assert row[15:] == ["WEB_APP", "unknown", "unknown", "month=…(2)", "", "", ""]
+
+    for page in (search, system, dashboard, csv_resp, *visits):
+        assert not re.search(r"reject|invalid|malformed", page.text, re.I), page.url
+
+
+# --- Dashboard -------------------------------------------------------------------------
+
+
+def _db_scalar(app, sql: str) -> int:
+    """Run a one-value query on the app's database (inside ``with TestClient``)."""
+
+    async def run() -> int:
+        cursor = await app.state.db.execute(sql)
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0]
+
+    return asyncio.run(run())
+
+
+def _request_counts(body: str) -> int:
+    """Sum the ``N requests`` figures of every web row on a results page."""
+    return sum(int(n) for n in re.findall(r"(\d+) requests?\b", " ".join(
+        _cell_text(b.partition('<tr class="command-requests')[0]) for b in _blocks(body)
+        if 'class="pill pill-web"' in b
+    )))
+
+
+def test_dashboard_web_tile_counts_the_requests_of_its_linked_web_search(tmp_path: Path) -> None:
+    """The web tile equals the request total of the ``type=web`` rows it links to; kubectl excludes web."""
+    with _web_client(tmp_path, with_scenario=True) as (app, client):
+        body = _get(client, "/dashboard?window=all").text
+        tiles = _tiles(body)
+        web_url, web_value = tiles["Web requests"]
+        kube_url, kube_value = tiles["kubectl API requests"]
+        pages = _walk_pages(client, web_url)
+        kubectl_total = _db_scalar(app, "SELECT COUNT(*) FROM api_requests WHERE api_kind = 'kubectl'")
+        web_total = _db_scalar(app, "SELECT COUNT(*) FROM api_requests WHERE api_kind = 'web'")
+    assert web_url == "/search?type=web&window=all"
+    assert int(web_value) == web_total == 20
+    assert sum(_request_counts(p) for p in pages) == int(web_value)
+    assert sum(len(_web_blocks(p)) for p in pages) == len(ALL_WEB_CONNS)
+    # The kubectl tile counts kubectl rows only (web rows share the table but not the figure).
+    assert kube_url == "/search?type=kubectl&window=all"
+    assert int(kube_value) == kubectl_total
+    assert int(kube_value) != kubectl_total + web_total
+
+
+def test_dashboard_web_tile_is_windowed_on_requested_at(tmp_path: Path) -> None:
+    """A 7-day window excludes older web requests from the tile; ``all`` counts them."""
+    from datetime import datetime, timedelta, timezone
+
+    from tests.fixtures.timeline import add_connection, add_request
+
+    now = datetime.now(tz=timezone.utc)
+    recent = _ms(now - timedelta(days=1))
+    old = _ms(now - timedelta(days=60))
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        async def seed() -> None:
+            for conn, when, n in (("wc-recent", recent, 2), ("wc-old", old, 5)):
+                await add_connection(
+                    app.state.db, conn, user_id="uid-w", username="w@example.com",
+                    resource_address="dash.corp.internal", state="api", resource_type="WEB_APP",
+                )
+                for i in range(n):
+                    await add_request(
+                        app.state.db, f"{conn}-{i}", conn_id=conn, requested_at=when,
+                        resource_address="dash.corp.internal", user_id="uid-w",
+                        username="w@example.com", url=f"/p{i}", api_kind="web",
+                        kubectl_session=None, kubectl_command=None,
+                    )
+
+        asyncio.run(seed())
+        seven = _tiles(_get(client, "/dashboard?window=7").text)
+        everything = _tiles(_get(client, "/dashboard?window=all").text)
+    assert seven["Web requests"][1] == "2"
+    assert seven["Web requests"][0] == "/search?type=web&window=7"
+    assert everything["Web requests"][1] == "7"
+    assert seven["kubectl API requests"][1] == "0"
+
+
+def test_dashboard_feed_lists_web_rows_compactly(tmp_path: Path) -> None:
+    """The recent-activity feed includes web rows in compact form: Details link, no Focus, no request table."""
+    with _web_client(tmp_path) as (_app, client):
+        body = _get(client, "/dashboard?window=all").text
+    feed = _feed_blocks(body)
+    assert feed and all('class="pill pill-web"' in b for b in feed)
+    newest = feed[0]
+    assert "2026-10-01T23:59:00.000Z" in newest  # wc-g, the newest connection
+    assert '<span class="app-name">Legacy</span>' in newest
+    assert 'class="details-link"' in newest and "Details" in newest
+    assert ">Focus" not in newest
+    assert "command-requests" not in newest and "<details" not in newest
+    assert "/search?cmd=ww-g1" in _hrefs(newest)
+    assert len(feed) == 11  # all eleven connections fit in the 15-item feed
+
+
+def test_dashboard_web_tile_has_zero_and_card_when_there_is_no_web_data(tmp_path: Path) -> None:
+    """With no web rows the tile still renders (zero) and links to ``type=web``."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        tiles = _tiles(_get(client, "/dashboard").text)
+    assert tiles["Web requests"] == ("/search?type=web&window=30", "0")
+
+
+# --- CSV (22 columns per kind) -----------------------------------------------------------
+
+_CSV_SCHEME = {"tls13": "https", "none": "http", None: "unknown"}
+_CSV_UPSTREAM = {
+    "verify_full": "verified", "verify_ca": "ca_only", "insecure": "unverified",
+    "none": "plaintext", None: "unknown",
+}
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _expected_csv_row(conn: dict) -> list[str]:
+    """Independently derive the 22 CSV cells of a :data:`WEB_CONNECTIONS` entry (§8.7)."""
+    from tests.fixtures.timeline import at
+
+    reqs = conn["requests"]
+    primary = next((r for r in reqs if r[2].upper() in _MUTATING), reqs[0])
+    first, last = reqs[0], reqs[-1]
+    url = primary[3]
+    path, sep, query = url.partition("?")
+    gw = conn["gwops"]
+    has_row = conn.get("row", True)
+    match = gw[0] if (gw and has_row) else None
+    exact = match == "exact"
+    def secs(r: tuple[str, ...]) -> float:
+        h, m, s = r[1].split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    return [
+        str(conn["conn_id"]),
+        conn["user"][1] or "",
+        conn["system"] or "",
+        "",
+        at(first[1]),
+        at(last[1]),
+        str(round(secs(last) - secs(first), 3)),
+        "0",
+        "",
+        "",
+        "web",
+        "",
+        primary[2],
+        path,
+        str(len(reqs)),
+        "WEB_APP",
+        _CSV_SCHEME[conn["down"]],
+        _CSV_UPSTREAM[conn["up"]],
+        query if sep else "",
+        (gw[1] or "") if match is not None else "",
+        (gw[2] or "") if exact else "",
+        ("true" if gw[3] else "false") if exact else "",
+    ]
+
+
+def test_csv_web_rows_have_22_columns_matching_the_stored_data(tmp_path: Path) -> None:
+    """Every web connection exports 22 cells; 1–15 keep their meaning; 16–22 follow §8.7."""
+    from tests.fixtures.timeline import WEB_CONNECTIONS
+
+    with _web_client(tmp_path) as (_app, client):
+        resp = _export(client, "type=web")
+    assert resp.status_code == 200
+    rows = _csv_rows(resp)
+    assert rows[0] == CSV_HEADER and len(rows[0]) == 22
+    assert all(len(r) == 22 for r in rows)
+    got = {r[0]: r for r in rows[1:]}
+    assert set(got) == ALL_WEB_CONNS
+    for conn in WEB_CONNECTIONS:
+        assert got[str(conn["conn_id"])] == _expected_csv_row(conn), conn["conn_id"]
+    assert "x-gatorcast-truncated" not in resp.headers
+
+
+def test_csv_web_column_rules_spot_checks(tmp_path: Path) -> None:
+    """Spot-check each §8.7 rule against literal values (not derived from the fixture)."""
+    with _web_client(tmp_path) as (_app, client):
+        got = {r[0]: r for r in _csv_rows(_export(client, "type=web"))[1:]}
+    # exact + managed: scheme, upstream, gateway id, app, managed=true; kind web, command empty.
+    a = got["wc-a"]
+    assert a[10:15] == ["web", "", "POST", "/login", "3"]
+    assert a[3] == "" and a[7] == "0" and a[8] == "" and a[9] == ""
+    assert a[15:] == ["WEB_APP", "https", "verified", "", "gw-aaa", "Wiki Prod", "true"]
+    # exact + unmanaged -> managed=false; verify_ca -> ca_only; primary is the DELETE, no query.
+    assert got["wc-b"][12:14] == ["DELETE", "/items/42"]
+    assert got["wc-b"][15:] == ["WEB_APP", "https", "ca_only", "", "gw-bbb", "Docs (beta)", "false"]
+    # insecure -> unverified; none -> plaintext; http scheme.
+    assert got["wc-h"][16:19] == ["http", "unverified", ""]
+    assert got["wc-c"][15:] == ["WEB_APP", "http", "plaintext", "", "gw-ccc", "Grafana", "true"]
+    # none / ambiguous: gateway id only; unknown TLS.
+    assert got["wc-d"][15:] == ["WEB_APP", "unknown", "unknown", "", "gw-ddd", "", ""]
+    assert got["wc-e"][15:] == ["WEB_APP", "unknown", "unknown", "", "gw-eee", "", ""]
+    # absent object: everything gwops-derived is empty.
+    assert got["wc-f"][15:] == ["WEB_APP", "unknown", "unknown", "", "", "", ""]
+    # no connections row: the request row's configured modes still export, gwops cells are empty.
+    assert got["wc-i"][15:] == ["WEB_APP", "https", "verified", "", "", "", ""]
+    # exact with a NULL gateway id: the id cell is empty, app and managed are filled.
+    assert got["wc-g"][2] == ""  # the NULL system
+    assert got["wc-g"][15:] == ["WEB_APP", "https", "plaintext", "", "", "Legacy", "true"]
+
+
+def test_csv_web_query_column_is_the_masked_query_without_the_question_mark(tmp_path: Path) -> None:
+    """Column 19 is the primary request's stored query (masked values) minus ``?``; the path drops it."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    with _web_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wc-q", user_id="uid-q", username="q@example.com",
+            resource_address="query.corp.internal", state="api", resource_type="WEB_APP",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "ww-q1", conn_id="wc-q", requested_at=at("15:00:00.000"),
+            resource_address="query.corp.internal", user_id="uid-q", username="q@example.com",
+            url="/report?month=…(2)&token=ab…6(12)", api_kind="web", kubectl_session=None,
+            kubectl_command=None,
+        ))
+        resp = _export(client, "type=web&system=query.corp.internal")
+    (row,) = _csv_rows(resp)[1:]
+    assert row[13] == "/report"
+    assert row[18] == "month=…(2)&token=ab…6(12)"
+    assert "?" not in row[18]
+    # UTF-8, with the masking ellipsis intact and no byte-order mark (WEBAPP_SPEC Q12).
+    assert "…".encode() in resp.content
+    assert not resp.content.startswith(b"\xef\xbb\xbf")
+    assert resp.content.startswith(b"conn_id,")
+
+
+def test_csv_formula_guard_applies_to_the_gwops_and_query_columns(tmp_path: Path) -> None:
+    """An unmanaged app named ``=…`` (and ``+``/``-``/``@`` gateway ids, a ``-`` query) get a leading ``'``."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    cases = [
+        ("wc-eq", "=cmd|' /C calc'!A0", "gw-eq", "/p"),
+        ("wc-plus", "+SUM(1+1)", "+gw", "/p"),
+        ("wc-minus", "-2+3", "-gw", "/p?-key=…(3)"),
+        ("wc-at", "@SUM(A1)", "@gw", "/p"),
+    ]
+    with _web_client(tmp_path) as (app, client):
+        for i, (conn, app_name, gateway, url) in enumerate(cases):
+            asyncio.run(add_connection(
+                app.state.db, conn, user_id="uid-f", username="f@example.com",
+                resource_address="formula.corp.internal", state="api", resource_type="WEB_APP",
+                gwops_match="exact", gwops_gateway_id=gateway, gwops_app=app_name,
+                gwops_managed=False, downstream_tls="tls13", upstream_tls="verify_full",
+            ))
+            asyncio.run(add_request(
+                app.state.db, f"fx-{i}", conn_id=conn, requested_at=at(f"16:0{i}:00.000"),
+                resource_address="formula.corp.internal", user_id="uid-f", username="f@example.com",
+                url=url, api_kind="web", kubectl_session=None, kubectl_command=None,
+                downstream_tls="tls13", upstream_tls="verify_full",
+            ))
+        resp = _export(client, "type=web&system=formula.corp.internal")
+    got = {r[0]: r for r in _csv_rows(resp)[1:]}
+    assert got["wc-eq"][20] == "'=cmd|' /C calc'!A0" and got["wc-eq"][19] == "gw-eq"
+    assert got["wc-plus"][19:21] == ["'+gw", "'+SUM(1+1)"]
+    assert got["wc-minus"][19:21] == ["'-gw", "'-2+3"]
+    assert got["wc-minus"][18] == "'-key=…(3)"
+    assert got["wc-at"][19:21] == ["'@gw", "'@SUM(A1)"]
+    # Nothing in the export starts with a formula character.
+    for row in got.values():
+        for cell in row:
+            assert not cell.startswith(tuple(FORMULA_CHARS)), (row[0], cell)
+    # The managed column is the fixed word, never the raw integer.
+    assert {r[21] for r in got.values()} == {"false"}
+
+
+def test_csv_mixed_export_has_22_cells_for_every_kind(tmp_path: Path) -> None:
+    """``type=any`` mixes recordings, kubectl, and web rows, each 22 cells, with the right column 16."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        rows = _csv_rows(_export(client))
+    assert rows[0] == CSV_HEADER
+    assert all(len(r) == 22 for r in rows)
+    by_kind: dict[str, list[list[str]]] = {}
+    for row in rows[1:]:
+        by_kind.setdefault(row[10], []).append(row)
+    assert set(by_kind) == {"ssh", "exec", "failed", "kubectl", "web"}
+    for row in by_kind["kubectl"]:
+        assert row[15:] == ["KUBERNETES", *NO_WEB_CELLS]
+    for row in by_kind["web"]:
+        assert row[15] == "WEB_APP" and row[16] in {"https", "http", "unknown"}
+    for kind in ("ssh", "exec", "failed"):
+        for row in by_kind[kind]:
+            assert row[16:] == NO_WEB_CELLS  # recordings have no web cells (column 16 is their stored type)
+    assert len(by_kind["web"]) == len(ALL_WEB_CONNS)
+
+
+def test_csv_scheme_and_upstream_filters_apply_to_the_export(tmp_path: Path) -> None:
+    """The export follows the page: the same filters select the same connections."""
+    with _web_client(tmp_path) as (_app, client):
+        rows = _csv_rows(_export(client, "type=web&scheme=https&upstream=plaintext"))
+        any_rows = _csv_rows(_export(client, "scheme=http"))
+    assert [r[0] for r in rows[1:]] == ["wc-g"]
+    assert {r[0] for r in any_rows[1:]} == SCHEME_EXPECTED["http"]
+    assert {r[10] for r in any_rows[1:]} == {"web"}
+
+
+def test_csv_web_path_is_exported_unmasked_by_design(tmp_path: Path) -> None:
+    """Accepted risk (WEBAPP_SPEC 5.3 withdrawn, 10): a path token is exported in full; query values are not.
+
+    The CSV ``path`` column is the primary request's stored path. A password-reset style
+    path keeps its token verbatim (and the search row shows it too), while the same
+    request's query value stays masked.
+    """
+    from tests.fixtures.timeline import add_connection, add_request, at
+    from tests.samples import WEBAPP_PATH_TOKENS
+
+    token = WEBAPP_PATH_TOKENS[0]
+    with _web_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wc-token", user_id="uid-t", username="t@example.com",
+            resource_address="reset.corp.internal", state="api", resource_type="WEB_APP",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "ww-token-1", conn_id="wc-token", requested_at=at("15:00:00.000"),
+            resource_address="reset.corp.internal", user_id="uid-t", username="t@example.com",
+            url=f"/reset/{token}?next=/…(5)", api_kind="web", kubectl_session=None,
+            kubectl_command=None,
+        ))
+        csv_resp = _export(client, "type=web&system=reset.corp.internal")
+        page = _get(client, "/search?type=web&system=reset.corp.internal")
+    (row,) = _csv_rows(csv_resp)[1:]
+    assert row[13] == f"/reset/{token}"
+    assert row[18] == "next=/…(5)"
+    assert token in page.text
+
+
+def test_search_web_row_for_a_connection_with_no_user_uses_the_unknown_bucket(tmp_path: Path) -> None:
+    """No username and no user id: plain "(unknown user)" label, no user link, ``user=_unknown`` visit link."""
+    from tests.fixtures.timeline import add_request, at
+
+    with _web_client(tmp_path) as (app, client):
+        asyncio.run(add_request(
+            app.state.db, "ww-anon-1", conn_id="wc-anon", requested_at=at("15:30:00.000"),
+            resource_address="anon.corp.internal", url="/anon", api_kind="web",
+            kubectl_session=None, kubectl_command=None, user_agent=None,
+        ))
+        body = _get(client, "/search?type=web&system=anon.corp.internal").text
+        visit = re.search(r'href="(/systems/anon\.corp\.internal/web\?[^"]*)"', body)
+        assert visit is not None
+        visit_resp = _get(client, html_lib.unescape(visit.group(1)))
+    (block,) = _blocks(body)
+    summary = block.partition('<tr class="command-requests')[0]
+    assert "(unknown user)" in summary
+    assert "/search?user=" not in summary
+    assert "user=_unknown" in html_lib.unescape(visit.group(1))
+    assert visit_resp.status_code == 200 and "(unknown user)" in visit_resp.text
+
+
+# =============================================================================================
+# Session 12 fix loop (route level): F cursor errors, J no-detection notice, K scan-budget text,
+# N purged focus, O resolved kinds, P primary beyond 200, D display escaping, R fixed maps,
+# I unrecognised TLS in the CSV, and the coverage gaps (101 / failed primary rows).
+# =============================================================================================
+
+
+class _LogSpy:
+    """Stand-in for ``routes.log`` that records ``(event, kwargs)`` of every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def _record(self, event: str, **kw: object) -> None:
+        self.calls.append((event, kw))
+
+    debug = info = warning = error = exception = _record
+
+
+def _fresh_client(tmp_path: Path, *, raise_server_exceptions: bool = True):
+    """``(app, client)`` context manager over an empty app (seed inside the ``with``)."""
+
+    @contextlib.contextmanager
+    def cm():
+        app = create_app(_settings(tmp_path))
+        with TestClient(app, raise_server_exceptions=raise_server_exceptions) as client:
+            yield app, client
+
+    return cm()
+
+
+# --- F: only a cursor mismatch is a 400 -------------------------------------------------------------
+
+
+def test_search_tampered_cursor_is_a_400_for_full_page_and_htmx(tmp_path: Path) -> None:
+    """F: a cursor that does not decode, or decodes for another search, is a 400 (never a 500)."""
+    with _scenario_client(tmp_path) as (_app, client, _sc):
+        next_url = _next_href(_get(client, "/search?page_size=5").text)
+        assert next_url is not None
+        good = re.search(r"cursor=([^&]+)", next_url).group(1)
+        tampered = [good[:-9], "!!!not-a-cursor!!!", good[::-1]]
+        for cursor in tampered:
+            full = _get(client, f"/search?page_size=5&cursor={cursor}")
+            partial = _get(client, f"/search?page_size=5&cursor={cursor}", **{"HX-Request": "true"})
+            assert full.status_code == 400, cursor
+            assert partial.status_code == 400, cursor
+            assert "cursor" in partial.text
+        other = _get(client, f"/search?type=ssh&page_size=5&cursor={good}")
+    assert other.status_code == 400
+
+
+def test_search_engine_cursor_mismatch_is_a_400_and_is_logged_without_the_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F: ``run_timeline`` raising CursorMismatch (defense in depth) becomes a 400 + ``search.cursor_mismatch``."""
+    from gatorcast.store.timeline import CursorMismatch
+    from gatorcast.web import routes
+
+    spy = _LogSpy()
+    monkeypatch.setattr(routes, "log", spy)
+
+    async def boom(*args, **kwargs):
+        raise CursorMismatch("SENTINEL-CURSOR-VALUE")
+
+    monkeypatch.setattr(routes, "run_timeline", boom)
+    with _fresh_client(tmp_path) as (_app, client):
+        full = _get(client, "/search")
+        partial = _get(client, "/search", **{"HX-Request": "true"})
+    assert full.status_code == 400 and partial.status_code == 400
+    assert "SENTINEL-CURSOR-VALUE" not in full.text + partial.text
+    assert [c for c in spy.calls if c[0] == "search.cursor_mismatch"] == [("search.cursor_mismatch", {})] * 2
+    assert "SENTINEL-CURSOR-VALUE" not in repr(spy.calls)
+
+
+@pytest.mark.parametrize("headers", [{}, {"HX-Request": "true"}], ids=["full", "htmx"])
+def test_search_internal_value_error_is_a_500_not_a_400(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    """F: any other ValueError from the engine is an internal error: it must not read as a bad cursor."""
+    from gatorcast.web import routes
+
+    spy = _LogSpy()
+    monkeypatch.setattr(routes, "log", spy)
+
+    async def boom(*args, **kwargs):
+        raise ValueError("internal engine bug")
+
+    monkeypatch.setattr(routes, "run_timeline", boom)
+    with _fresh_client(tmp_path, raise_server_exceptions=False) as (_app, client):
+        resp = _get(client, "/search", **headers)
+    assert resp.status_code == 500
+    assert "search.cursor_mismatch" not in [c[0] for c in spy.calls]
+
+
+def test_search_export_does_not_catch_engine_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F: the CSV walk has no catch: even a CursorMismatch from the engine is a 500, never a false 400."""
+    from gatorcast.store.timeline import CursorMismatch
+    from gatorcast.web import routes
+
+    async def boom(*args, **kwargs):
+        raise CursorMismatch("engine bug")
+
+    monkeypatch.setattr(routes, "run_timeline", boom)
+    with _fresh_client(tmp_path, raise_server_exceptions=False) as (_app, client):
+        assert _get(client, "/search/export.csv").status_code == 500
+        # ... while a bad client cursor is still rejected before the walk starts.
+        assert _get(client, "/search/export.csv?cursor=!!!").status_code == 400
+
+
+# --- J: the no-detection notice for web ---------------------------------------------------------------
+
+NO_DETECTION = "Web connections are not evaluated by detection rules."
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "type=web&has_findings=true",
+        "type=any&has_findings=true",
+        "type=web&severity=high",
+        "type=any&max_severity=low",
+        "type=web&category=kube-api",
+        "type=any&rule_ids=recursive-delete",
+        "has_findings=true",
+    ],
+)
+def test_search_notes_that_web_is_not_evaluated_when_a_findings_filter_includes_web(
+    tmp_path: Path, query: str
+) -> None:
+    """J: a findings filter with web among the resolved kinds gets the fixed notice (once)."""
+    with _web_client(tmp_path) as (_app, client):
+        resp = _get(client, f"/search?{query}")
+    assert resp.status_code == 200
+    assert resp.text.count(NO_DETECTION) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "type=web",
+        "type=web&has_findings=false",
+        "type=kubectl&has_findings=true",
+        "type=recordings&has_findings=true",
+        "type=ssh&severity=high",
+        "type=any&has_findings=false",
+        "type=any",
+    ],
+)
+def test_search_does_not_note_web_detection_when_it_would_be_untrue_or_irrelevant(
+    tmp_path: Path, query: str
+) -> None:
+    """J: no notice for ``has_findings=false`` (web matches), for web-free kind sets, or without a filter."""
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        resp = _get(client, f"/search?{query}")
+    assert resp.status_code == 200
+    assert NO_DETECTION not in resp.text
+
+
+def test_search_cmd_focus_never_shows_the_no_detection_notice(tmp_path: Path) -> None:
+    """J: under a ``cmd`` focus the notice is not listed (the focus banner already narrows the page)."""
+    with _web_client(tmp_path) as (_app, client):
+        resp = _get(client, "/search?cmd=ww-a1&has_findings=true")
+    assert resp.status_code == 200
+    assert NO_DETECTION not in resp.text
+
+
+# --- K: the scan-budget text names the kind(s) --------------------------------------------------------
+
+
+def _seed_many_requests(app, n: int, *, api_kind: str, prefix: str) -> None:
+    """``n`` one-request connections of ``api_kind`` (distinct commands), oldest first."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    for i in range(n):
+        conn = f"{prefix}-{i}"
+        asyncio.run(add_connection(
+            app.state.db, conn, user_id="uid-k", username="k@example.com",
+            resource_address=f"{prefix}.corp.internal", state="api",
+            resource_type="WEB_APP" if api_kind == "web" else "KUBERNETES",
+        ))
+        asyncio.run(add_request(
+            app.state.db, f"{conn}-r", conn_id=conn, requested_at=at(f"10:0{i}:00.000"),
+            resource_address=f"{prefix}.corp.internal", user_id="uid-k", username="k@example.com",
+            api_kind=api_kind, kubectl_session=None if api_kind == "web" else f"ks-{conn}",
+            kubectl_command=None if api_kind == "web" else "kubectl get",
+        ))
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("type=kubectl", "Scanned 2 kubectl requests without filling the page."),
+        ("type=web", "Scanned 2 web requests without filling the page."),
+        ("type=any", "Scanned 2 kubectl requests and 2 web requests without filling the page."),
+    ],
+    ids=["kubectl", "web", "both"],
+)
+def test_search_scan_budget_text_names_the_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query: str, expected: str
+) -> None:
+    """K: the notice says which kind(s) the budget stopped (kubectl, web, or both)."""
+    from gatorcast.store import timeline
+
+    monkeypatch.setattr(timeline, "_API_SCAN_BUDGET", 2)
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_many_requests(app, 5, api_kind="kubectl", prefix="kk")
+        _seed_many_requests(app, 5, api_kind="web", prefix="ww")
+        resp = _get(client, f"/search?{query}&q=no-such-text-anywhere")
+    assert resp.status_code == 200
+    texts = [_cell_text(n) for n in re.findall(r'<p class="truncated-notice">(.*?)</p>', resp.text, re.S)]
+    assert expected in texts, texts
+    assert "Continue scanning ›" in resp.text
+
+
+def test_search_scan_budget_text_without_a_known_source_uses_the_generic_fallback() -> None:
+    """K: an unexpected source set reads the neutral per-kind text rather than guessing a kind."""
+    from gatorcast.web import routes
+
+    assert routes._SCAN_BUDGET_FALLBACK_TEXT.format(n=7) == "Scanned 7 requests per kind without filling the page."
+    assert routes._SCAN_BUDGET_TEXTS.get(frozenset({"sessions"}), routes._SCAN_BUDGET_FALLBACK_TEXT) == (
+        routes._SCAN_BUDGET_FALLBACK_TEXT
+    )
+
+
+# --- N: a focus that resolves but is purged before hydration ---------------------------------------
+
+
+@pytest.mark.parametrize("request_id", ["ww-a2", "r-c1-2"], ids=["web", "kubectl"])
+def test_search_focus_purged_before_hydration_shows_the_not_found_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request_id: str
+) -> None:
+    """N: resolved by the source, rows gone by hydration (retention): the not-found notice, no row."""
+    from gatorcast.store.timeline import ApiCommandSource
+
+    async def purged(self, ref):
+        return None
+
+    with _web_client(tmp_path, with_scenario=True) as (_app, client):
+        ok = _get(client, f"/search?cmd={request_id}")
+        assert ok.status_code == 200 and len(_blocks(ok.text)) == 1
+        monkeypatch.setattr(ApiCommandSource, "_hydrate_one", purged)
+        gone = _get(client, f"/search?cmd={request_id}")
+    assert gone.status_code == 200
+    assert _blocks(gone.text) == []
+    assert "Command or web connection not found. It may have been removed by retention." in gone.text
+    assert "Showing no command or web connection" in gone.text
+
+
+# --- O: the routes pass the resolved kinds to build_sources ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_names"),
+    [
+        ("/search?type=kubectl", {"api_commands"}),
+        ("/search?type=web", {"web_conns"}),
+        ("/search?type=ssh", {"sessions"}),
+        ("/search?type=any", {"sessions", "api_commands", "web_conns"}),
+        ("/search?type=any&scheme=https", {"web_conns"}),  # kubectl and recordings are excluded
+    ],
+)
+def test_search_builds_only_the_sources_of_the_resolved_kinds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str, expected_names: set[str]
+) -> None:
+    from gatorcast.web import routes
+
+    seen: list[set[str]] = []
+    real = routes.build_sources
+
+    def spy(db, casts, **kwargs):
+        sources = real(db, casts, **kwargs)
+        seen.append({s.name for s in sources})
+        return sources
+
+    monkeypatch.setattr(routes, "build_sources", spy)
+    with _fresh_client(tmp_path) as (_app, client):
+        assert _get(client, url).status_code == 200
+    assert seen == [expected_names]
+
+
+def test_dashboard_feed_builds_every_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from gatorcast.web import routes
+
+    seen: list[set[str]] = []
+    real = routes.build_sources
+
+    def spy(db, casts, **kwargs):
+        sources = real(db, casts, **kwargs)
+        seen.append({s.name for s in sources})
+        return sources
+
+    monkeypatch.setattr(routes, "build_sources", spy)
+    with _fresh_client(tmp_path) as (_app, client):
+        assert _get(client, "/dashboard").status_code == 200
+    assert seen == [{"sessions", "api_commands", "web_conns"}]
+
+
+def test_pick_label_is_public_on_the_activity_module() -> None:
+    """O: the timeline recomputes labels through the public helper."""
+    from gatorcast.pipeline import activity
+    from gatorcast.store import timeline
+
+    assert activity.pick_label is timeline.pick_label
+    assert "_pick_label" not in vars(activity)
+
+
+# --- P: a primary request beyond the first 200 rows, on the search row and in the CSV -------------
+
+
+def _seed_long_connection_rows(app, *, api_kind: str, conn_id: str, address: str, delete_at: int) -> None:
+    """250 requests one second apart; GET everywhere except a DELETE at index ``delete_at``."""
+    from tests.fixtures.timeline import add_connection, add_request
+
+    web = api_kind == "web"
+    asyncio.run(add_connection(
+        app.state.db, conn_id, user_id="uid-long", username="long@example.com", resource_address=address,
+        state="api", resource_type="WEB_APP" if web else "KUBERNETES",
+    ))
+
+    async def rows() -> None:
+        for i in range(250):
+            await add_request(
+                app.state.db, f"{conn_id}-{i:03d}", conn_id=conn_id,
+                requested_at=f"2026-10-02T09:{i // 60:02d}:{i % 60:02d}.000Z", resource_address=address,
+                user_id="uid-long", username="long@example.com",
+                method="DELETE" if i == delete_at else "GET",
+                url=f"/items/{i:03d}" if web else f"/api/v1/namespaces/default/pods/p{i:03d}",
+                api_kind=api_kind, commit=False,
+                kubectl_session=None if web else f"ks-{conn_id}",
+                kubectl_command=None if web else "kubectl get",
+            )
+        await app.state.db.commit()
+
+    asyncio.run(rows())
+
+
+def test_search_web_row_shows_a_primary_delete_beyond_the_listed_rows(tmp_path: Path) -> None:
+    """P: 250-request web connection, first DELETE at #230: counts, primary, notice, Visit link, CSV."""
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_long_connection_rows(app, api_kind="web", conn_id="wlong", address="long.corp.internal", delete_at=230)
+        page = _get(client, "/search?type=web")
+        csv_resp = _get(client, "/search/export.csv?type=web")
+    (block,) = _blocks(page.text)
+    summary, _, detail = block.partition('<tr class="command-requests result-detail">')
+    assert '<span class="method mono">DELETE</span>' in summary
+    assert '<span class="mono request-url">/items/230</span>' in summary
+    assert "250 requests" in _cell_text(summary)
+    assert "<summary>Requests (200)</summary>" in detail
+    assert "First 200 of 250 requests — open the visit view for all." in detail
+    assert '<td class="mono request-url">/items/230</td>' not in detail  # past the listed rows
+    visit = [h for h in _hrefs(block) if "/web?" in h]
+    assert visit == [
+        "/systems/long.corp.internal/web?user=uid-long"
+        "&from=2026-10-02T09%3A00%3A00.000Z&to=2026-10-02T09%3A04%3A09.000Z"
+    ]
+    (row,) = _csv_rows(csv_resp)[1:]
+    assert (row[10], row[12], row[13], row[14]) == ("web", "DELETE", "/items/230", "250")
+
+
+def test_search_kubectl_row_shows_a_primary_delete_beyond_the_listed_rows(tmp_path: Path) -> None:
+    """P (kubectl): the same, with the activity-view link in the notice."""
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_long_connection_rows(
+            app, api_kind="kubectl", conn_id="klong", address="klong.example.internal", delete_at=230
+        )
+        page = _get(client, "/search?type=kubectl")
+        csv_resp = _get(client, "/search/export.csv?type=kubectl")
+    (block,) = _blocks(page.text)
+    summary, _, detail = block.partition('<tr class="command-requests result-detail">')
+    assert '<span class="method mono">DELETE</span>' in summary
+    assert '<span class="mono request-url">/api/v1/namespaces/default/pods/p230</span>' in summary
+    assert "250 requests" in _cell_text(summary)
+    assert "First 200 of 250 requests — open the activity view for all." in detail
+    (row,) = _csv_rows(csv_resp)[1:]
+    assert (row[10], row[12], row[13], row[14]) == (
+        "kubectl", "DELETE", "/api/v1/namespaces/default/pods/p230", "250"
+    )
+
+
+# --- D: display escaping of control / format / separator characters --------------------------------
+
+RLO = "‮"
+ZWSP = "​"
+BIDI_PATH = f"/doc{RLO}/evil\tpath{ZWSP}end"
+BIDI_SHOWN = "/doc%E2%80%AE/evil%09path%E2%80%8Bend"
+
+
+def _seed_bidi_rows(app) -> None:
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    asyncio.run(add_connection(
+        app.state.db, "wb-1", user_id="uid-d", username="d@example.com", resource_address="bidi.corp.internal",
+        state="api", resource_type="WEB_APP", gwops_match="exact", gwops_gateway_id="gw-d",
+        gwops_app="Bidi", gwops_managed=True, downstream_tls="tls13", upstream_tls="verify_full",
+    ))
+    for i, url in enumerate((BIDI_PATH, "/plain")):
+        asyncio.run(add_request(
+            app.state.db, f"wb-r{i}", conn_id="wb-1", requested_at=at(f"09:00:0{i}.000"),
+            resource_address="bidi.corp.internal", user_id="uid-d", username="d@example.com",
+            method="DELETE" if i == 0 else "GET", url=url, api_kind="web", user_agent=None,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+    for i, url in enumerate((f"/api/v1/namespaces/x/pods/a{RLO}b\tc{ZWSP}d", "/api/v1/pods")):
+        asyncio.run(add_request(
+            app.state.db, f"kb-r{i}", conn_id="kb-1", requested_at=at(f"10:00:0{i}.000"),
+            resource_address="kbidi.example.internal", user_id="uid-d", username="d@example.com",
+            method="DELETE" if i == 0 else "GET", url=url, kubectl_session="ks-bidi",
+            kubectl_command="kubectl delete",
+        ))
+
+
+def _no_raw_format_chars(text: str) -> bool:
+    return RLO not in text and ZWSP not in text
+
+
+def test_search_percent_encodes_control_and_format_characters_in_displayed_urls(tmp_path: Path) -> None:
+    """D: U+202E, a tab and a zero-width space in a stored URL render percent-encoded (web and kubectl rows)."""
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_bidi_rows(app)
+        web = _get(client, "/search?type=web")
+        kube = _get(client, "/search?type=kubectl")
+    assert web.status_code == 200 and kube.status_code == 200
+    assert _no_raw_format_chars(web.text) and _no_raw_format_chars(kube.text)
+    (wblock,) = _blocks(web.text)
+    assert f'<span class="mono request-url">{BIDI_SHOWN}</span>' in wblock  # primary request
+    assert f'<td class="mono request-url">{BIDI_SHOWN}</td>' in wblock  # request table
+    assert "\t" not in re.search(r'<span class="mono request-url">(.*?)</span>', wblock).group(1)
+    (kblock,) = _blocks(kube.text)
+    shown = "/api/v1/namespaces/x/pods/a%E2%80%AEb%09c%E2%80%8Bd"
+    assert f'<span class="mono request-url">{shown}</span>' in kblock
+    assert f'<td class="mono request-url">{shown}' in kblock
+
+
+def test_dashboard_feed_percent_encodes_the_displayed_url(tmp_path: Path) -> None:
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_bidi_rows(app)
+        resp = _get(client, "/dashboard?window=all")
+    assert resp.status_code == 200
+    assert _no_raw_format_chars(resp.text)
+    assert BIDI_SHOWN in resp.text
+
+
+def test_csv_keeps_the_stored_value_of_a_url_with_control_and_format_characters(tmp_path: Path) -> None:
+    """D: the export is not display-escaped: it carries the stored path, passed through ``_csv_safe``."""
+    from gatorcast.web.routes import _csv_safe
+
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_bidi_rows(app)
+        resp = _get(client, "/search/export.csv?type=web")
+    (row,) = _csv_rows(resp)[1:]
+    assert row[13] == _csv_safe(BIDI_PATH) == BIDI_PATH
+    assert "%E2%80%AE" not in resp.text and "%09" not in resp.text
+
+
+def test_display_url_helper_encodes_only_control_format_and_separator_categories() -> None:
+    from gatorcast.web.routes import _display_url
+
+    assert _display_url(None) is None
+    assert _display_url("/plain/%41?a=b&c=d") == "/plain/%41?a=b&c=d"  # '%' and ordinary text untouched
+    assert _display_url("/é日本\U0001f600") == "/é日本\U0001f600"
+    assert _display_url("/a\nb\rc\x00d\x7fe") == "/a%0Ab%0Dc%00d%7Fe"  # Cc
+    assert _display_url("/a​b‏c‮d⁦e﻿") == (
+        "/a%E2%80%8Bb%E2%80%8Fc%E2%80%AEd%E2%81%A6e%EF%BB%BF"  # Cf
+    )
+    assert _display_url("/a b c") == "/a%E2%80%A8b%E2%80%A9c"  # Zl, Zp
+    assert _display_url("/a\u0085b") == "/a%C2%85b"  # NEL is Cc
+
+
+def test_css_isolates_the_stored_text_classes() -> None:
+    """D: the classes that wrap stored text carry ``unicode-bidi: isolate`` in app.css."""
+    css = (Path(__file__).parent.parent / "src" / "gatorcast" / "web" / "static" / "app.css").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"((?:\.[a-z-]+,\s*)+\.[a-z-]+)\s*\{[^}]*unicode-bidi:\s*isolate", css)
+    assert match is not None
+    selectors = {s.strip() for s in match.group(1).split(",")}
+    assert {".request-url", ".app-name", ".method", ".user-link", ".command-label", ".bar-label"} <= selectors
+
+
+# --- R: fixed maps for status and severity classes --------------------------------------------------
+
+HOSTILE_STATUS = 'x" onmouseover="alert(1)" data-x="'
+HOSTILE_SEVERITY = 'high" onclick="alert(2)" class="'
+
+
+def _seed_hostile_session(app) -> None:
+    async def run() -> None:
+        db = app.state.db
+        await db.execute(
+            "INSERT INTO sessions (conn_id, username, resource_address, started_at, duration_seconds, "
+            "chunk_count, cast_path, status, finding_count, max_severity, created_at) "
+            "VALUES ('hostile-1', 'h@example.com', 'hostile.corp.internal', '2026-10-01T09:00:00.000Z', 5, 1, "
+            "'/data/casts/hostile-1.cast', ?, 1, ?, datetime('now'))",
+            (HOSTILE_STATUS, HOSTILE_SEVERITY),
+        )
+        await db.execute(
+            "INSERT INTO findings (conn_id, rule_id, category, severity, label, offset_seconds) "
+            "VALUES ('hostile-1', 'r1', 'dangerous-command', ?, 'Hostile severity finding', 0.5)",
+            (HOSTILE_SEVERITY,),
+        )
+        await db.commit()
+
+    asyncio.run(run())
+
+
+def test_hostile_stored_status_and_severity_never_reach_a_class_or_label(tmp_path: Path) -> None:
+    """R: an unknown stored status reads ``unknown`` with ``pill-unknown``; an unknown severity is ``sev-none``."""
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_hostile_session(app)
+        pages = {
+            "search": _get(client, "/search?type=recordings"),
+            "session": _get(client, "/sessions/hostile-1"),
+            "system": _get(client, "/systems/hostile.corp.internal"),
+        }
+    for name, resp in pages.items():
+        assert resp.status_code == 200, name
+        body = resp.text
+        assert 'onmouseover="alert(1)"' not in body, name  # never an attribute of its own
+        assert 'onclick="alert(2)"' not in body, name
+        assert re.search(r'class="pill pill-unknown">unknown</span>', body), name
+        assert 'class="pill pill-complete"' not in body, name
+    assert 'class="sev sev-none"' in pages["session"].text
+    assert 'class="sev sev-none"' in pages["system"].text
+    assert "sev-high" not in pages["session"].text + pages["system"].text
+    # The search row never shows an unknown severity at all (``_safe_severity``).
+    assert "sev-high" not in pages["search"].text and "sev-none" not in pages["search"].text
+
+
+# --- I: CSV maps an unrecognised stored TLS mode to ``unknown`` -------------------------------------
+
+
+def test_csv_maps_unrecognised_tls_modes_to_unknown(tmp_path: Path) -> None:
+    """I: a stored mode outside the vocabulary exports as ``unknown`` (never the raw text)."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    with _fresh_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wt-1", user_id="uid-t", username="t@example.com", resource_address="tls.corp.internal",
+            state="api", resource_type="WEB_APP", gwops_match="exact", gwops_gateway_id="gw-t", gwops_app="T",
+            gwops_managed=True, downstream_tls="SENTINEL-DOWN", upstream_tls="SENTINEL-UP",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "wt-r0", conn_id="wt-1", requested_at=at("09:00:00.000"),
+            resource_address="tls.corp.internal", user_id="uid-t", username="t@example.com", api_kind="web",
+            user_agent=None, downstream_tls="SENTINEL-DOWN", upstream_tls="SENTINEL-UP",
+        ))
+        resp = _get(client, "/search/export.csv?type=web")
+    (row,) = _csv_rows(resp)[1:]
+    assert row[15] == "WEB_APP"
+    assert (row[16], row[17]) == ("unknown", "unknown")
+    assert "SENTINEL" not in resp.text
+
+
+# --- coverage gaps: a primary 101 (WebSocket) and a primary failed row ------------------------------
+
+
+def _seed_special_primary_rows(app) -> None:
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    for conn, address, status, outcome in (
+        ("w101", "ws.corp.internal", 101, "completed"),
+        ("wfail", "fail.corp.internal", None, "failed"),
+    ):
+        asyncio.run(add_connection(
+            app.state.db, conn, user_id="uid-s", username="s@example.com", resource_address=address,
+            state="api", resource_type="WEB_APP", downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+        asyncio.run(add_request(
+            app.state.db, f"{conn}-r0", conn_id=conn, requested_at=at("09:00:00.000"),
+            resource_address=address, user_id="uid-s", username="s@example.com", url="/socket",
+            api_kind="web", user_agent=None, status_code=status, outcome=outcome,
+            downstream_tls="tls13", upstream_tls="verify_full",
+        ))
+
+
+def test_search_web_row_with_a_101_primary_shows_the_websocket_label(tmp_path: Path) -> None:
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_special_primary_rows(app)
+        resp = _get(client, "/search?type=web&system=ws.corp.internal")
+    (block,) = _blocks(resp.text)
+    summary = block.partition('<tr class="command-requests result-detail">')[0]
+    assert '<span class="status status-1xx">101</span>' in summary
+    assert "WebSocket" in _cell_text(summary)
+    assert "outcome-failed" not in summary
+
+
+def test_search_web_row_with_a_failed_primary_is_marked_failed_with_no_status(tmp_path: Path) -> None:
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_special_primary_rows(app)
+        resp = _get(client, "/search?type=web&system=fail.corp.internal")
+    (block,) = _blocks(resp.text)
+    summary = block.partition('<tr class="command-requests result-detail">')[0]
+    assert '<tr class="result-row is-failed">' in summary
+    assert '<span class="outcome-failed">' in summary
+    assert "status-" not in summary  # no status chip for a failed request with no status
+    assert "WebSocket" not in summary
+
+
+def test_dashboard_feed_renders_a_101_and_a_failed_primary_web_row(tmp_path: Path) -> None:
+    with _fresh_client(tmp_path) as (app, client):
+        _seed_special_primary_rows(app)
+        resp = _get(client, "/dashboard?window=all")
+    assert resp.status_code == 200
+    assert '<span class="status status-1xx">101</span>' in resp.text and "WebSocket" in resp.text
+    assert '<span class="outcome-failed">' in resp.text
+    assert '<tr class="result-row is-failed">' in resp.text
+
+
+def test_search_web_row_marks_unrecognised_stored_tls_modes(tmp_path: Path) -> None:
+    """I: the search row (start row's modes) shows the fixed warning markers, never the stored text."""
+    from tests.fixtures.timeline import add_connection, add_request, at
+
+    with _fresh_client(tmp_path) as (app, client):
+        asyncio.run(add_connection(
+            app.state.db, "wu-1", user_id="uid-u", username="u@example.com", resource_address="u.corp.internal",
+            state="api", resource_type="WEB_APP", downstream_tls="SENTINEL-DOWN", upstream_tls="SENTINEL-UP",
+        ))
+        asyncio.run(add_request(
+            app.state.db, "wu-r0", conn_id="wu-1", requested_at=at("09:00:00.000"),
+            resource_address="u.corp.internal", user_id="uid-u", username="u@example.com", api_kind="web",
+            user_agent=None, downstream_tls="SENTINEL-DOWN", upstream_tls="SENTINEL-UP",
+        ))
+        resp = _get(client, "/search?type=web")
+    (block,) = _blocks(resp.text)
+    summary = block.partition('<tr class="command-requests result-detail">')[0]
+    assert "Unrecognised TLS mode" in _cell_text(summary)
+    assert "Unrecognised upstream TLS mode" in _cell_text(summary)
+    assert summary.count('class="marker marker-warn"') == 2
+    assert "SENTINEL" not in resp.text and "TLS unknown" not in summary

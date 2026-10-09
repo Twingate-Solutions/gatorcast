@@ -7,7 +7,70 @@ here — they live in the .cast file on the volume (CLAUDE.md rule 9).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+RESOURCE_TYPE_INVALID = "invalid"
+"""Stored ``connections.resource_type`` for a start line whose ``resource_type`` was
+present but unusable (WEBAPP_SPEC 4.1). Lower case, so it can never equal a real
+normalized value (those match ``[A-Z][A-Z0-9_]{0,31}``). It is a non-null,
+non-``KUBERNETES`` type: its requests are stored under the web policy with no rules.
+It is an internal marker: it is never copied to ``sessions.resource_type`` and is
+never shown as a type label."""
+
+
+class GwopsWebApp(BaseModel):
+    """Validated ``gwops`` object from a ``WEB_APP`` start line (WEBAPP_SPEC 3.3, 4.1).
+
+    Configured state as gwops read it when it shipped the line, not proof of a
+    negotiated TLS mode. Constructed only by ``classify._classify_gwops`` from
+    explicitly validated primitives; never built by ``model_validate`` on the raw
+    object. Invariant (held by the constructor, not re-checked here): for
+    ``match == "exact"`` the ``managed``, both TLS modes and both ports are non-null;
+    for ``none`` / ``ambiguous`` every field after ``gateway_id`` is ``None``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    match: Literal["exact", "none", "ambiguous"]
+    gateway_id: str | None
+    """Opaque Twingate gateway id; ``None`` in gwops Mode B before its first reconcile."""
+    app: str | None = None
+    """Display-only app name (``exact`` only); ``None`` when absent or when check 10 failed."""
+    managed: bool | None = None
+    downstream_tls: Literal["tls13", "none"] | None = None
+    downstream_port: int | None = None
+    upstream_tls: Literal["verify_full", "verify_ca", "insecure", "none"] | None = None
+    upstream_port: int | None = None
+
+
+class GwopsSnapshot(BaseModel):
+    """The per-connection ``gwops``/TLS snapshot as stored on ``connections``.
+
+    Mirrors the eight snapshot columns (WEBAPP_SPEC 3.3 "What is stored", 4.3).
+    Fixed on the first processing of the connection's start line and never
+    rewritten (first write wins). Configured state, not proof of a negotiated
+    mode. Every field is ``None`` for a connection with no valid object (TLS
+    unknown). Field types are plain strings and ints, not the contract ``Literal``
+    types: this is a read model over stored values and must not raise on a row
+    written by another version.
+
+    Never log an instance: ``gwops_app`` and ``gwops_gateway_id`` are never logged
+    (WEBAPP_SPEC 4.4).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    gwops_match: str | None = None
+    gwops_gateway_id: str | None = Field(default=None, repr=False)
+    gwops_app: str | None = Field(default=None, repr=False)
+    gwops_managed: bool | None = None
+    downstream_tls: str | None = None
+    downstream_port: int | None = None
+    upstream_tls: str | None = None
+    upstream_port: int | None = None
 
 
 class Session(BaseModel):
@@ -42,6 +105,11 @@ class Session(BaseModel):
     """How the row was last sealed: ``True`` terminally ("session finished" / close),
     ``False`` reopenably (idle backstop). ``None`` when not sealed, or sealed before
     this column existed (legacy; the assembler treats a sealed ``None`` as terminal).
+    """
+    resource_type: str | None = None
+    """Normalized Gateway ``resource_type`` copied from the connection at promote
+    (for example ``SSH``, ``KUBERNETES``), or ``None`` when unknown. Display and CSV
+    export detail only (WEBAPP_SPEC §8.7 column 16); never identity (CLAUDE.md rule 4).
     """
 
 
@@ -97,6 +165,22 @@ class SessionStart(BaseModel):
     set this; the legacy path derives shell_user from the asciicast header instead.
     """
     ts: str | None = None
+    resource_type: str | None = None
+    """Normalized Gateway ``resource_type`` (for example ``KUBERNETES``, ``WEB_APP``).
+
+    The raw value stripped and upper-cased, kept only when it fullmatches
+    ``[A-Z][A-Z0-9_]{0,31}``. ``None`` when the field is absent (treated as a
+    pre-upgrade Kubernetes connection) and always ``None`` for envelope-format
+    starts. :data:`RESOURCE_TYPE_INVALID` when the field is present but unusable
+    (not a string, or it fails the pattern): that is fail-closed like any other
+    non-Kubernetes type. Set by the legacy ``Authenticated connection`` branch only.
+    """
+    gwops: GwopsWebApp | None = None
+    """Validated ``gwops`` object, read only when ``resource_type == "WEB_APP"``.
+
+    ``None`` when the object is absent, rejected, or the connection is not a web app;
+    the rest of the event is identical in every one of those cases (TLS unknown).
+    """
 
 
 class SessionEnd(BaseModel):
@@ -136,6 +220,13 @@ class ApiRequest(BaseModel):
     method: str
     url: str
     """Sanitized by ``classify._store_url`` (exec/attach query stripped)."""
+    url_web: str
+    """Web-policy storage form of the same raw URL (``webmask.store_web_url``).
+
+    Normalized path, masked query values. Chosen over ``url`` by the assembler for
+    ``WEB_APP`` (and any other non-Kubernetes) connections. Required: ``classify``
+    always sets it, and a hand-built request must say which form it carries.
+    """
     status_code: int | None = None
     outcome: str = "completed"
     """``"completed"`` or ``"failed"``."""

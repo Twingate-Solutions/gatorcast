@@ -17,7 +17,7 @@
 #}
 {% block title %}Session {{ session.conn_id }} · Gatorcast{% endblock %}
 
-{% from "_macros.html" import user_link %}
+{% from "_macros.html" import user_link, sev_cls, status_pill %}
 
 {% block head %}
   <link rel="stylesheet" href="/static/asciinema-player.css" />
@@ -48,7 +48,7 @@
     <dd class="mono">{{ session.shell_user or "—" }}</dd>
 
     <dt>Status</dt>
-    <dd><span class="pill pill-{{ session.status }}">{{ "in progress" if session.status == "provisional" else session.status }}</span></dd>
+    <dd>{{ status_pill(session.status) }}</dd>
 
     <dt>Started</dt>
     <dd class="dim">{{ session.started_at or "—" }}</dd>
@@ -84,7 +84,7 @@
       <ul class="finding-list">
         {% for f in findings %}
           <li class="finding-row" data-offset="{{ f.offset_seconds if f.offset_seconds is not none else '' }}">
-            <span class="sev sev-{{ f.severity }}">{{ f.severity }}</span>
+            <span class="sev {{ sev_cls(f.severity) }}">{{ f.severity }}</span>
             <span class="finding-label">{{ f.label }}</span>
             {% if f.offset_seconds is not none %}
               <a class="jump" href="#t={{ f.offset_seconds }}" data-offset="{{ f.offset_seconds }}">
@@ -140,7 +140,7 @@
         }
 
         var player = AsciinemaPlayer.create(
-          "/sessions/{{ session.conn_id }}/cast",
+          {{ ("/sessions/" ~ (session.conn_id | urlencode) ~ "/cast") | tojson }},
           document.getElementById("player"),
           opts
         );

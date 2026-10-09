@@ -1,5 +1,7 @@
 """Tests for plaintext extraction + char->time offset index."""
 
+import pytest
+
 from gatorcast.pipeline.extract import extract_plaintext, offset_at
 
 HEADER = '{"version":2,"width":80,"height":24,"timestamp":1700000000}\n'
@@ -38,3 +40,16 @@ def test_ignores_non_output_events():
     r = extract_plaintext(cast)
     assert "secret-keystroke" not in r.text
     assert "visible" in r.text
+
+
+# --- Known production bug (Session 12 review): extract_plaintext splits on str.splitlines() ---
+
+
+@pytest.mark.parametrize("raw", ["\u0085", " ", " "], ids=["NEL", "LS", "PS"])
+def test_extract_plaintext_keeps_an_event_that_holds_a_raw_unicode_line_separator(raw: str) -> None:
+    """The text of an event with one raw separator in its output is still extracted."""
+    import json
+
+    header = '{"version":2,"width":80,"height":24}\n'
+    cast = header + json.dumps([1.0, "o", f"rm -rf /etc{raw}x"], ensure_ascii=False) + "\n"
+    assert "rm -rf /etc" in extract_plaintext(cast).text

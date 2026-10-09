@@ -54,8 +54,11 @@ def extract_plaintext(cast_text: str) -> ExtractResult:
     parts: list[str] = []
     offsets: list[tuple[int, float]] = []
     pos = 0
-    for line in cast_text.splitlines():
-        line = line.strip()
+    # Split on "\n" only: str.splitlines() also breaks on U+0085, U+2028, U+2029 and
+    # \v, \f, \x1c-\x1e, which can sit raw inside an event's JSON string and would
+    # drop that event from search and detection.
+    for line in cast_text.split("\n"):
+        line = line.removesuffix("\r").strip()
         if not line or not line.startswith("["):
             continue
         try:

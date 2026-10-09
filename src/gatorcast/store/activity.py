@@ -3,7 +3,7 @@
 Raw, parameterized SQL over three tables (see ``gatorcast.db``):
 
   * ``connections``  — hidden per-``conn_id`` state (``pending | recording | api |
-    error``). An ``Authenticated connection`` line creates a *pending* connection
+    error | empty``) plus the Gateway ``resource_type``. An ``Authenticated connection`` line creates a *pending* connection
     here instead of a visible ``sessions`` row (spec §6).
   * ``api_requests`` — one row of allowlisted metadata per Gateway API-request audit
     line, deduplicated by ``request_id`` (``INSERT OR IGNORE``) so at-least-once
@@ -31,16 +31,19 @@ to that exact format by :func:`to_requested_at_format`.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import aiosqlite
 
-from gatorcast.models import ApiRequest
+from gatorcast.models import ApiRequest, GwopsSnapshot, GwopsWebApp
 from gatorcast.pipeline.detect import Finding
 
 # Valid ``connections.state`` values (spec §5/§6).
-CONNECTION_STATES: frozenset[str] = frozenset({"pending", "recording", "api", "error"})
+CONNECTION_STATES: frozenset[str] = frozenset({"pending", "recording", "api", "error", "empty"})
+
+# Valid ``api_requests.api_kind`` values (WEBAPP_SPEC §4.2).
+API_KINDS: frozenset[str] = frozenset({"kubectl", "web"})
 
 # SQLite's default bound-parameter limit is 999 on older builds; stay well under it.
 _IN_CHUNK = 500
@@ -65,6 +68,20 @@ class ConnectionRow:
     has_api: bool
     created_at: str | None
     last_seen_at: str | None
+    resource_type: str | None = None
+    start_seen: bool = False
+    """True once an ``Authenticated connection`` line has been processed for this row."""
+    gwops_match: str | None = None
+    """``exact`` | ``none`` | ``ambiguous``, or ``None`` (absent, rejected, not a web app)."""
+    gwops_gateway_id: str | None = field(default=None, repr=False)
+    gwops_app: str | None = field(default=None, repr=False)
+    gwops_managed: bool | None = None
+    downstream_tls: str | None = None
+    """Configured client-facing TLS mode, or ``None`` (unknown). Copied onto web requests."""
+    downstream_port: int | None = None
+    upstream_tls: str | None = None
+    """Configured app-facing TLS mode, or ``None`` (unknown). Copied onto web requests."""
+    upstream_port: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +118,130 @@ class ApiFindingRow:
     created_at: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RequestStorage:
+    """The storage form chosen for one API request (WEBAPP_SPEC §4.4 policy table).
+
+    The assembler picks the policy from the connection row and passes the result
+    here; the store writes exactly these values and applies no policy of its own.
+    Every field is already allowlisted/masked by the classifier: ``url`` is
+    ``ApiRequest.url`` (Kubernetes form) or ``ApiRequest.url_web`` (web form).
+
+    Attributes:
+        api_kind: ``'kubectl'`` or ``'web'`` (stored on ``api_requests.api_kind``).
+        url: The URL form to store.
+        user_agent: ``User-Agent`` value, or ``None``.
+        kubectl_command: ``Kubectl-Command`` value, or ``None`` (always ``None`` for web).
+        kubectl_session: ``Kubectl-Session`` value, or ``None`` (always ``None`` for web).
+        downstream_tls: Connection's downstream TLS mode copied onto the row (web), or ``None``.
+        upstream_tls: Connection's upstream TLS mode copied onto the row (web), or ``None``.
+    """
+
+    api_kind: str
+    url: str
+    user_agent: str | None
+    kubectl_command: str | None
+    kubectl_session: str | None
+    downstream_tls: str | None = None
+    upstream_tls: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an unknown ``api_kind`` before it reaches the database."""
+        if self.api_kind not in API_KINDS:
+            raise ValueError(f"unknown api_kind: {self.api_kind!r}")
+
+    @classmethod
+    def kubectl(cls, req: ApiRequest) -> RequestStorage:
+        """Kubernetes-policy form: ``req.url`` and the three allowlisted headers, no TLS."""
+        return cls(
+            api_kind="kubectl",
+            url=req.url,
+            user_agent=req.user_agent,
+            kubectl_command=req.kubectl_command,
+            kubectl_session=req.kubectl_session,
+        )
+
+
+# The eight ``gwops``/TLS snapshot columns on ``connections`` (WEBAPP_SPEC §3.3), in
+# the order ``_gwops_values`` produces them and ``GwopsSnapshot`` declares them.
+_GWOPS_COLUMNS: tuple[str, ...] = (
+    "gwops_match",
+    "gwops_gateway_id",
+    "gwops_app",
+    "gwops_managed",
+    "downstream_tls",
+    "downstream_port",
+    "upstream_tls",
+    "upstream_port",
+)
+_GWOPS_COLUMN_LIST = ", ".join(_GWOPS_COLUMNS)
+
+# "First processing" of a start line (WEBAPP_SPEC §4.4): no start line has yet been
+# processed for this ``conn_id``. ``connections.start_seen`` is the marker (set by every
+# start line, never by the request path), so a start line that carried neither ``ts`` nor
+# ``resource_type`` still counts as processed. The ``started_at``/``resource_type`` NULL
+# test is kept for rows written before the marker existed: either column being non-NULL
+# marks such a row processed, and a row with none of the three is the minimal one
+# ``set_state`` inserts for a request that beat its start line. Every SET expression
+# reads the pre-update row, so assigning ``start_seen``/``started_at``/``resource_type``
+# in the same statement cannot change this test.
+_FIRST_PROCESSING_SQL = (
+    "connections.start_seen = 0 AND connections.started_at IS NULL "
+    "AND connections.resource_type IS NULL"
+)
+
+# First write wins (WEBAPP_SPEC §4.4): the snapshot is taken from the incoming line only
+# on the first processing of the start line.
+_GWOPS_FIRST_WRITE_SET =",\n                    ".join(
+    f"{col} = CASE WHEN {_FIRST_PROCESSING_SQL} THEN excluded.{col} ELSE connections.{col} END"
+    for col in _GWOPS_COLUMNS
+)
+
 _CONNECTION_COLUMNS = (
     "conn_id, user_id, username, resource_address, started_at, state, has_api, "
-    "created_at, last_seen_at"
+    "created_at, last_seen_at, resource_type, start_seen, " + _GWOPS_COLUMN_LIST
 )
+
+
+def _gwops_values(gwops: GwopsWebApp | None) -> tuple[object, ...]:
+    """Map a validated ``gwops`` object to the eight snapshot column values.
+
+    ``exact`` yields every field; ``none`` and ``ambiguous`` yield only the match and
+    gateway id (any app fields are never stored, even if the model carries them);
+    ``None`` yields all NULL.
+
+    Args:
+        gwops: The validated object from ``classify``, or ``None``.
+
+    Returns:
+        Values in :data:`_GWOPS_COLUMNS` order.
+    """
+    if gwops is None:
+        return (None,) * len(_GWOPS_COLUMNS)
+    if gwops.match != "exact":
+        return (gwops.match, gwops.gateway_id, None, None, None, None, None, None)
+    return (
+        gwops.match,
+        gwops.gateway_id,
+        gwops.app,
+        None if gwops.managed is None else int(gwops.managed),
+        gwops.downstream_tls,
+        gwops.downstream_port,
+        gwops.upstream_tls,
+        gwops.upstream_port,
+    )
+
+# Retention for ``connections`` (WEBAPP_SPEC §9): purge on last activity, not creation.
+# ``created_at <= last_seen_at`` always, so the ``created_at`` conjunct costs nothing
+# semantically and lets ``idx_connections_created`` bound the scan to old-created rows
+# (a MULTI-INDEX OR so a NULL ``created_at`` is still reachable); the remaining
+# predicates are evaluated on those rows only. ``idx_api_req_conn`` serves the NOT EXISTS.
+_PURGE_CONNECTIONS_SQL = """
+DELETE FROM connections
+WHERE (created_at < datetime(?1) OR created_at IS NULL)
+  AND COALESCE(last_seen_at, created_at) < datetime(?1)
+  AND NOT EXISTS (SELECT 1 FROM api_requests r WHERE r.conn_id = connections.conn_id)
+"""
 
 _REQUEST_COLUMNS = (
     "request_id, conn_id, resource_address, user_key, user_id, username, "
@@ -127,6 +264,30 @@ def _row_to_connection(row: aiosqlite.Row) -> ConnectionRow:
         has_api=bool(row["has_api"]),
         created_at=row["created_at"],
         last_seen_at=row["last_seen_at"],
+        resource_type=row["resource_type"],
+        start_seen=bool(row["start_seen"]),
+        gwops_match=row["gwops_match"],
+        gwops_gateway_id=row["gwops_gateway_id"],
+        gwops_app=row["gwops_app"],
+        gwops_managed=None if row["gwops_managed"] is None else bool(row["gwops_managed"]),
+        downstream_tls=row["downstream_tls"],
+        downstream_port=row["downstream_port"],
+        upstream_tls=row["upstream_tls"],
+        upstream_port=row["upstream_port"],
+    )
+
+
+def _row_to_gwops_snapshot(row: aiosqlite.Row) -> GwopsSnapshot:
+    """Map the eight snapshot columns of a ``connections`` row to a :class:`GwopsSnapshot`."""
+    return GwopsSnapshot(
+        gwops_match=row["gwops_match"],
+        gwops_gateway_id=row["gwops_gateway_id"],
+        gwops_app=row["gwops_app"],
+        gwops_managed=None if row["gwops_managed"] is None else bool(row["gwops_managed"]),
+        downstream_tls=row["downstream_tls"],
+        downstream_port=row["downstream_port"],
+        upstream_tls=row["upstream_tls"],
+        upstream_port=row["upstream_port"],
     )
 
 
@@ -195,6 +356,12 @@ def to_requested_at_format(value: str | datetime) -> str:
     )
 
 
+def _check_api_kind(api_kind: str) -> None:
+    """Raise ``ValueError`` unless ``api_kind`` is a known ``api_requests.api_kind``."""
+    if api_kind not in API_KINDS:
+        raise ValueError(f"unknown api_kind: {api_kind!r}")
+
+
 def _chunks(values: Sequence[str], size: int = _IN_CHUNK) -> Iterable[Sequence[str]]:
     """Yield consecutive slices of ``values`` of at most ``size`` items."""
     for start in range(0, len(values), size):
@@ -227,6 +394,8 @@ class ActivityStore:
         username: str | None,
         resource_address: str | None,
         started_at: str | None,
+        resource_type: str | None = None,
+        gwops: GwopsWebApp | None = None,
     ) -> None:
         """Record an ``Authenticated connection`` line as a pending connection.
 
@@ -236,8 +405,46 @@ class ActivityStore:
         ``state``/``has_api`` are never changed on conflict (a connection already
         promoted to ``recording``/``api`` stays there).
 
-        Then backfills ``resource_address`` onto any of this connection's API
-        requests that arrived before the start line (stored with a NULL cluster).
+        ``resource_type`` is **first write wins** (CLAUDE.md rule 2, WEBAPP_SPEC
+        §4.4): it is written only on the first processing of the start line (the same
+        test as the ``gwops`` snapshot, below), so a repeated or forged start line
+        can never retype a connection (for example flip ``KUBERNETES`` to
+        ``WEB_APP`` and thereby disable detection) nor fill a NULL one. A
+        pre-upgrade connection with a processed start line and no type stays NULL
+        (Kubernetes policy).
+
+        **First processing** means no start line has been processed for this
+        ``conn_id``: there is no row, or the row is the minimal one ``set_state``
+        inserts for a request that beat its start line (``start_seen = 0 AND
+        started_at IS NULL AND resource_type IS NULL``). Every call here sets
+        ``start_seen = 1``, so a start line with no ``ts`` and no ``resource_type``
+        still counts as processed.
+
+        The eight ``gwops``/TLS snapshot columns are written as one unit, only
+        on the first processing of the start line (WEBAPP_SPEC §4.4, §4.5; first
+        write wins). Any later call keeps the
+        stored snapshot, including a NULL one: a repeat can neither rewrite nor
+        retroactively fill it. The rule is a ``CASE`` on the existing row inside
+        the single ``INSERT … ON CONFLICT`` statement, so there is no
+        read-then-write window. ``exact`` stores all eight values; ``none`` and
+        ``ambiguous`` store only ``gwops_match`` and ``gwops_gateway_id``; ``None``
+        stores NULL in all eight. Nothing here logs a ``gwops`` value.
+
+        Then, in the same transaction (one commit):
+
+          * backfills ``resource_address`` onto any of this connection's API
+            requests that arrived before the start line (stored with a NULL cluster);
+          * on the **first processing** of the start line only (the same test the
+            ``gwops`` snapshot and ``resource_type`` use), and only when the
+            ``resource_type`` **stored after the upsert** (not the incoming
+            argument) is non-null and not ``KUBERNETES``, runs the web backfill
+            (WEBAPP_SPEC §4.4): the connection's earlier ``kubectl`` rows lose their
+            ``kube-api`` findings and become ``web`` rows (kubectl headers cleared,
+            TLS modes copied from the connection's stored modes, read back after
+            the upsert). A repeated start line never backfills.
+
+        The first-processing read and the upsert are separate statements in one
+        transaction; the assembler lock (every caller holds it) serializes them.
 
         Args:
             conn_id: The connection id (primary key).
@@ -245,30 +452,114 @@ class ActivityStore:
             username: Envelope ``user.username`` (identity), if present.
             resource_address: Target system / cluster, if present.
             started_at: Start-line timestamp, if present.
+            resource_type: Normalized Gateway resource type (``KUBERNETES``, ``SSH``,
+                ``WEB_APP``, …) from the start line, if present.
+            gwops: The validated ``gwops`` object from a ``WEB_APP`` start line, or
+                ``None`` (absent, rejected, or not a web app).
         """
+        try:
+            cursor = await self._db.execute(
+                "SELECT start_seen, started_at, resource_type FROM connections "
+                "WHERE conn_id = ?",
+                (conn_id,),
+            )
+            existing = await cursor.fetchone()
+            await cursor.close()
+            first_processing = existing is None or (
+                not existing["start_seen"]
+                and existing["started_at"] is None
+                and existing["resource_type"] is None
+            )
+            await self._db.execute(
+                f"""
+                INSERT INTO connections (
+                    conn_id, user_id, username, resource_address, started_at,
+                    resource_type, state, has_api, created_at, last_seen_at, start_seen,
+                    {_GWOPS_COLUMN_LIST}
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, datetime('now'), datetime('now'), 1,
+                        ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conn_id) DO UPDATE SET
+                    user_id          = COALESCE(excluded.user_id, connections.user_id),
+                    username         = COALESCE(excluded.username, connections.username),
+                    resource_address = COALESCE(excluded.resource_address, connections.resource_address),
+                    started_at       = COALESCE(connections.started_at, excluded.started_at),
+                    resource_type    = CASE WHEN {_FIRST_PROCESSING_SQL}
+                                       THEN excluded.resource_type
+                                       ELSE connections.resource_type END,
+                    start_seen       = 1,
+                    last_seen_at     = datetime('now'),
+                    {_GWOPS_FIRST_WRITE_SET}
+                """,
+                (
+                    conn_id,
+                    user_id,
+                    username,
+                    resource_address,
+                    started_at,
+                    resource_type,
+                    *_gwops_values(gwops),
+                ),
+            )
+            if resource_address is not None:
+                await self._db.execute(
+                    "UPDATE api_requests SET resource_address = ? "
+                    "WHERE conn_id = ? AND resource_address IS NULL",
+                    (resource_address, conn_id),
+                )
+            if first_processing:
+                await self._backfill_web_requests(conn_id)
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
+
+    async def _backfill_web_requests(self, conn_id: str) -> None:
+        """Convert a connection's early ``kubectl`` rows to ``web`` (no commit).
+
+        A no-op unless the connection's **stored** ``resource_type`` (read back
+        here, after the upsert) is non-null and not ``KUBERNETES``. For requests
+        stored before this connection's start line said it is not a Kubernetes
+        connection (WEBAPP_SPEC §4.4):
+
+          1. delete their findings (all are ``kube-api`` rule findings);
+          2. set ``api_kind = 'web'``, clear ``kubectl_command``/``kubectl_session``
+             and bind the connection's stored ``downstream_tls``/``upstream_tls``.
+
+        The modes are read back from the connection row (after the upsert) so a
+        repeated start line cannot substitute different values. Their URLs were
+        already stored in the provisional form (the stricter of the Kubernetes and
+        web policies, ``webmask.store_provisional_url``), so no URL rewrite is
+        needed or possible (the raw URL is not kept).
+
+        Args:
+            conn_id: The connection whose rows are converted (the row must exist).
+        """
+        cursor = await self._db.execute(
+            "SELECT resource_type, downstream_tls, upstream_tls FROM connections "
+            "WHERE conn_id = ?",
+            (conn_id,),
+        )
+        modes = await cursor.fetchone()
+        await cursor.close()
+        if modes is None or modes["resource_type"] in (None, "KUBERNETES"):
+            return
+        downstream_tls = modes["downstream_tls"]
+        upstream_tls = modes["upstream_tls"]
+        await self._db.execute(
+            "DELETE FROM api_findings WHERE request_id IN "
+            "(SELECT request_id FROM api_requests WHERE conn_id = ? AND api_kind = 'kubectl')",
+            (conn_id,),
+        )
         await self._db.execute(
             """
-            INSERT INTO connections (
-                conn_id, user_id, username, resource_address, started_at,
-                state, has_api, created_at, last_seen_at
-            )
-            VALUES (?, ?, ?, ?, ?, 'pending', 0, datetime('now'), datetime('now'))
-            ON CONFLICT(conn_id) DO UPDATE SET
-                user_id          = COALESCE(excluded.user_id, connections.user_id),
-                username         = COALESCE(excluded.username, connections.username),
-                resource_address = COALESCE(excluded.resource_address, connections.resource_address),
-                started_at       = COALESCE(connections.started_at, excluded.started_at),
-                last_seen_at     = datetime('now')
+            UPDATE api_requests
+            SET api_kind = 'web', kubectl_command = NULL, kubectl_session = NULL,
+                downstream_tls = ?, upstream_tls = ?
+            WHERE conn_id = ? AND api_kind = 'kubectl'
             """,
-            (conn_id, user_id, username, resource_address, started_at),
+            (downstream_tls, upstream_tls, conn_id),
         )
-        if resource_address is not None:
-            await self._db.execute(
-                "UPDATE api_requests SET resource_address = ? "
-                "WHERE conn_id = ? AND resource_address IS NULL",
-                (resource_address, conn_id),
-            )
-        await self._db.commit()
 
     async def get_connection(self, conn_id: str) -> ConnectionRow | None:
         """Fetch one connection by id.
@@ -287,6 +578,35 @@ class ActivityStore:
         await cursor.close()
         return _row_to_connection(row) if row is not None else None
 
+    async def gwops_for_connections(self, conn_ids: Iterable[str]) -> dict[str, GwopsSnapshot]:
+        """Fetch the ``gwops``/TLS snapshot of each of a set of connections.
+
+        A primary-key lookup over ``connections`` with parameterized ``IN`` lists of
+        at most 500 ids per query. Duplicates are ignored.
+
+        Args:
+            conn_ids: Connection ids to look up.
+
+        Returns:
+            ``conn_id → GwopsSnapshot`` for every id that has a ``connections`` row.
+            A connection with no stored object maps to a snapshot whose fields are all
+            ``None`` (TLS unknown); an id with no row is absent.
+        """
+        ids = _unique(conn_ids)
+        result: dict[str, GwopsSnapshot] = {}
+        for chunk in _chunks(ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"SELECT conn_id, {_GWOPS_COLUMN_LIST} FROM connections "
+                f"WHERE conn_id IN ({placeholders})",
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                result[row["conn_id"]] = _row_to_gwops_snapshot(row)
+        return result
+
     async def set_state(self, conn_id: str, state: str, *, has_api: bool = False) -> None:
         """Set a connection's lifecycle state (upsert).
 
@@ -297,7 +617,7 @@ class ActivityStore:
 
         Args:
             conn_id: The connection id.
-            state: One of ``pending``, ``recording``, ``api``, ``error``.
+            state: One of ``pending``, ``recording``, ``api``, ``error``, ``empty``.
             has_api: True when an API audit line has arrived on this connection.
 
         Raises:
@@ -319,24 +639,28 @@ class ActivityStore:
         await self._db.commit()
 
     async def expire_pending(self, max_idle_seconds: int) -> list[ConnectionRow]:
-        """Move pending connections idle longer than the backstop to ``error``.
+        """Expire pending connections idle longer than the backstop.
 
         Selects ``state = 'pending' AND last_seen_at < datetime('now', '-N seconds')``
-        and flips them to ``error`` in one atomic ``UPDATE … RETURNING``, so a
-        connection touched concurrently is never expired by a stale read. Uses
-        SQLite wall-clock time, so it is correct across restarts.
+        and flips them in one atomic ``UPDATE … RETURNING``, so a connection touched
+        concurrently is never expired by a stale read. A ``WEB_APP`` connection
+        becomes ``empty`` (hidden: a browser pre-connect or refused tunnel, WEBAPP_SPEC
+        §6); every other connection becomes ``error``. Uses SQLite wall-clock time, so
+        it is correct across restarts.
 
         Args:
             max_idle_seconds: The backstop window (``SESSION_MAX_IDLE_SECONDS``).
 
         Returns:
-            The expired connections (with ``state == 'error'``), oldest first. The
-            caller surfaces each as a visible ``error`` session row.
+            Every expired connection, oldest first, each with its new ``state``
+            (``'error'`` or ``'empty'``). The caller surfaces a visible ``error``
+            session row only for rows whose ``state == 'error'``.
         """
         modifier = f"-{max(0, int(max_idle_seconds))} seconds"
         cursor = await self._db.execute(
             f"""
-            UPDATE connections SET state = 'error'
+            UPDATE connections
+            SET state = CASE WHEN resource_type = 'WEB_APP' THEN 'empty' ELSE 'error' END
             WHERE state = 'pending' AND last_seen_at < datetime('now', ?)
             RETURNING {_CONNECTION_COLUMNS}
             """,
@@ -351,7 +675,13 @@ class ActivityStore:
 
     # --- API requests + findings ------------------------------------------------
 
-    async def insert_request(self, req: ApiRequest, resource_address: str | None) -> bool:
+    async def insert_request(
+        self,
+        req: ApiRequest,
+        resource_address: str | None,
+        *,
+        storage: RequestStorage | None = None,
+    ) -> bool:
         """Store one API request with no findings, ignoring a redelivered duplicate.
 
         Equivalent to :meth:`insert_request_with_findings` with an empty findings
@@ -363,17 +693,24 @@ class ActivityStore:
             req: The classified, allowlisted API request.
             resource_address: The cluster, from the connection (``None`` until the
                 start line is seen; :meth:`upsert_connection_start` backfills it).
+            storage: The storage form chosen by the caller (``api_kind``, URL,
+                headers, TLS modes). ``None`` stores the Kubernetes form
+                (:meth:`RequestStorage.kubectl`).
 
         Returns:
             True if a new row was inserted; False if ``request_id`` already existed.
         """
-        return await self.insert_request_with_findings(req, resource_address, ())
+        return await self.insert_request_with_findings(
+            req, resource_address, (), storage=storage
+        )
 
     async def insert_request_with_findings(
         self,
         req: ApiRequest,
         resource_address: str | None,
         findings: Sequence[Finding],
+        *,
+        storage: RequestStorage | None = None,
     ) -> bool:
         """Store one API request and its findings atomically (one transaction).
 
@@ -388,7 +725,9 @@ class ActivityStore:
             the request *and* its findings (they can never be lost to a dedup hit).
 
         Only the allowlisted :class:`ApiRequest` fields and rule metadata are
-        written; ``offset_seconds`` is not stored (API findings have none).
+        written; ``offset_seconds`` is not stored (API findings have none). The
+        URL, headers, ``api_kind`` and TLS modes written are the caller-chosen
+        ``storage``, never read from ``req`` when ``storage`` is given.
 
         Args:
             req: The classified, allowlisted API request.
@@ -396,6 +735,9 @@ class ActivityStore:
                 start line is seen; :meth:`upsert_connection_start` backfills it).
             findings: The findings from ``detect_api`` (computed by the caller
                 before this call); empty stores the request alone.
+            storage: The storage form chosen by the caller per the policy table
+                (WEBAPP_SPEC §4.4). ``None`` stores the Kubernetes form
+                (:meth:`RequestStorage.kubectl`).
 
         Returns:
             True if a new request row was inserted (with its findings); False if
@@ -404,8 +746,9 @@ class ActivityStore:
         Raises:
             Exception: Any database error, after the transaction is rolled back.
         """
+        chosen = storage if storage is not None else RequestStorage.kubectl(req)
         try:
-            inserted = await self._insert_request_row(req, resource_address)
+            inserted = await self._insert_request_row(req, resource_address, chosen)
             if inserted:
                 await self._insert_finding_rows(req.request_id, findings)
             await self._db.commit()
@@ -414,8 +757,16 @@ class ActivityStore:
             raise
         return inserted
 
-    async def _insert_request_row(self, req: ApiRequest, resource_address: str | None) -> bool:
+    async def _insert_request_row(
+        self,
+        req: ApiRequest,
+        resource_address: str | None,
+        storage: RequestStorage,
+    ) -> bool:
         """Execute the ``INSERT OR IGNORE`` for one request (no commit).
+
+        Identity, time, method, status and outcome come from ``req``; ``api_kind``,
+        URL, headers and TLS modes come from ``storage``.
 
         Returns:
             True if a new row was inserted; False if ``request_id`` already existed.
@@ -425,9 +776,10 @@ class ActivityStore:
             INSERT OR IGNORE INTO api_requests (
                 request_id, conn_id, resource_address, user_key, user_id, username,
                 requested_at, method, url, status_code, outcome,
-                kubectl_command, kubectl_session, user_agent
+                kubectl_command, kubectl_session, user_agent,
+                api_kind, downstream_tls, upstream_tls
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 req.request_id,
@@ -438,12 +790,15 @@ class ActivityStore:
                 req.username,
                 req.requested_at,
                 req.method,
-                req.url,
+                storage.url,
                 req.status_code,
                 req.outcome,
-                req.kubectl_command,
-                req.kubectl_session,
-                req.user_agent,
+                storage.kubectl_command,
+                storage.kubectl_session,
+                storage.user_agent,
+                storage.api_kind,
+                storage.downstream_tls,
+                storage.upstream_tls,
             ),
         )
         inserted = cursor.rowcount == 1
@@ -494,37 +849,49 @@ class ActivityStore:
         since: str | datetime,
         until: str | datetime,
         limit: int = DEFAULT_MAX_ROWS,
+        *,
+        api_kind: str = "kubectl",
     ) -> list[ApiRequestRow]:
-        """List a cluster's API requests in a time window, for activity grouping.
+        """List a system's API requests of one kind in a time window.
 
         The window is half-open, ``since <= requested_at < until``, so adjacent
         pages (``until`` of one = ``since`` of the next) never repeat a request.
         ``resource_address IS ?`` matches the NULL (unknown cluster) bucket too.
         Ordered ``user_key, requested_at`` as ``group_activity`` requires.
 
+        The query is pinned to ``idx_api_req_sys_kind_time`` (``INDEXED BY``): it
+        walks ``(resource_address, api_kind)`` in ``requested_at`` order, and the
+        planner would otherwise prefer ``idx_api_req_kind_time`` and scan every row
+        of the kind across all systems.
+
         Args:
-            resource_address: The cluster, or ``None`` for the unknown bucket.
+            resource_address: The system, or ``None`` for the unknown bucket.
             since: Inclusive lower bound (ISO 8601 string or datetime).
             until: Exclusive upper bound (ISO 8601 string or datetime).
             limit: Maximum rows returned. A result of exactly ``limit`` rows means
                 the window may be truncated.
+            api_kind: ``'kubectl'`` (default) or ``'web'``.
 
         Returns:
             The matching :class:`ApiRequestRow` list.
 
         Raises:
-            ValueError: If a string bound is not parseable ISO 8601.
+            ValueError: If a string bound is not parseable ISO 8601, or ``api_kind``
+                is unknown.
         """
+        _check_api_kind(api_kind)
         cursor = await self._db.execute(
             f"""
             SELECT {_REQUEST_COLUMNS}
-            FROM api_requests
-            WHERE resource_address IS ? AND requested_at >= ? AND requested_at < ?
+            FROM api_requests INDEXED BY idx_api_req_sys_kind_time
+            WHERE resource_address IS ? AND api_kind = ?
+              AND requested_at >= ? AND requested_at < ?
             ORDER BY user_key, requested_at, request_id
             LIMIT ?
             """,
             (
                 resource_address,
+                api_kind,
                 to_requested_at_format(since),
                 to_requested_at_format(until),
                 max(1, int(limit)),
@@ -541,37 +908,44 @@ class ActivityStore:
         from_: str | datetime,
         to: str | datetime,
         limit: int = DEFAULT_MAX_ROWS,
+        *,
+        api_kind: str = "kubectl",
     ) -> list[ApiRequestRow]:
-        """List one user's requests on one cluster within an activity session's bounds.
+        """List one user's requests of one kind on one system within an activity session's bounds.
 
         Bounds are inclusive (``from_ <= requested_at <= to``) because they are an
         activity session's own first and last ``requested_at``. ``IS ?`` matches the
-        NULL cluster and NULL user buckets.
+        NULL cluster and NULL user buckets. Served by
+        ``idx_api_req_sys_kind_user_time`` with no hint and no sort.
 
         Args:
-            resource_address: The cluster, or ``None`` for the unknown bucket.
+            resource_address: The system, or ``None`` for the unknown bucket.
             user_key: The ``user_key`` (user id, else username), or ``None``.
             from_: Inclusive lower bound (ISO 8601 string or datetime).
             to: Inclusive upper bound (ISO 8601 string or datetime).
             limit: Maximum rows returned.
+            api_kind: ``'kubectl'`` (default) or ``'web'``.
 
         Returns:
             The matching :class:`ApiRequestRow` list, ordered by ``requested_at``.
 
         Raises:
-            ValueError: If a string bound is not parseable ISO 8601.
+            ValueError: If a string bound is not parseable ISO 8601, or ``api_kind``
+                is unknown.
         """
+        _check_api_kind(api_kind)
         cursor = await self._db.execute(
             f"""
             SELECT {_REQUEST_COLUMNS}
             FROM api_requests
-            WHERE resource_address IS ? AND user_key IS ?
+            WHERE resource_address IS ? AND api_kind = ? AND user_key IS ?
               AND requested_at >= ? AND requested_at <= ?
             ORDER BY requested_at, request_id
             LIMIT ?
             """,
             (
                 resource_address,
+                api_kind,
                 user_key,
                 to_requested_at_format(from_),
                 to_requested_at_format(to),
@@ -687,11 +1061,17 @@ class ActivityStore:
         under the same condition — deleted explicitly as well as by the FK cascade,
         so the purge is correct even on a connection without ``foreign_keys=ON``.
 
-        ``connections`` rows are purged on server time only:
-        ``COALESCE(datetime(created_at), datetime(last_seen_at)) < datetime(cutoff)``.
-        Both columns are server-assigned (``datetime('now')``), never Gateway-supplied
-        (``started_at`` is not consulted), so a forged future timestamp cannot pin a
-        connection; ``last_seen_at`` covers a row whose ``created_at`` is missing.
+        ``connections`` rows are purged on the connection's **last activity**, on
+        server time only (:data:`_PURGE_CONNECTIONS_SQL`): a connection goes only
+        when ``COALESCE(last_seen_at, created_at)`` is before the cutoff *and* no
+        ``api_requests`` row (run after the request purge above, so only requests
+        newer than the cutoff remain) still references it. A long keep-alive
+        connection with recent requests therefore keeps its row, and its later
+        requests keep their cluster and type instead of falling back to the
+        provisional path. Both columns are server-assigned (``datetime('now')``),
+        never Gateway-supplied (``started_at`` is not consulted), so a forged future
+        timestamp cannot pin a connection. ``last_seen_at`` is bumped by every
+        start line and every newly stored request.
 
         One transaction; rolled back on error.
 
@@ -718,11 +1098,7 @@ class ActivityStore:
             )
             requests_deleted = max(cursor.rowcount, 0)
             await cursor.close()
-            cursor = await self._db.execute(
-                "DELETE FROM connections WHERE "
-                "COALESCE(datetime(created_at), datetime(last_seen_at)) < datetime(?)",
-                (cutoff,),
-            )
+            cursor = await self._db.execute(_PURGE_CONNECTIONS_SQL, (cutoff,))
             connections_deleted = max(cursor.rowcount, 0)
             await cursor.close()
             await self._db.commit()

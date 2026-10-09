@@ -6,13 +6,20 @@ WAL mode with synchronous=NORMAL for durable, concurrent-friendly metadata.
 Tables:
     sessions      — one row per recording (visible in the UI).
     findings      — cast-offset findings from the plaintext sidecar scan.
-    connections   — hidden per-``conn_id`` connection state (pending | recording | api | error).
-    api_requests  — allowlisted kubectl API-request metadata, deduplicated by ``request_id``.
+    connections   — hidden per-``conn_id`` connection state
+                    (pending | recording | api | error | empty) plus the Gateway
+                    ``resource_type`` and the per-connection gwops/TLS snapshot.
+    api_requests  — allowlisted API-request metadata (``api_kind`` ``kubectl`` | ``web``),
+                    deduplicated by ``request_id``.
     api_findings  — rule findings on API requests (cascade-deleted with their request).
 
 Schema evolution:
     * ``CREATE TABLE/INDEX IF NOT EXISTS`` for new tables (idempotent every boot).
-    * ``_ensure_columns`` adds columns to a pre-existing ``sessions`` table (idempotent).
+    * ``_ensure_columns`` adds later-release columns to pre-existing ``sessions``,
+      ``connections`` and ``api_requests`` tables from per-table column lists
+      (idempotent, PRAGMA-guarded ``ALTER``).
+    * Indexes on later-release columns (``API_REQUEST_INDEXES``) are created after the
+      ``ALTER``s; superseded indexes (``RETIRED_INDEXES``) are dropped every boot.
     * ``PRAGMA user_version`` gates one-time data migrations that must never re-run.
 
 Shared SQL fragments (``CMD_KEY_SQL``, ``SESSION_AT_SQL``, ``FAILED_SQL``) live here
@@ -135,6 +142,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     max_severity     TEXT,                          -- highest finding severity (low | medium | high | critical)
     request_id       TEXT,                          -- k8s exec/attach request_id (NULL for SSH)
     sealed_terminal  INTEGER,                       -- 1 terminal seal | 0 reopenable seal | NULL unsealed/legacy
+    resource_type    TEXT,                          -- Gateway resource type, copied from connections at promote
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -159,10 +167,21 @@ CREATE TABLE IF NOT EXISTS connections (
     username         TEXT,
     resource_address TEXT,
     started_at       TEXT,                           -- ISO8601 from the start line
-    state            TEXT NOT NULL DEFAULT 'pending',-- pending | recording | api | error
+    state            TEXT NOT NULL DEFAULT 'pending',-- pending | recording | api | error | empty
     has_api          INTEGER NOT NULL DEFAULT 0,     -- 1 once any audit line arrived
     created_at       TEXT DEFAULT (datetime('now')),
-    last_seen_at     TEXT DEFAULT (datetime('now'))  -- drives the pending backstop
+    last_seen_at     TEXT DEFAULT (datetime('now')), -- drives the pending backstop
+    resource_type    TEXT,                           -- normalized start-line value (KUBERNETES, SSH, WEB_APP, ...)
+    start_seen       INTEGER NOT NULL DEFAULT 0,     -- 1 once a start line was processed (first-processing marker)
+    -- gwops snapshot (WEB_APP start lines only; configured state, never proof; first write wins)
+    gwops_match      TEXT,                           -- exact | none | ambiguous | NULL
+    gwops_gateway_id TEXT,                           -- opaque Twingate gateway id; NULL in gwops Mode B or when absent
+    gwops_app        TEXT,                           -- display only (exact)
+    gwops_managed    INTEGER,                        -- 1 | 0 | NULL (exact only)
+    downstream_tls   TEXT,                           -- tls13 | none | NULL (unknown)
+    downstream_port  INTEGER,                        -- 1-65535 | NULL
+    upstream_tls     TEXT,                           -- verify_full | verify_ca | insecure | none | NULL
+    upstream_port    INTEGER                         -- 1-65535 | NULL
 );
 CREATE INDEX IF NOT EXISTS idx_connections_state_seen ON connections(state, last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_connections_created    ON connections(created_at);
@@ -182,13 +201,13 @@ CREATE TABLE IF NOT EXISTS api_requests (
     kubectl_command  TEXT,
     kubectl_session  TEXT,
     user_agent       TEXT,
-    created_at       TEXT DEFAULT (datetime('now'))
+    created_at       TEXT DEFAULT (datetime('now')),
+    api_kind         TEXT NOT NULL DEFAULT 'kubectl',-- kubectl | web (storage policy and search kind)
+    downstream_tls   TEXT,                           -- configured mode, copied from the connection (web rows)
+    upstream_tls     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_api_req_sys_time      ON api_requests(resource_address, requested_at);
-CREATE INDEX IF NOT EXISTS idx_api_req_sys_user_time ON api_requests(resource_address, user_key, requested_at);
 CREATE INDEX IF NOT EXISTS idx_api_req_conn          ON api_requests(conn_id);
 CREATE INDEX IF NOT EXISTS idx_api_req_session       ON api_requests(kubectl_session);
-CREATE INDEX IF NOT EXISTS idx_api_req_time          ON api_requests(requested_at);
 
 CREATE TABLE IF NOT EXISTS api_findings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,14 +221,14 @@ CREATE TABLE IF NOT EXISTS api_findings (
 CREATE INDEX IF NOT EXISTS idx_api_findings_request  ON api_findings(request_id);
 CREATE INDEX IF NOT EXISTS idx_api_findings_severity ON api_findings(severity);
 """ + f"""
--- Session 10 (spec §7.1). The api_requests columns always exist (Session 9 created
--- the table), so these need no column guard. idx_api_req_cmd is rendered from
--- CMD_KEY_SQL so query expressions built with cmd_key() match it exactly.
+-- Session 10 (spec §7.1). Every column idx_api_req_cmd references existed when
+-- Session 9 created the table, so it needs no column guard. It is rendered from
+-- CMD_KEY_SQL so query expressions built with cmd_key() match it exactly. The other
+-- api_requests scan indexes lead with api_kind (a Session 11 column) and are created
+-- by init_db after the ALTERs: see API_REQUEST_INDEXES.
 CREATE INDEX IF NOT EXISTS idx_api_req_cmd ON api_requests(
     {CMD_KEY_SQL.format(a="")},
     requested_at, request_id);
-CREATE INDEX IF NOT EXISTS idx_api_req_user_time   ON api_requests(username, requested_at, request_id);
-CREATE INDEX IF NOT EXISTS idx_api_req_userid_time ON api_requests(user_id, requested_at, request_id);
 """
 
 # Columns added to ``sessions`` after its first release. ``CREATE TABLE IF NOT EXISTS``
@@ -221,6 +240,50 @@ SESSION_COLUMNS: tuple[tuple[str, str], ...] = (
     # Session 10 T11: how the row was sealed (1 terminal, 0 reopenable, NULL not
     # sealed / sealed before this column existed — treated as terminal).
     ("sealed_terminal", "ALTER TABLE sessions ADD COLUMN sealed_terminal INTEGER"),
+    # Session 11 (spec §4.2): the Gateway resource type, copied from ``connections``
+    # when a recording promotes the connection to a session.
+    ("resource_type", "ALTER TABLE sessions ADD COLUMN resource_type TEXT"),
+)
+
+# Columns added to ``connections`` after Session 9 created it (Session 11, spec §4.2,
+# §3.3): the normalized start-line ``resource_type`` and the eight gwops/TLS snapshot
+# columns. All nullable: NULL means "unknown" (no object, a rejected object, ``none``
+# or ``ambiguous``). No index: the snapshot is read by primary key only.
+CONNECTION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("resource_type", "ALTER TABLE connections ADD COLUMN resource_type TEXT"),
+    # 1 once an ``Authenticated connection`` line has been processed for the row: the
+    # reliable "first processing" marker (a start line may carry neither ``ts`` nor
+    # ``resource_type``, so those columns cannot say). Rows from before it existed are
+    # recognised by the old minimal-row test (``started_at``/``resource_type`` NULL).
+    ("start_seen", "ALTER TABLE connections ADD COLUMN start_seen INTEGER NOT NULL DEFAULT 0"),
+    ("gwops_match", "ALTER TABLE connections ADD COLUMN gwops_match TEXT"),
+    ("gwops_gateway_id", "ALTER TABLE connections ADD COLUMN gwops_gateway_id TEXT"),
+    ("gwops_app", "ALTER TABLE connections ADD COLUMN gwops_app TEXT"),
+    ("gwops_managed", "ALTER TABLE connections ADD COLUMN gwops_managed INTEGER"),
+    ("downstream_tls", "ALTER TABLE connections ADD COLUMN downstream_tls TEXT"),
+    ("downstream_port", "ALTER TABLE connections ADD COLUMN downstream_port INTEGER"),
+    ("upstream_tls", "ALTER TABLE connections ADD COLUMN upstream_tls TEXT"),
+    ("upstream_port", "ALTER TABLE connections ADD COLUMN upstream_port INTEGER"),
+)
+
+# Columns added to ``api_requests`` in Session 11 (spec §4.2). ``api_kind`` is NOT NULL
+# with a constant default, which ``ALTER TABLE ADD COLUMN`` accepts and which makes
+# every existing row ``kubectl`` with no data migration and no table rewrite.
+API_REQUEST_COLUMNS: tuple[tuple[str, str], ...] = (
+    (
+        "api_kind",
+        "ALTER TABLE api_requests ADD COLUMN api_kind TEXT NOT NULL DEFAULT 'kubectl'",
+    ),
+    ("downstream_tls", "ALTER TABLE api_requests ADD COLUMN downstream_tls TEXT"),
+    ("upstream_tls", "ALTER TABLE api_requests ADD COLUMN upstream_tls TEXT"),
+)
+
+# Per-table column lists applied by ``_ensure_columns``. Table names are fixed
+# literals (never input).
+TABLE_COLUMNS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("sessions", SESSION_COLUMNS),
+    ("connections", CONNECTION_COLUMNS),
+    ("api_requests", API_REQUEST_COLUMNS),
 )
 
 # Session indexes are created after _ensure_columns so they can reference columns
@@ -239,6 +302,48 @@ SESSION_INDEXES: tuple[tuple[str, str], ...] = (
         "CREATE INDEX IF NOT EXISTS idx_sessions_at ON sessions("
         f"{SESSION_AT_SQL.format(a='')}, conn_id)",
     ),
+)
+
+# api_requests indexes that lead with ``api_kind`` (Session 11, spec §4.2). They
+# reference a column that an upgraded database only gains through ``API_REQUEST_COLUMNS``,
+# so they are created after ``_ensure_columns`` (never in ``SCHEMA``). ``api_kind``
+# is an equality column in every kubectl-source query, so each index is a kind-scoped
+# version of the one it replaces and a web-heavy table never makes a kubectl scan
+# walk web rows. Each statement is idempotent.
+API_REQUEST_INDEXES: tuple[str, ...] = (
+    # scan mode without system/user; dashboard request count
+    "CREATE INDEX IF NOT EXISTS idx_api_req_kind_time "
+    "ON api_requests(api_kind, requested_at, request_id)",
+    # user= arm 1 (username)
+    "CREATE INDEX IF NOT EXISTS idx_api_req_kind_user_time "
+    "ON api_requests(api_kind, username, requested_at, request_id)",
+    # user= arm 2 (user_id)
+    "CREATE INDEX IF NOT EXISTS idx_api_req_kind_userid_time "
+    "ON api_requests(api_kind, user_id, requested_at, request_id)",
+    # list_systems (covering), scans with system. ``request_id`` is the trailing tie-break
+    # of the scan's ``ORDER BY requested_at DESC, request_id DESC``: with it the planner
+    # walks (resource_address = ?, api_kind = ?) in order with no sort and prefers this
+    # index to ``idx_api_req_kind_time`` (without it the planner picks the kind-only
+    # index and filters the system row by row, and a scan would burn its budget on
+    # other systems' rows).
+    "CREATE INDEX IF NOT EXISTS idx_api_req_sys_kind_time "
+    "ON api_requests(resource_address, api_kind, requested_at, request_id)",
+    # activity and visit reads (same reason for the trailing ``request_id``: their
+    # ``ORDER BY requested_at, request_id`` over one user's bounded window)
+    "CREATE INDEX IF NOT EXISTS idx_api_req_sys_kind_user_time "
+    "ON api_requests(resource_address, api_kind, user_key, requested_at, request_id)",
+)
+
+# Indexes superseded by ``API_REQUEST_INDEXES`` (same order). They are no longer in
+# ``SCHEMA`` and are dropped on every boot after the replacements exist, so an upgraded
+# database converges on the same 20 indexes as a fresh one. ``DROP INDEX IF EXISTS`` is
+# idempotent.
+RETIRED_INDEXES: tuple[str, ...] = (
+    "idx_api_req_time",
+    "idx_api_req_user_time",
+    "idx_api_req_userid_time",
+    "idx_api_req_sys_time",
+    "idx_api_req_sys_user_time",
 )
 
 # Current data-migration level stored in ``PRAGMA user_version``.
@@ -287,26 +392,62 @@ async def connect(db_path: Path) -> aiosqlite.Connection:
     return conn
 
 
-async def _session_columns(conn: aiosqlite.Connection) -> set[str]:
-    """Return the set of column names currently present on ``sessions``."""
-    cur = await conn.execute("PRAGMA table_info(sessions)")
-    existing = {row[1] for row in await cur.fetchall()}
+async def _table_columns(conn: aiosqlite.Connection, table: str) -> set[str]:
+    """Return the set of column names currently present on ``table``.
+
+    Uses the ``pragma_table_info`` table-valued function so the table name is a bound
+    parameter, not interpolated SQL. An absent table yields an empty set.
+
+    Args:
+        conn: The open database connection.
+        table: The table name.
+
+    Returns:
+        The column names on ``table``.
+    """
+    cur = await conn.execute("SELECT name FROM pragma_table_info(?)", (table,))
+    existing = {row[0] for row in await cur.fetchall()}
     await cur.close()
     return existing
 
 
+async def _session_columns(conn: aiosqlite.Connection) -> set[str]:
+    """Return the set of column names currently present on ``sessions``."""
+    return await _table_columns(conn, "sessions")
+
+
 async def _ensure_columns(conn: aiosqlite.Connection) -> None:
-    """Add later-release columns to a pre-existing ``sessions`` table (idempotent).
+    """Add later-release columns to pre-existing tables (idempotent).
 
     ``CREATE TABLE IF NOT EXISTS`` will not alter an existing table, so a DB created
-    before these columns existed needs an explicit, guarded ``ALTER``. Covers the
-    Session 8 finding columns, the Session 9 ``request_id`` column, and the
-    Session 10 ``sealed_terminal`` column (no ``user_version`` bump).
+    before these columns existed needs an explicit, guarded ``ALTER``. Applies each
+    per-table list in :data:`TABLE_COLUMNS`: ``sessions`` (Session 8 finding columns,
+    Session 9 ``request_id``, Session 10 ``sealed_terminal``, Session 11
+    ``resource_type``), ``connections`` (Session 11 ``resource_type`` and gwops/TLS
+    snapshot) and ``api_requests`` (Session 11 ``api_kind`` and TLS modes). No
+    ``user_version`` bump. A column is added only if absent, so a second boot, or a
+    fresh install whose ``CREATE TABLE`` already has it, issues no ``ALTER``.
     """
-    existing = await _session_columns(conn)
-    for col, ddl in SESSION_COLUMNS:
-        if col not in existing:
-            await conn.execute(ddl)
+    for table, columns in TABLE_COLUMNS:
+        existing = await _table_columns(conn, table)
+        for col, ddl in columns:
+            if col not in existing:
+                await conn.execute(ddl)
+    await conn.commit()
+
+
+async def _ensure_api_request_indexes(conn: aiosqlite.Connection) -> None:
+    """Create the ``api_kind``-prefixed ``api_requests`` indexes, then drop retired ones.
+
+    Must run after :func:`_ensure_columns`: the new indexes reference ``api_kind``,
+    which an upgraded database only has once its ``ALTER`` has run. The replacements
+    are built before the superseded indexes are dropped, so a crash between the two
+    steps leaves every query with an index, and the next boot finishes the job.
+    """
+    for ddl in API_REQUEST_INDEXES:
+        await conn.execute(ddl)
+    for name in RETIRED_INDEXES:
+        await conn.execute(f"DROP INDEX IF EXISTS {name}")  # noqa: S608 - fixed literals
     await conn.commit()
 
 
@@ -510,8 +651,10 @@ async def _run_migrations(conn: aiosqlite.Connection, casts_dir: Path | None = N
 async def init_db(db_path: Path, casts_dir: Path | None = None) -> aiosqlite.Connection:
     """Ensure the data directory exists, open a connection, and create the schema.
 
-    Order: create tables/indexes → add missing ``sessions`` columns → create the
-    column-dependent ``sessions`` indexes → run ``user_version``-gated migrations.
+    Order: create tables/indexes → add missing columns (``sessions``, ``connections``,
+    ``api_requests``) → create the column-dependent ``sessions`` indexes → create the
+    ``api_kind``-prefixed ``api_requests`` indexes and drop the retired ones → run
+    ``user_version``-gated migrations.
 
     Args:
         db_path: Filesystem path to the SQLite database file.
@@ -529,6 +672,7 @@ async def init_db(db_path: Path, casts_dir: Path | None = None) -> aiosqlite.Con
     await conn.commit()
     await _ensure_columns(conn)
     await _ensure_session_indexes(conn)
+    await _ensure_api_request_indexes(conn)
     await _run_migrations(conn, casts_dir)
     log.info("db.initialized", db_path=str(db_path), user_version=await _get_user_version(conn))
     return conn

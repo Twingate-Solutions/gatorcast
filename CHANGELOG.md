@@ -6,6 +6,215 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
+Web-app support (Sessions 11 and 12). Gatorcast now stores and shows Twingate Gateway **web-app**
+(`WEB_APP`, HTTP and HTTPS) traffic as its own kind, separate from kubectl activity: per-request
+method, path, status and `User-Agent`, grouped per connection, with the web app's **configured**
+TLS posture when the shipper supplies it. Web traffic is not evaluated by detection rules.
+
+The TLS badges depend on gwops (backlog item B-20) with Gatorcast delivery configured. Without
+that, or from any other shipper, every web connection shows **TLS unknown**. TLS values are
+configured state, not proof of the negotiated mode. Upgrading needs no migration step; see
+[Upgrading to 0.5.0](README.md#upgrading-to-050-web-apps) in the README.
+
+### Added
+
+- **Web-app connections are recognised.** The `resource_type` on an `Authenticated connection`
+  line (normalized to upper case, e.g. `WEB_APP`, `KUBERNETES`, `SSH`) is stored on the
+  connection and copied to its session. Each API request is stored with an `api_kind` of
+  `kubectl` or `web`, chosen from its connection. A value that is present but unusable (not a
+  string, empty, bad characters, too long) is stored as an internal `invalid` marker and routed
+  as a non-Kubernetes type, with one `classify.resource_type_rejected` warning (reason code and
+  `conn_id` only).
+- **`web` search kind.** `/search?type=web` lists one row per web connection, placed by its first
+  request, with the primary request's method and path (unmasked path, masked query), status, the
+  request count and span, and links to the visit view and the one-connection focus. A row expands
+  to its requests. `type=any` includes web rows; the dashboard recent-activity feed does too. The
+  text filter `q` matches the stored URL case-insensitively (path and masked query, ASCII case
+  folding only), and `cmd=<request_id>` focuses whichever kind holds that request.
+- **`scheme` and `upstream` filters** on web rows, with a "Web filters (configured TLS)" block
+  on the search form. `scheme` is `https`, `http` or `unknown`; `upstream` is `verified`,
+  `ca_only`, `unverified`, `plaintext` or `unknown`. They filter on **configured** TLS. A kind
+  that cannot evaluate them is excluded with a notice, and an invalid value is a `400` that
+  names the parameter.
+- **Web request storage.** Each web request is stored with its method, a normalized path, a
+  query with masked values, status, outcome, user, time and `User-Agent`. Nothing else from the
+  request is kept. See Security below.
+- **Configured-TLS badges.** Web rows, systems and requests show `HTTPS` or `HTTP` for the
+  client-facing leg and a marker for a non-verified upstream leg (`Plaintext upstream`,
+  `Unverified upstream`, `CA-only upstream`), or `TLS unknown`. Every badge carries a fixed
+  tooltip saying the value is configured, not proof. A stored mode outside the known values
+  renders a fixed "Unrecognised TLS mode" marker instead of a badge.
+- **Optional `gwops` object on the start line.** When the shipper adds a `gwops` object to a
+  `WEB_APP` `Authenticated connection` line, Gatorcast stores a per-connection snapshot of the
+  configured TLS posture: downstream and upstream TLS modes and ports, the app name, the
+  managed flag, and the gateway id. The snapshot is written once, on the first processing of the
+  start line; a repeated start line never rewrites it. An invalid object is ignored and the
+  connection is stored without TLS data. Each rejection logs one warning carrying only a reason
+  code and the `conn_id`, never a value. A line without the object is normal and logs nothing.
+  The object is read only on `WEB_APP` start lines, only for the documented keys, and every
+  other key is ignored. The values are configured state, not proof of the negotiated mode.
+- **gwops detail on web rows.** For a connection whose snapshot matched exactly, the search row
+  shows the app name, a `managed` or `unmanaged` marker, and the gateway id in a tooltip. A
+  rejected object is visible only in the logs; the UI shows it as "No gwops data".
+- **Systems list.** Web systems get a `Web` badge, the scheme badge and the upstream marker of
+  their newest web request. The **Requests** column links each kind present to its own search.
+- **System page.** A **Configured web app TLS (from gwops)** block lists each distinct
+  configuration seen in the 7-day window (matched, unmanaged, gateway id not yet assigned,
+  no match, ambiguous, or no gwops data), with connection counts and times and a footnote that
+  the values are configured, not proof. A **Web activity** table lists per-user visits (gap-based
+  groups of web requests) with connection and request counts and a `4xx/5xx` count.
+- **Visit view.** `GET /systems/{slug}/web` shows one visit's requests (up to 2,000) with
+  per-request configured-TLS badges, the connection, and the same configuration block. It takes
+  `user`, `from` and `to`, validated as on the kubectl activity page.
+- **Dashboard.** A **Web requests** tile counts web requests in the window and links to
+  `type=web`.
+- **CSV columns 16 to 22:** `resource_type`, `configured_scheme`, `configured_upstream_tls`,
+  `query` (masked values only), `gwops_gateway_id`, `gwops_app` and `gwops_managed`. Web rows fill
+  all seven; kubectl rows set `resource_type` to `KUBERNETES`; recording rows set it from the
+  session when known. Every cell passes the formula guard.
+- **Detection notice.** A findings filter (`has_findings=true`, `severity`, `max_severity`,
+  `category`, `rule_ids`) returns no web rows and says "Web connections are not evaluated by
+  detection rules."
+- **Demo data.** `scripts/seed_demo.py` now also posts seven `WEB_APP` demo apps (91 lines):
+  a verified-upstream app, a plaintext app, an `insecure` upstream, a `verify_ca` upstream, an
+  unmanaged app with no gateway id, an app whose start lines carry no `gwops` object, and one
+  with `match: none`. Re-running it is safe; ingest deduplicates.
+- **New modules and tests.** `pipeline/webmask.py` (the web URL storage form) and the template
+  `web_activity.html`; `tests/test_webmask.py` and web coverage across the existing modules;
+  fixtures `webapp_lines.ndjson` and `webapp_interim_lines.ndjson`. The suite is 3017 tests.
+
+### Changed
+
+- **CSV export has 22 columns** (was 15). The first 15 keep their names, order and values.
+- **Systems list columns.** "API requests" is now **Requests** and "Last API request" is now
+  **Last request**; both cover every kind present. The systems summary counts are split:
+  `SystemSummary.api_request_count` is replaced by `kubectl_request_count` and
+  `web_request_count`.
+- **`/systems/{slug}` routing supports addresses containing `/`**, such as a CIDR, and `%`, `?`,
+  `#` and spaces. `/systems/{slug}`, `/activity` and `/web` are served by one path dispatcher.
+- **kubectl surfaces exclude web rows.** The `kube-api` detection rules do not run on web
+  requests, and kubectl discovery grouping does not include them. Kubectl search, the activity
+  pages, the dashboard card and the systems counts count kubectl rows only.
+- **Web requests that arrive before their start line fail closed.** Such a request is stored in
+  a provisional form that applies the stricter of both policies: the Kubernetes path cut at
+  `proxy`, only allowlisted query keys, `command=` never stored, and remaining values masked.
+  When the start line arrives (on its first processing) and identifies a `WEB_APP` connection
+  (or any non-`KUBERNETES` type), the stored rows are converted to `web`, their kubectl headers
+  are cleared and their `kube-api` findings are removed. The converted row keeps the provisional
+  URL, so a path cut at `proxy` and dropped query keys are not restored. A `KUBERNETES` start
+  line leaves the rows as stored.
+- **Empty web-app connections expire silently.** A `WEB_APP` connection that delivers no
+  recording and no request within `SESSION_MAX_IDLE_SECONDS` (a browser pre-connect, a refused
+  `CONNECT`) moves to a hidden `empty` state instead of becoming a visible `error` session. SSH
+  and Kubernetes behaviour is unchanged. A later request moves the connection to `api`.
+- **The HTTP method gate is wider.** Any token that starts with a letter, continues with letters,
+  digits, `_` or `-`, and is at most 24 characters is recorded, with its case preserved. Before,
+  only 3 to 10 upper-case letters passed, so a lowercase `delete` or a custom `MKWORKSPACE`
+  produced no row.
+- **Dashboard.** The kubectl API requests card counts kubectl requests only.
+- **Schema.** New columns are added in place on upgrade, with no migration step and no
+  `user_version` bump: `resource_type` on `connections` and `sessions`; the `gwops` snapshot and
+  TLS mode and port columns on `connections`; `api_kind` (default `kubectl`, so existing rows stay
+  kubectl) and the two TLS mode columns on `api_requests`. The five `api_requests` scan indexes
+  are replaced by `api_kind`-prefixed ones at startup; the total index count is unchanged.
+  Requests stored before this release stay `kubectl` and are not reclassified.
+
+### Fixed
+
+These were found by the closing code and security review of this release.
+
+- **`/ingest` and cast parsing split on `\n` only.** `str.splitlines()` also breaks on U+0085,
+  U+2028 and U+2029, so a user who put one of those into a header value or terminal output tore
+  their own line into fragments that could not be parsed, and the line was dropped. The ingest
+  body splitter, the asciicast reassembly and the plaintext extraction now split on `\n` only.
+  This also applied to Kubernetes lines before this release.
+- **Lone surrogates no longer drop lines.** A lone surrogate code point in a username, address,
+  header value, URL or recording text made SQLite or the `.cast` write fail, so the line was
+  dropped. Such code points are now replaced with U+FFFD before they reach an event.
+- **Forged start lines cannot retype a connection or delete findings.** `resource_type` and the
+  `gwops` snapshot are first write wins, and the web conversion of earlier requests runs only on
+  the first processing of a start line. A repeated, redelivered or forged `WEB_APP` start line
+  for a `KUBERNETES` connection can no longer flip its type, convert its rows, or delete its
+  `kube-api` findings.
+- **Requests before their start line no longer persist `command=` fragments or uncut proxy
+  paths.** They are stored in the provisional form described under Changed.
+- **Padded base64 tokens in a query are masked whole.** `?dGVzdA==` used to be read as a key with
+  an empty-looking value and kept in plaintext.
+- **Long-lived connections are no longer purged while active.** The retention purge removes a
+  connection only when its last activity is past the cutoff and no stored request still refers
+  to it. It used to use the creation time, so a keep-alive connection could lose its row while
+  its requests remained.
+- **A start line with an unusable `resource_type` no longer falls back to Kubernetes handling.**
+  It is routed as a non-Kubernetes type (see Added).
+- **Search messages are kind-aware and accurate.** The `cmd` focus banner, the not-found text
+  and the scan-budget notice name kubectl, web or both. A `cmd` focus that finds nothing returns
+  to the unfiltered search. Only a cursor that does not match its request is a `400` from the
+  search engine; a fault during CSV export is a `500` rather than a false `400`.
+
+### Security
+
+- **Web storage policy.** The only request header stored for a web request is `User-Agent`.
+  `Authorization`, `Cookie`, `Set-Cookie`, every other request header, every response header and
+  `remote_addr` are never read, so they cannot reach the database, logs, UI or CSV, and neither
+  can client-sent identity headers such as `X-Twingate-User`. Identity stays the envelope
+  `user.username`. `Kubectl-*` headers are discarded on web requests.
+- **Query values are masked; paths are not (accepted risk).** Every query value is replaced by
+  its first and last characters (at most a quarter of the value, never more than four) and its
+  length, for example `token=ab…6(12)`. The normalized path is stored as is, so a token embedded
+  in a path (a password-reset or invite link, a share or download capability URL, a magic-login
+  JWT, a `;jsessionid=` value) is stored in full and visible to every UI user, in search and in
+  CSV exports. Masking is not encryption.
+- **Display encoding.** Stored URLs and paths are shown with control, format and line-separator
+  characters percent-encoded, and stored text is bidi-isolated, so control and bidirectional
+  characters cannot disguise an audit row. Stored values and CSV exports are unchanged.
+- **Class names and labels come from fixed maps.** Scheme badges, upstream markers and the
+  managed marker are chosen from fixed tables keyed by the stored value. No stored text becomes
+  a class, a link target or a URL. `gwops_app` is length- and character-checked and rendered
+  only through autoescape.
+- **Formula guard** covers the new text columns, including `gwops_app` and `gwops_gateway_id`.
+- **Log hygiene.** No URL, masked or not, is logged. `gwops` rejections log a reason code and
+  `conn_id` only. Pydantic validation errors are never logged.
+
+### Notes
+
+- **TLS labels are configured state, not proof.** TLS modes travel in each connection's token,
+  so after a mode change a connection on an older token (up to about 55 minutes) can be labelled
+  with the new mode while running the old one. Labels are only as trustworthy as the ingest
+  channel: anyone with the ingest token, or network access to the unauthenticated syslog port,
+  can forge a start line with a `gwops` object.
+- **Certificate-name line injection (upstream).** The Gateway logs upstream TLS errors through
+  Go's `log` package unescaped, so an upstream certificate DNS name containing `\n{...}` produces
+  a standalone line that gwops cannot tell from a Gateway line. Anyone who controls an upstream
+  app's certificate can therefore forge ingest lines. First-write-wins type and snapshot protect
+  existing connections only. The fix belongs in the Gateway or gwops.
+- **Use TLS between gwops and Gatorcast.** gwops forwards request lines unredacted, including
+  `Authorization`, `Cookie`, `Set-Cookie` and `X-Api-Key` values and full URLs with query strings,
+  and spools them at rest. Gatorcast never stores those values, but they cross the wire on the
+  gwops hop.
+- **No web detection rules and no HTTP-status filter.** Candidate rules are listed in the
+  technical plan's backlog.
+- **Web rows stored before 0.5.0 stay `kubectl`.** They keep their Kubernetes-policy URLs and any
+  `kube-api` findings until retention removes them. A pre-upgrade connection with a processed
+  start line and no type stays on the Kubernetes policy.
+- **No retroactive TLS fill.** Connections from before gwops ships the object, from a gwops
+  without Gatorcast delivery, or from another shipper stay TLS unknown.
+- **`LOG_LEVEL=debug` logs SQL bind parameters** (not introduced by this release): at `debug` the
+  SQLite driver's own log lines include bound values, which can include stored URLs and
+  usernames. Keep production at `info`.
+- **A single-pad base64 token** (`?dGVzdDE=`) in a query looks like an empty-valued key and is not
+  masked. A token in key position that fits the key pattern is likewise kept.
+- The `gwops` object was built and tested against fixtures and demo data. Real gwops output has
+  not been checked against it.
+
+### Documentation
+
+- README, ARCHITECTURE.md, INGESTION_RECIPES.md, SEARCH_AND_DETECTION.md and TESTING.md describe
+  web-app support, the configured-TLS badges and their dependency on gwops, the web storage
+  policy and its accepted risks, the connection lifecycle including `empty`, the `web` kind and
+  its filters, the 22 CSV columns, and the new tests and demo data.
+
 ## [0.4.0] - 2026-10-05
 
 This release also ships the kubectl activity work that was previously listed under Unreleased.
@@ -464,7 +673,8 @@ This release also ships the kubectl activity work that was previously listed und
 - **GitHub Actions CI** (`publish.yml`): `pytest` gate must pass before the image is
   built and pushed; installs the package with `[dev]` extras.
 
-[Unreleased]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.2.0

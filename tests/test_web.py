@@ -465,3 +465,73 @@ def test_session_detail_page_has_no_external_asset_urls(tmp_path: Path) -> None:
     assert resp.status_code == 200
     external = _external_urls_in_html(resp.text)
     assert external == [], f"Found external asset URLs: {external}"
+
+
+# ---------------------------------------------------------------------------
+# Session 12 (web apps): shared-page smoke tests (WEBAPP_SPEC §8.5; CLAUDE.md rule 8)
+# ---------------------------------------------------------------------------
+
+_WEB_SYSTEM = "wiki.corp.internal"
+_WEB_ASSET_PAGES = (
+    "/systems",
+    f"/systems/{_WEB_SYSTEM}?activity_before=2026-10-02T00:00:00Z",
+    f"/systems/{_WEB_SYSTEM}/web?user=uid-alice&from=2026-10-01T10:00:00Z&to=2026-10-01T10:30:00Z",
+    "/search?type=web",
+    "/search?type=any&scheme=https",
+    "/dashboard?window=all",
+)
+
+
+def _seed_web_pages(app) -> None:
+    """Load the web scenario (Alice's wiki connections fall inside the visit bounds above)."""
+    from tests.fixtures.timeline import build_web_scenario
+
+    asyncio.run(build_web_scenario(app.state.db))
+
+
+@pytest.mark.parametrize("path", _WEB_ASSET_PAGES)
+def test_web_pages_require_auth(tmp_path: Path, path: str) -> None:
+    """Every web-bearing page is behind the UI Basic auth (401 + challenge)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_web_pages(app)
+        resp = client.get(path, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.headers.get("WWW-Authenticate") == "Basic"
+
+
+@pytest.mark.parametrize("path", _WEB_ASSET_PAGES)
+def test_web_pages_render_and_reference_no_external_assets(tmp_path: Path, path: str) -> None:
+    """Rule 8: the systems, system, visit, web search, and dashboard pages are offline-only."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed_web_pages(app)
+        resp = client.get(path, headers=_auth_header())
+    assert resp.status_code == 200
+    assert _external_urls_in_html(resp.text) == []
+    assert "<script>" not in resp.text.replace('<script src=', "")  # no inline script blocks added
+    assert resp.headers["content-type"].startswith("text/html")
+
+
+def test_systems_page_lists_web_systems_alongside_ssh_systems(tmp_path: Path) -> None:
+    """An SSH system and a web system each get their own row, badge set, and request links."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed(app, conn_id="ssh-1", username="iris@x", resource_address="ssh-host")
+        _seed_web_pages(app)
+        body = client.get("/systems", headers=_auth_header()).text
+    ssh_row = next(c for c in body.split("<tr>") if 'href="/systems/ssh-host"' in c)
+    web_row = next(c for c in body.split("<tr>") if f'href="/systems/{_WEB_SYSTEM}"' in c)
+    assert "pill-ssh" in ssh_row and "pill-web" not in ssh_row
+    assert "pill-web" in web_row and "pill-ssh" not in web_row and "pill-kubectl" not in web_row
+    assert "type=web" in web_row and "type=web" not in ssh_row
+
+
+def test_system_page_for_an_ssh_system_has_no_web_sections(tmp_path: Path) -> None:
+    """A recordings-only system keeps its session table and gains no web or TLS section."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        _seed(app, conn_id="ssh-2", username="jo@x", resource_address="ssh-only")
+        body = client.get("/systems/ssh-only", headers=_auth_header()).text
+    assert "jo@x" in body
+    assert "Configured web app TLS" not in body and "Web activity" not in body

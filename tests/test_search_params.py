@@ -27,6 +27,7 @@ from gatorcast.store.timeline import (
     KIND_SOURCE,
     SOURCE_API_COMMANDS,
     SOURCE_SESSIONS,
+    SOURCE_WEB,
     Cursor,
     UnifiedQuery,
     check_position,
@@ -35,13 +36,16 @@ from gatorcast.store.timeline import (
 from gatorcast.web import params, routes
 from gatorcast.web.kinds import (
     EXCLUSION_LABELS,
+    FILTER_NAMES,
     KINDS,
     TYPE_GROUPS,
     TYPE_LABELS,
     resolve_kinds,
 )
 from gatorcast.web.params import (
+    SCHEME_VALUES,
     SEARCH_URL_ORDER,
+    UPSTREAM_VALUES,
     ParsedSearch,
     decode_cursor,
     encode_cursor,
@@ -51,8 +55,10 @@ from gatorcast.web.params import (
 
 NOW = datetime(2026, 10, 5, 12, 0, 0, tzinfo=UTC)
 SENTINEL = "GCSENTINELVALUE"
-ALL_KINDS = frozenset({"ssh", "exec", "failed", "kubectl"})
+ALL_KINDS = frozenset({"ssh", "exec", "failed", "kubectl", "web"})
 REC_KINDS = frozenset({"ssh", "exec", "failed"})
+CMD_KINDS = frozenset({"kubectl", "web"})  # the api_requests-backed kinds
+CURSOR_KINDS = ["exec", "failed", "kubectl", "ssh", "web"]  # sorted, as a cursor carries them
 AT = "2026-10-05T10:04:11.250Z"
 UUID = "11111111-1111-4111-8111-111111111111"
 HREQ = "h:" + "0123456789abcdef" * 2
@@ -111,10 +117,11 @@ def _cursor_obj(**overrides: object) -> dict[str, object]:
     obj: dict[str, object] = {
         "v": 1,
         "sort": "newest",
-        "k": ["exec", "failed", "kubectl", "ssh"],
+        "k": CURSOR_KINDS,
         "p": {
             "sessions": [AT, "aaaaaaaa-0000-4000-8000-000000000001"],
             "api_commands": ["T", "2026-10-05T10:02:07.000Z", UUID],
+            "web_conns": ["T", "2026-10-05T10:01:00.000Z", "w-1"],
         },
     }
     obj.update(overrides)
@@ -218,9 +225,10 @@ def test_unknown_params_are_ignored() -> None:
         ("exec", {"exec"}),
         ("failed", {"failed"}),
         ("kubectl", {"kubectl"}),
+        ("web", {"web"}),
     ],
 )
-def test_type_accepts_six_values(type_: str, kinds: set[str]) -> None:
+def test_type_accepts_seven_values(type_: str, kinds: set[str]) -> None:
     parsed = _parse(f"type={type_}")
     assert parsed.type == type_
     assert parsed.query.kinds == frozenset(kinds)
@@ -228,13 +236,15 @@ def test_type_accepts_six_values(type_: str, kinds: set[str]) -> None:
 
 
 def test_registry_shape() -> None:
-    assert list(KINDS) == ["ssh", "exec", "failed", "kubectl"]
+    assert list(KINDS) == ["ssh", "exec", "failed", "kubectl", "web"]
     assert tuple(KINDS) == KIND_KEYS
-    assert set(TYPE_GROUPS) == {"any", "recordings", "ssh", "exec", "failed", "kubectl"}
-    assert len(TYPE_GROUPS) == 6
-    assert TYPE_GROUPS["recordings"] == REC_KINDS
-    assert TYPE_GROUPS["any"] == frozenset(KINDS)
+    assert set(TYPE_GROUPS) == {"any", "recordings", "ssh", "exec", "failed", "kubectl", "web"}
+    assert len(TYPE_GROUPS) == 7
+    assert TYPE_GROUPS["recordings"] == REC_KINDS  # unchanged: web is not a recording
+    assert TYPE_GROUPS["any"] == frozenset(KINDS) == ALL_KINDS  # any follows the registry
+    assert TYPE_GROUPS["web"] == frozenset({"web"})
     assert [v for v, _ in TYPE_LABELS] == list(TYPE_GROUPS)
+    assert ("web", "Web requests") in TYPE_LABELS
     assert KINDS["failed"].label == "Failed connection"
     assert KINDS["failed"].badge_class == "pill-failed"
     for key, kind in KINDS.items():
@@ -243,6 +253,34 @@ def test_registry_shape() -> None:
     assert {KINDS[k].source for k in REC_KINDS} == {SOURCE_SESSIONS}
     assert KINDS["kubectl"].source == SOURCE_API_COMMANDS
     assert KINDS["kubectl"].row_macro == "command_row"
+    web = KINDS["web"]
+    assert (web.label, web.badge_class, web.source, web.row_macro) == (
+        "Web connection", "pill-web", SOURCE_WEB, "web_row",
+    )
+    assert web.sorts == KINDS["kubectl"].sorts == frozenset({"newest", "risk"})
+
+
+def test_kind_filter_sets() -> None:
+    """Which filters each kind can evaluate (WEBAPP_SPEC 8.3)."""
+    names = frozenset(FILTER_NAMES)
+    assert FILTER_NAMES.index("regex") + 1 == FILTER_NAMES.index("scheme")
+    assert FILTER_NAMES.index("scheme") + 1 == FILTER_NAMES.index("upstream")
+    assert FILTER_NAMES.index("upstream") + 1 == FILTER_NAMES.index("cmd")
+    for key in REC_KINDS:
+        assert KINDS[key].filters == names - {"cmd", "scheme", "upstream"}
+    assert KINDS["kubectl"].filters == names - {
+        "status", "min_duration", "max_duration", "regex", "scheme", "upstream",
+    }
+    assert KINDS["web"].filters == names - {"status", "min_duration", "max_duration", "regex"}
+    # web evaluates the finding filters and cmd; kubectl cannot evaluate scheme or upstream
+    assert {"severity", "max_severity", "has_findings", "category", "rule_ids", "cmd"} <= KINDS["web"].filters
+    assert not {"scheme", "upstream"} & KINDS["kubectl"].filters
+
+
+def test_exclusion_labels_for_web_filters_and_focus() -> None:
+    assert EXCLUSION_LABELS["scheme"] == "HTTP/HTTPS filter"
+    assert EXCLUSION_LABELS["upstream"] == "Upstream TLS filter"
+    assert EXCLUSION_LABELS["cmd"] == "Command/connection focus"
 
 
 # --- enum / format validation -----------------------------------------------------
@@ -264,6 +302,8 @@ def test_registry_shape() -> None:
         "rule_ids",
         "min_duration",
         "max_duration",
+        "scheme",
+        "upstream",
         "page_size",
         "page",
         "cmd",
@@ -300,7 +340,7 @@ def test_control_chars_rejected(name: str, ch: str) -> None:
 @pytest.mark.parametrize(
     "name",
     ["type", "system", "user", "window", "from", "to", "q", "mode", "sort", "cursor",
-     "page_size", "cmd", "username", "keyword", "page", "discovery"],
+     "page_size", "cmd", "username", "keyword", "page", "discovery", "scheme", "upstream"],
 )
 def test_repeated_single_valued_param(name: str) -> None:
     detail = _bad([(name, SENTINEL), (name, SENTINEL)], name)
@@ -478,23 +518,25 @@ def test_page_valid_then_ignored() -> None:
         ("sort=duration", "sort"),
     ],
 )
-def test_recordings_only_filters_exclude_kubectl(query: str, reason: str) -> None:
+def test_recordings_only_filters_exclude_kubectl_and_web(query: str, reason: str) -> None:
     parsed = _parse(query)
     assert parsed.kinds == REC_KINDS
-    assert parsed.excluded == {"kubectl": reason}
+    assert parsed.excluded == {"kubectl": reason, "web": reason}
+    assert list(parsed.excluded) == ["kubectl", "web"]  # registry order
     assert reason in EXCLUSION_LABELS
 
 
-def test_cmd_excludes_recording_kinds() -> None:
+def test_cmd_excludes_recording_kinds_and_keeps_kubectl_and_web() -> None:
     parsed = _parse(f"cmd={UUID}")
-    assert parsed.kinds == frozenset({"kubectl"})
+    assert parsed.kinds == CMD_KINDS
     assert parsed.excluded == {"ssh": "cmd", "exec": "cmd", "failed": "cmd"}
     assert list(parsed.excluded) == ["ssh", "exec", "failed"]  # registry order
 
 
-def test_cmd_overrides_other_filters_for_kubectl() -> None:
-    parsed = _parse(f"cmd={UUID}&status=error&sort=duration&mode=regex&q=x")
-    assert parsed.kinds == frozenset({"kubectl"})
+def test_cmd_overrides_other_filters_for_kubectl_and_web() -> None:
+    parsed = _parse(f"cmd={UUID}&status=error&sort=duration&mode=regex&q=x&scheme=https&upstream=unknown")
+    assert parsed.kinds == CMD_KINDS
+    assert parsed.excluded == {"ssh": "cmd", "exec": "cmd", "failed": "cmd"}
 
 
 def test_cmd_does_not_override_type() -> None:
@@ -504,8 +546,12 @@ def test_cmd_does_not_override_type() -> None:
 
 
 def test_first_unevaluable_filter_is_the_reason() -> None:
-    assert _parse("status=error&min_duration=1&regex=x").excluded == {"kubectl": "status"}
-    assert _parse("max_duration=1&sort=duration").excluded == {"kubectl": "max_duration"}
+    assert _parse("status=error&min_duration=1&regex=x").excluded == {
+        "kubectl": "status", "web": "status",
+    }
+    assert _parse("max_duration=1&sort=duration").excluded == {
+        "kubectl": "max_duration", "web": "max_duration",
+    }
 
 
 def test_common_filters_exclude_nothing() -> None:
@@ -521,6 +567,9 @@ def test_every_selected_kind_excluded_is_empty_not_error() -> None:
     parsed = _parse("type=kubectl&status=error")
     assert parsed.kinds == frozenset()
     assert parsed.excluded == {"kubectl": "status"}
+    parsed = _parse("type=web&regex=x")
+    assert parsed.kinds == frozenset()
+    assert parsed.excluded == {"web": "regex"}
 
 
 def test_resolve_kinds_on_constructed_query() -> None:
@@ -596,15 +645,19 @@ def test_session_kind_examples() -> None:
     [
         ("newest", {"sessions": (AT, "conn-1"), "api_commands": ("T", AT, UUID)}),
         ("newest", {"sessions": "done", "api_commands": ("F", AT, HREQ)}),
+        ("newest", {"web_conns": ("T", AT, UUID)}),
+        ("newest", {"sessions": (AT, "conn-1"), "api_commands": "done", "web_conns": ("T", AT, "w-1")}),
         ("risk", {"sessions": (3, AT, "conn-1"), "api_commands": ("F", 4, AT, UUID)}),
         ("risk", {"sessions": (0, AT, "conn-1"), "api_commands": ("T", AT, "req-1")}),
+        ("risk", {"web_conns": ("T", AT, "w-1")}),
+        ("risk", {"api_commands": ("F", 2, AT, UUID), "web_conns": "done"}),
         ("duration", {"sessions": (1, 12.5, "conn-1")}),
         ("duration", {"sessions": (0, 0, "conn-1")}),
         ("newest", {}),
     ],
 )
 def test_cursor_round_trip(sort: str, positions: dict[str, object]) -> None:
-    kinds = ("ssh",) if sort == "duration" else ("exec", "failed", "kubectl", "ssh")
+    kinds = ("ssh",) if sort == "duration" else tuple(CURSOR_KINDS)
     cursor = Cursor(sort=sort, kinds=kinds, positions=positions)
     token = encode_cursor(cursor)
     assert len(token) <= 2048
@@ -647,7 +700,8 @@ def test_cursor_not_base64url() -> None:
         _cursor_obj(k=[]),
         _cursor_obj(k=["ssh", "exec"]),  # not sorted
         _cursor_obj(k=["ssh", "ssh"]),
-        _cursor_obj(k=["web"]),
+        _cursor_obj(k=["wat"]),  # unknown kind
+        _cursor_obj(k=["web"]),  # web is a kind now, but the default positions name unqueried sources
         {k: v for k, v in _cursor_obj().items() if k != "p"},  # missing field
         _cursor_obj(p={"web": "done"}),  # unknown source
         _cursor_obj(p={"sessions": ["2026-10-05T10:04:11Z", "c"]}),  # no millis
@@ -655,6 +709,16 @@ def test_cursor_not_base64url() -> None:
         _cursor_obj(p={"sessions": [AT, "c", "extra"]}),
         _cursor_obj(p={"sessions": "finished"}),
         _cursor_obj(p={"api_commands": ["X", AT, UUID]}),  # bad phase
+        _cursor_obj(p={"web_conns": ["X", AT, UUID]}),
+        _cursor_obj(p={"web_conns": ["T", "2026-10-05T10:04:11Z", UUID]}),  # no millis
+        _cursor_obj(p={"web_conns": ["T", AT, "bad/id"]}),
+        _cursor_obj(p={"web_conns": ["T", AT]}),
+        _cursor_obj(p={"web_conns": "finished"}),
+        _cursor_obj(sort="risk", p={"web_conns": ["F", AT, UUID]}),  # risk F lacks rank
+        _cursor_obj(sort="risk", p={"web_conns": ["F", True, AT, UUID]}),
+        _cursor_obj(sort="duration", k=["web"], p={"web_conns": ["T", AT, UUID]}),  # no duration position
+        _cursor_obj(k=["ssh"], p={"web_conns": ["T", AT, UUID]}),  # source not queried
+        _cursor_obj(k=["kubectl"], p={"web_conns": ["T", AT, UUID]}),
         _cursor_obj(p={"api_commands": ["T", AT, "h:short"]}),
         _cursor_obj(sort="risk", p={"sessions": [5, AT, "c"]}),  # rank > 4
         _cursor_obj(sort="risk", p={"sessions": [True, AT, "c"]}),  # bool rank
@@ -684,11 +748,14 @@ def test_cursor_wrong_sort() -> None:
 
 
 def test_cursor_wrong_kinds() -> None:
-    token = _token(_cursor_obj())  # all four kinds
+    token = _token(_cursor_obj())  # all five kinds
     detail = _bad([("type", "ssh"), ("cursor", token)], "cursor")
     assert "does not match" in detail
-    # Kinds are compared after exclusions: status drops kubectl.
+    # Kinds are compared after exclusions: status drops kubectl and web.
     detail = _bad([("status", "error"), ("cursor", token)], "cursor")
+    assert "does not match" in detail
+    # scheme drops everything but web
+    detail = _bad([("scheme", "https"), ("cursor", token)], "cursor")
     assert "does not match" in detail
 
 
@@ -699,9 +766,20 @@ def test_cursor_matches_resolved_kinds() -> None:
     assert parsed.cursor.positions == {"sessions": "done"}
 
 
-def test_check_position_rejects_duration_for_api_commands() -> None:
+def test_cursor_matches_web_only_kinds_under_a_web_filter() -> None:
+    token = _token(_cursor_obj(k=["web"], p={"web_conns": ["T", AT, "w-1"]}))
+    parsed = _parse([("scheme", "unknown"), ("cursor", token)])
+    assert parsed.cursor is not None
+    assert parsed.cursor.kinds == ("web",)
+    assert parsed.cursor.positions == {"web_conns": ("T", AT, "w-1")}
+    parsed = _parse([("type", "web"), ("cursor", token)])
+    assert parsed.cursor is not None and parsed.kinds == frozenset({"web"})
+
+
+@pytest.mark.parametrize("source", [SOURCE_API_COMMANDS, SOURCE_WEB])
+def test_check_position_rejects_duration_for_api_sources(source: str) -> None:
     with pytest.raises(ValueError):
-        check_position(SOURCE_API_COMMANDS, "duration", [1, 2.0, UUID])
+        check_position(source, "duration", [1, 2.0, UUID])
 
 
 def test_encode_cursor_rejects_oversize() -> None:
@@ -729,6 +807,8 @@ def test_search_url_fixed_order() -> None:
         "sort": "risk",
         "mode": "regex",
         "q": "x",
+        "upstream": "unverified",
+        "scheme": "https",
         "max_duration": 9,
         "min_duration": 1.5,
         "status": "error",
@@ -752,6 +832,20 @@ def test_search_url_fixed_order() -> None:
     assert dict(parse_qsl(urlsplit(url).query))["min_duration"] == "1.5"
 
 
+def test_search_url_order_places_scheme_and_upstream_after_max_duration() -> None:
+    order = list(SEARCH_URL_ORDER)
+    assert order.index("scheme") == order.index("max_duration") + 1
+    assert order.index("upstream") == order.index("scheme") + 1
+    assert order[order.index("upstream") + 1] == "q"
+    assert order == [
+        "type", "system", "user", "window", "from", "to", "severity", "max_severity",
+        "has_findings", "category", "rule_ids", "status", "min_duration", "max_duration",
+        "scheme", "upstream", "q", "mode", "sort", "discovery", "page_size", "cmd", "cursor",
+    ]
+    url = search_url(q="x", upstream="plaintext", max_duration=5, scheme="http", type="web")
+    assert url == "/search?type=web&max_duration=5&scheme=http&upstream=plaintext&q=x"
+
+
 def test_search_url_drops_none_blank_and_defaults() -> None:
     assert search_url() == "/search"
     assert (
@@ -759,6 +853,7 @@ def test_search_url_drops_none_blank_and_defaults() -> None:
         == "/search"
     )
     assert search_url(discovery="0", rule_ids=[]) == "/search"
+    assert search_url(scheme=None, upstream="") == "/search"
 
 
 def test_search_url_keeps_window_all() -> None:
@@ -821,6 +916,179 @@ def test_url_params_with_cursor_for_next_link() -> None:
     assert _parse(urlsplit(url).query).cursor == cursor
 
 
+# --- scheme / upstream (WEBAPP_SPEC 8.3) ----------------------------------------------------
+
+
+def test_tls_filter_vocabularies() -> None:
+    assert SCHEME_VALUES == ("https", "http", "unknown")
+    assert UPSTREAM_VALUES == ("verified", "ca_only", "unverified", "plaintext", "unknown")
+
+
+def test_tls_filters_absent_by_default() -> None:
+    q = _parse("").query
+    assert (q.scheme, q.scheme_null, q.upstream, q.upstream_null) == (None, False, None, False)
+
+
+@pytest.mark.parametrize(
+    ("value", "stored", "is_null"),
+    [("https", "tls13", False), ("http", "none", False), ("unknown", None, True)],
+)
+def test_scheme_maps_url_value_to_stored_value_or_null_flag(
+    value: str, stored: str | None, is_null: bool
+) -> None:
+    q = _parse(f"scheme={value}").query
+    assert (q.scheme, q.scheme_null) == (stored, is_null)
+    assert (q.upstream, q.upstream_null) == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("value", "stored", "is_null"),
+    [
+        ("verified", "verify_full", False),
+        ("ca_only", "verify_ca", False),
+        ("unverified", "insecure", False),
+        ("plaintext", "none", False),
+        ("unknown", None, True),
+    ],
+)
+def test_upstream_maps_url_value_to_stored_value_or_null_flag(
+    value: str, stored: str | None, is_null: bool
+) -> None:
+    q = _parse(f"upstream={value}").query
+    assert (q.upstream, q.upstream_null) == (stored, is_null)
+    assert (q.scheme, q.scheme_null) == (None, False)
+
+
+def test_scheme_and_upstream_combine_and_leave_the_rest_alone() -> None:
+    parsed = _parse("scheme=http&upstream=verified&user=alice&sort=risk")
+    q = parsed.query
+    assert (q.scheme, q.upstream) == ("none", "verify_full")
+    assert (q.user, q.sort) == ("alice", "risk")
+    assert parsed.kinds == frozenset({"web"})
+    assert parsed.type == "any"  # type is not rewritten: the other kinds are excluded, not unselected
+
+
+@pytest.mark.parametrize("name", ["scheme", "upstream"])
+@pytest.mark.parametrize("value", ["", "%20", "+"])
+def test_blank_tls_filter_is_absent(name: str, value: str) -> None:
+    parsed = _parse(f"{name}={value}")
+    assert parsed.query == UnifiedQuery(kinds=ALL_KINDS)
+    assert parsed.excluded == {}
+
+
+@pytest.mark.parametrize(
+    ("name", "bad"),
+    [
+        ("scheme", "HTTPS"),
+        ("scheme", "Http"),
+        ("scheme", "tls13"),  # a stored value is not a URL value
+        ("scheme", "none"),
+        ("scheme", "ftp"),
+        ("scheme", "https,http"),
+        ("upstream", "verify_full"),  # stored values are not URL values
+        ("upstream", "insecure"),
+        ("upstream", "none"),
+        ("upstream", "Verified"),
+        ("upstream", "ca-only"),
+    ],
+)
+def test_invalid_tls_values_are_rejected_naming_only_the_parameter(name: str, bad: str) -> None:
+    detail = _bad([(name, bad)], name)
+    assert detail == f"'{name}' is not a valid value"
+    assert bad not in detail
+    # an arbitrary value is rejected without being echoed
+    _bad([(name, f"{SENTINEL}_value")], name)
+
+
+def test_surrounding_whitespace_on_a_valid_tls_value_is_trimmed() -> None:
+    assert _parse("scheme=%20https%20").query.scheme == "tls13"
+    assert _parse("upstream=%09plaintext").query.upstream == "none"
+
+
+@pytest.mark.parametrize("name", ["scheme", "upstream"])
+def test_repeated_tls_filter_is_rejected(name: str) -> None:
+    valid = "https" if name == "scheme" else "verified"
+    detail = _bad([(name, valid), (name, valid)], name)
+    assert "only once" in detail
+    _bad([(name, valid), (name, SENTINEL)], name)  # a different value, still a repeat
+
+
+def test_tls_filters_have_no_legacy_aliases() -> None:
+    assert not LEGACY_NAMES & {"scheme", "upstream"}
+    for alias in ("downstream_tls", "upstream_tls", "tls", "https"):
+        assert _parse(f"{alias}=anything").query == UnifiedQuery(kinds=ALL_KINDS)  # unknown: ignored
+    with pytest.raises(TypeError):
+        search_url(scheme_null=True)
+    with pytest.raises(TypeError):
+        search_url(upstream_null=True)
+
+
+@pytest.mark.parametrize(
+    ("query", "excluded"),
+    [
+        ("scheme=https", {"ssh": "scheme", "exec": "scheme", "failed": "scheme", "kubectl": "scheme"}),
+        ("scheme=unknown", {"ssh": "scheme", "exec": "scheme", "failed": "scheme", "kubectl": "scheme"}),
+        ("upstream=plaintext", {"ssh": "upstream", "exec": "upstream", "failed": "upstream", "kubectl": "upstream"}),
+        ("upstream=unknown&scheme=http", {"ssh": "scheme", "exec": "scheme", "failed": "scheme", "kubectl": "scheme"}),
+    ],
+)
+def test_tls_filters_exclude_every_non_web_kind(query: str, excluded: dict[str, str]) -> None:
+    parsed = _parse(query)
+    assert parsed.kinds == frozenset({"web"})
+    assert parsed.excluded == excluded
+    assert list(parsed.excluded) == ["ssh", "exec", "failed", "kubectl"]  # registry order
+    assert all(reason in EXCLUSION_LABELS for reason in excluded.values())
+
+
+def test_tls_filters_with_a_non_web_type_exclude_everything() -> None:
+    for type_, kinds in (("kubectl", {"kubectl"}), ("recordings", REC_KINDS), ("ssh", {"ssh"})):
+        parsed = _parse(f"type={type_}&scheme=https")
+        assert parsed.kinds == frozenset()
+        assert parsed.excluded == {k: "scheme" for k in kinds}
+    parsed = _parse("type=web&scheme=https&upstream=verified")
+    assert parsed.kinds == frozenset({"web"}) and parsed.excluded == {}
+
+
+def test_web_cannot_evaluate_recording_filters_even_with_tls_filters() -> None:
+    parsed = _parse("scheme=https&status=error")
+    assert parsed.kinds == frozenset()
+    assert parsed.excluded == {
+        "ssh": "scheme", "exec": "scheme", "failed": "scheme", "kubectl": "status", "web": "status",
+    }
+    parsed = _parse("scheme=https&sort=duration")
+    assert parsed.kinds == frozenset()
+    assert parsed.excluded["web"] == "sort"
+
+
+@pytest.mark.parametrize("scheme", SCHEME_VALUES)
+@pytest.mark.parametrize("upstream", UPSTREAM_VALUES)
+def test_tls_filters_round_trip_through_url_params(scheme: str, upstream: str) -> None:
+    parsed = _parse(f"scheme={scheme}&upstream={upstream}&type=web")
+    params_ = parsed.url_params()
+    assert params_["scheme"] == scheme and params_["upstream"] == upstream  # incl. unknown
+    url = search_url(**params_)
+    assert dict(parse_qsl(urlsplit(url).query)) == {"type": "web", "scheme": scheme, "upstream": upstream}
+    reparsed = _parse(urlsplit(url).query)
+    assert reparsed.query == parsed.query
+
+
+@pytest.mark.parametrize("name", ["scheme", "upstream"])
+def test_url_params_omit_an_absent_tls_filter(name: str) -> None:
+    parsed = _parse("type=web")
+    assert parsed.url_params()[name] is None
+    assert name not in _names(search_url(**parsed.url_params()))
+
+
+def test_unknown_tls_value_survives_the_next_page_link() -> None:
+    cursor = Cursor(sort="newest", kinds=("web",), positions={"web_conns": ("T", AT, "w-1")})
+    parsed = _parse("scheme=unknown&upstream=unknown")
+    url = search_url(**parsed.url_params(), cursor=encode_cursor(cursor))
+    assert _names(url) == ["scheme", "upstream", "cursor"]
+    again = _parse(urlsplit(url).query)
+    assert again.query.scheme_null and again.query.upstream_null
+    assert again.cursor == cursor
+
+
 # --- module layout ----------------------------------------------------------------------
 
 
@@ -845,3 +1113,54 @@ def test_store_never_imports_web() -> None:
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     assert not alias.name.startswith("gatorcast.web"), path.name
+
+
+# --- Session 12 fix loop (F): decode_cursor / check_position raise CursorMismatch ---------------------
+
+from gatorcast.store.timeline import CursorMismatch  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "abc+/=",  # not base64url
+        "a",  # impossible length
+        _token(_cursor_obj())[:-7],  # truncated
+        _token(_cursor_obj(v=2)),  # unknown version
+        _token(_cursor_obj(sort="oldest")),
+        _token(_cursor_obj(k=[])),
+        _token(_cursor_obj(extra=1)),
+        _token({"v": 1}),
+        _token([1, 2, 3]),
+        _token(_cursor_obj(p={"nope": [AT, "x"]})),  # unknown source
+    ],
+    ids=["charset", "length", "truncated", "version", "sort", "kinds-empty", "extra-field",
+         "missing-fields", "not-an-object", "unknown-source"],
+)
+def test_decode_cursor_raises_cursor_mismatch_and_never_echoes_the_value(raw: str) -> None:
+    """F: every decode failure is a CursorMismatch (the only error the routes turn into a 400)."""
+    with pytest.raises(CursorMismatch) as exc_info:
+        decode_cursor(raw)
+    if len(raw) > 8:  # a 1-character value is trivially a substring of any message
+        assert raw not in str(exc_info.value)
+    assert isinstance(exc_info.value, ValueError)
+
+
+def test_decode_cursor_oversize_is_a_cursor_mismatch() -> None:
+    with pytest.raises(CursorMismatch):
+        decode_cursor("A" * 2049)
+
+
+def test_encode_cursor_oversize_is_an_internal_error_not_a_cursor_mismatch() -> None:
+    """The encoder only ever sees engine-issued cursors: too long is an internal ValueError."""
+    cursor = Cursor(sort="newest", kinds=("ssh",), positions={"sessions": (AT, "a" * 2000)})
+    with pytest.raises(ValueError) as exc_info:
+        encode_cursor(cursor)
+    assert not isinstance(exc_info.value, CursorMismatch)
+
+
+def test_parse_unified_query_turns_only_a_cursor_mismatch_into_a_400() -> None:
+    """A bad cursor token parses to a 400 naming ``cursor``; the 400 is the HTTPException, not the raw error."""
+    detail = _bad([("cursor", "abc+/=")], "cursor")
+    assert "invalid" in detail
+    _bad([("sort", "risk"), ("cursor", _token(_cursor_obj()))], "cursor")  # valid token, other sort

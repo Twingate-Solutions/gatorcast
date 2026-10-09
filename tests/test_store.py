@@ -526,7 +526,8 @@ async def test_list_systems_timestamps_in_requested_at_format(
     assert by_addr["api-only"].last_session_at is None
     assert by_addr["api-only"].last_api_at == "2026-10-01T07:00:00.000Z"
     assert by_addr["api-only"].session_count == 0
-    assert by_addr["api-only"].api_request_count == 1
+    assert by_addr["api-only"].kubectl_request_count == 1
+    assert by_addr["api-only"].web_request_count == 0
 
 
 async def test_list_systems_ordered_by_newer_timestamp(repo: SessionRepository, db) -> None:
@@ -584,6 +585,95 @@ async def test_list_systems_badges(repo: SessionRepository, db) -> None:
         "api-cluster": (False, True),
         "dead-box": (False, False),
     }
+
+
+async def _insert_api_kind(
+    db, request_id: str, resource_address: str | None, requested_at: str, api_kind: str
+) -> None:
+    """Insert a minimal api_requests row of one kind."""
+    await db.execute(
+        "INSERT INTO api_requests (request_id, conn_id, resource_address, requested_at, "
+        "method, url, api_kind) VALUES (?, 'conn-x', ?, ?, 'GET', '/x', ?)",
+        (request_id, resource_address, requested_at, api_kind),
+    )
+    await db.commit()
+
+
+async def test_list_systems_splits_request_counts_by_kind(repo: SessionRepository, db) -> None:
+    """Session 11 (WEBAPP_SPEC 8.5): kubectl_request_count and web_request_count count their own kind."""
+    t = "2026-10-01T10:00:00.000Z"
+    for i in range(3):
+        await _insert_api_kind(db, f"k{i}", "mixed", t, "kubectl")
+    for i in range(5):
+        await _insert_api_kind(db, f"w{i}", "mixed", t, "web")
+    for i in range(2):
+        await _insert_api_kind(db, f"wo{i}", "web-only", t, "web")
+    await _insert_api_kind(db, "ko", "kube-only", t, "kubectl")
+
+    by_addr = {s.resource_address: s for s in await repo.list_systems()}
+    assert (by_addr["mixed"].kubectl_request_count, by_addr["mixed"].web_request_count) == (3, 5)
+    assert (by_addr["web-only"].kubectl_request_count, by_addr["web-only"].web_request_count) == (0, 2)
+    assert (by_addr["kube-only"].kubectl_request_count, by_addr["kube-only"].web_request_count) == (1, 0)
+    assert not hasattr(by_addr["mixed"], "api_request_count")
+
+
+async def test_list_systems_split_counts_fold_sessions_and_requests_into_one_row(
+    repo: SessionRepository, db
+) -> None:
+    """A system with sessions and both request kinds stays one row with every count."""
+    t = "2026-10-01T10:00:00.000Z"
+    await _insert_row(db, "s1", "both", started_at=t, chunk_count=1, request_id="exec-req")
+    await _insert_api_kind(db, "k1", "both", t, "kubectl")
+    await _insert_api_kind(db, "w1", "both", t, "web")
+    systems = [s for s in await repo.list_systems() if s.resource_address == "both"]
+    assert len(systems) == 1
+    system = systems[0]
+    assert (system.session_count, system.exec_count) == (1, 1)
+    assert (system.kubectl_request_count, system.web_request_count) == (1, 1)
+
+
+async def test_has_kubernetes_ignores_web_requests(repo: SessionRepository, db) -> None:
+    """Web rows never earn the Kubernetes badge; kubectl rows and exec recordings still do."""
+    t = "2026-10-01T10:00:00.000Z"
+    await _insert_api_kind(db, "w1", "web-only", t, "web")
+    await _insert_api_kind(db, "k1", "kube-only", t, "kubectl")
+    await _insert_api_kind(db, "w2", "exec-web", t, "web")
+    await _insert_row(db, "e1", "exec-web", started_at=t, chunk_count=1, request_id="q")
+
+    by_addr = {s.resource_address: s for s in await repo.list_systems()}
+    assert by_addr["web-only"].has_kubernetes is False
+    assert by_addr["web-only"].has_ssh is False
+    assert by_addr["kube-only"].has_kubernetes is True
+    assert by_addr["exec-web"].has_kubernetes is True  # through the exec recording, not the web row
+
+
+async def test_web_only_system_is_still_listed_with_its_last_request_time(
+    repo: SessionRepository, db
+) -> None:
+    await _insert_api_kind(db, "w1", "web-only", "2026-10-01T09:00:00.000Z", "web")
+    await _insert_api_kind(db, "w2", "web-only", "2026-10-01T09:30:00.000Z", "web")
+    (system,) = await repo.list_systems()
+    assert system.resource_address == "web-only"
+    assert system.session_count == 0
+    assert system.last_api_at == "2026-10-01T09:30:00.000Z"
+
+
+async def test_upsert_start_stores_resource_type_and_never_clears_it(
+    repo: SessionRepository, db
+) -> None:
+    await repo.upsert_start("rt-1", username="u@x", resource_address="h", started_at=None, resource_type="SSH")
+    await repo.upsert_start("rt-1", username=None, resource_address=None, started_at=None)
+    cur = await db.execute("SELECT resource_type FROM sessions WHERE conn_id = 'rt-1'")
+    assert (await cur.fetchone())["resource_type"] == "SSH"
+    await repo.upsert_start("rt-1", username=None, resource_address=None, started_at=None, resource_type="DATABASE")
+    cur = await db.execute("SELECT resource_type FROM sessions WHERE conn_id = 'rt-1'")
+    assert (await cur.fetchone())["resource_type"] == "DATABASE"
+
+
+async def test_upsert_start_without_resource_type_leaves_it_null(repo: SessionRepository, db) -> None:
+    await repo.upsert_start("rt-2", username="u@x", resource_address="h", started_at=None)
+    cur = await db.execute("SELECT resource_type FROM sessions WHERE conn_id = 'rt-2'")
+    assert (await cur.fetchone())["resource_type"] is None
 
 
 async def test_list_systems_findings_summary(repo: SessionRepository, db) -> None:

@@ -32,7 +32,7 @@ needed. There is no `conftest.py`; each test module builds its own app, settings
 # From the project root, in a virtualenv:
 python -m venv .venv
 . .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"       # installs pytest + pytest-asyncio + httpx
+pip install -c constraints.txt -e ".[dev]"   # installs pytest + pytest-asyncio + httpx, pinned as CI does
 
 pytest                        # run everything
 pytest -q                     # quieter (this is what CI runs)
@@ -47,39 +47,39 @@ elsewhere.
 
 ### Test inventory
 
-The suite currently collects **1379 tests** across 26 test modules, and all 1379 pass
-(`pytest -q`, about 47 seconds, with one third-party Starlette deprecation warning about
-`httpx`). Counts are from `pytest --collect-only`; parametrized cases count individually, so
-they drift as tests are added.
+The suite currently collects **3017 tests** across 27 test modules, and all 3017 pass
+(`pytest -q`, about 157 seconds, with one third-party Starlette deprecation warning about `httpx`). Counts are from `pytest --collect-only`;
+parametrized cases count individually, so they drift as tests are added.
 
 | Area | Module | Tests | Covers |
 | --- | --- | --- | --- |
-| Ingest front doors | `test_ingest_http.py` | 8 | `POST /ingest`: bearer auth (401), NDJSON, JSON array, single object, per-line tolerance, Docker `{"log":…}` unwrap on the `application/json` path. Asserts on the rows that land in SQLite (sessions, pending connections, API requests). |
+| Ingest front doors | `test_ingest_http.py` | 13 | `POST /ingest`: bearer auth (401), NDJSON, JSON array, single object, per-line tolerance, Docker `{"log":…}` unwrap on the `application/json` path, splitting on `\n` only (a Unicode line separator inside a header value does not tear the line), non-JSON lines dropped without failing the batch, lone surrogate escapes replaced and the lines stored. Asserts on the rows that land in SQLite (sessions, pending connections, API requests). |
 | | `test_syslog_tcp.py` | 8 | Octet-counted and newline framing, back-to-back frames, EOF, end-to-end enqueue, and the defensive bounds (`MAX_FRAME_BYTES`, `MAX_LENGTH_DIGITS`). |
 | | `test_normalize.py` | 10 | Plain JSON, syslog-wrapped, collector-wrapped, and junk lines. |
-| Pipeline | `test_classify.py` | 244 | Legacy log-line classification: the two-stage recording filter, start/end events, API-request events, header and URL allowlisting, timestamp normalization. |
+| Pipeline | `test_classify.py` | 625 | Legacy log-line classification: the two-stage recording filter, start/end events, API-request events, header and URL allowlisting, timestamp normalization. Web apps: `resource_type` normalization (and the `invalid` marker), the web URL form on every request, the widened method gate, and every `gwops` object outcome (accepted variants, each rejection reason with exactly one warning that names only the reason and `conn_id`, an ignored `app`, the object ignored on non-`WEB_APP` starts) over the web fixtures. |
+| | `test_webmask.py` | 114 | `pipeline/webmask.py`: the masking function (quarter rule, revealed-character cleaning), the web URL form (path kept verbatim, no `proxy` truncation, no query allowlist, 4096 cap after masking), padded base64 tokens, and the provisional form. Pins that paths are **not** masked, so path masking cannot be added silently. |
 | | `test_classify_envelope.py` | 16 | The envelope wire format (`session_start` / `recording_chunk` / `session_end` records with no `logger`), plus a legacy-regression check. |
-| | `test_assembler.py` | 72 | Reassembly, finalize, idle backstop, startup sweep, and the connection lifecycle (pending → recording / api / error). Also the persisted seal mode: a late chunk after a restart or cache eviction leaves a terminally sealed `.cast` byte-identical, reopens a reopenably sealed one, and is ignored for an orphan or missing file; run with encryption off and on. |
-| | `test_extract.py` | 5 | Plaintext extraction and the character-to-time offset index. |
-| | `test_detect.py` | 71 | Built-in cast rules and the Kubernetes API rules; positive samples and look-alike negatives. |
+| | `test_assembler.py` | 267 | Reassembly, finalize, idle backstop, startup sweep, and the connection lifecycle (pending → recording / api / error). The persisted seal mode: a late chunk after a restart or cache eviction leaves a terminally sealed `.cast` byte-identical, reopens a reopenably sealed one, and is ignored for an orphan or missing file; run with encryption off and on. Web apps: the storage policy per connection row (Kubernetes, no type, `WEB_APP`, any other type), requests before their start line stored fail-closed and converted when the start line arrives, redelivered batches, idle `WEB_APP` connections expiring to the hidden `empty` state with no session row, a request after `empty`, and the same sweep still surfacing SSH and Kubernetes errors. |
+| | `test_extract.py` | 8 | Plaintext extraction and the character-to-time offset index, including an event that holds a raw Unicode line separator. |
+| | `test_detect.py` | 103 | Built-in cast rules and the Kubernetes API rules; positive samples and look-alike negatives, and the guard that every built-in API rule is Kubernetes-only. |
 | | `test_backfill.py` | 4 | Startup index + detect pass for finalized sessions that lack a sidecar. |
-| | `test_retention.py` | 25 | Age and size purge, including API requests, API findings, and connections. |
-| | `test_activity.py` | 65 | Pure kubectl activity grouping: discovery, commands, activity sessions. |
-| Storage / crypto | `test_store.py` | 73 | `SessionRepository` and `CastStore`, including `list_systems` (`last_session_at`, `last_api_at`, `ssh_count` / `exec_count`, ordering by the newer timestamp) and the persisted seal mode. |
-| | `test_db_schema.py` | 52 | Schema, indexes (including the four search indexes, with a second `init_db` a no-op and `user_version` still 1), the `sealed_terminal` column, the `gc_is_discovery` SQL function, the connections / api_requests / api_findings tables, and migrations. |
+| | `test_retention.py` | 30 | Age and size purge, including API requests, API findings, and connections (connections purged on last activity). |
+| | `test_activity.py` | 72 | Pure activity grouping: discovery, commands, activity sessions, and web visits. |
+| Storage / crypto | `test_store.py` | 79 | `SessionRepository` and `CastStore`, including `list_systems` (`last_session_at`, `last_api_at`, `ssh_count` / `exec_count`, the kubectl and web request counts, the newest web TLS lookup, ordering by the newer timestamp) and the persisted seal mode. |
+| | `test_db_schema.py` | 84 | Schema, indexes (the `api_kind`-led indexes replacing the retired ones, with a second `init_db` a no-op and `user_version` still 1), the `sealed_terminal` column, the `gc_is_discovery` SQL function, the connections / api_requests / api_findings tables, migrations, the `empty` connection state, and the documented types of the new `resource_type`, `gwops` and TLS columns (no constraints, no index over them, no manifest tables). |
 | | `test_crypto.py` | 11 | AES-256-GCM `Cryptor`: round-trip, tamper, wrong key, wrong AAD, bad key. |
-| | `test_search_store.py` | 27 | Findings persistence, the deprecated `SearchStore.search` wrapper, content scan, dashboard stats (windowing on the recording start, command-based API figures). |
-| | `test_activity_store.py` | 115 | `ActivityStore`: connections, deduplicated API requests, API findings. |
-| | `test_timeline.py` | 114 | The unified search engine (`store/timeline.py`): command identity and grouping, window edges, keyset paging with no duplicate or skipped item for every source and sort, the merge against a brute-force sort, budget frontiers and *Continue*, filters and exclusions, risk-sort phases, flagged cap, failed-connection kind, user filter, `cmd` focus. |
-| | `test_query_plans.py` | 25 | `EXPLAIN QUERY PLAN` pins for the hot queries. Asserts index names, not plan text, so it survives SQLite version differences. |
-| Web / config | `test_web.py` | 23 | Session/system routes, auth, `/cast`, fail-closed encryption, no external asset URLs, systems badges and timestamp columns, user and exec-to-command links. |
-| | `test_web_search.py` | 89 | Unified `/search`: type select, interleaved kinds, failed rows, the exec row shown twice, legacy URLs, `cmd=` focus, HTMX partials and `400` partial, **Next ›** cursors, escaping; the 15-column CSV; the dashboard's links, figures and recent-activity feed. |
-| | `test_search_params.py` | 215 | `web/params.py` and `web/kinds.py`: canonical and legacy parsing, every `400` (enum, length, repeat, conflict, window with `from`, `from > to`, `page_size`, regex), cursor round-trip and tamper cases, no `400` body echoing the value, `search_url` ordering, `resolve_kinds` exclusions, and a check that `store/` never imports `gatorcast.web`. |
-| | `test_web_activity.py` | 54 | kubectl activity routes, parameter validation (400s), dashboard kubectl card, activity-page links. |
+| | `test_search_store.py` | 30 | Findings persistence, the deprecated `SearchStore.search` wrapper, content scan, dashboard stats (windowing on the recording start, command-based API figures, kubectl-only API total, the web request total). |
+| | `test_activity_store.py` | 226 | `ActivityStore`: connections, deduplicated API requests, API findings. Web apps: the two API kinds, web storage and redelivery, `resource_type` first write wins (a forged start cannot retype a connection in either direction), the web backfill (only that connection, repeatable, first processing only), expiry of idle web connections to `empty`, and the `gwops` snapshot reads. |
+| | `test_timeline.py` | 339 | The unified search engine (`store/timeline.py`): command identity and grouping, window edges, keyset paging with no duplicate or skipped item for every source and sort, the merge against a brute-force sort, budget frontiers and *Continue*, filters and exclusions, risk-sort phases, flagged cap, failed-connection kind, user filter, `cmd` focus. Web apps: the `web` source (one row per connection, primary request, text filter, `scheme` and `upstream`, cursors across kinds, focus across both API sources, per-kind budgets) and a guard that no built-in API rule applies to web. |
+| | `test_query_plans.py` | 49 | `EXPLAIN QUERY PLAN` pins for the hot queries, including the web queries (time range of its kind, the two user indexes, command probes, hydration, no discovery function, focus by primary key). Asserts index names, not plan text, so it survives SQLite version differences. |
+| Web / config | `test_web.py` | 37 | Session/system routes, auth, `/cast`, fail-closed encryption, no external asset URLs, systems badges and timestamp columns, user and exec-to-command links. |
+| | `test_web_search.py` | 208 | Unified `/search`: type select, interleaved kinds, failed rows, the exec row shown twice, legacy URLs, `cmd=` focus, HTMX partials and `400` partial, **Next ›** cursors, escaping; the CSV; the dashboard's links, figures and recent-activity feed. Web apps: the `web` type and its interleaving with kubectl, web rows (one per connection, app name and managed marker for exact snapshots, "unnamed" and the fixed gateway-id tooltip text, no app element for `none`/`ambiguous`/absent, escaping of the app name and gateway id, **Visit ›** and **Focus ›** links), `cmd` focus on a web request, and the 22-column CSV (header, columns 16 to 22 per kind, the formula guard on every text column). |
+| | `test_search_params.py` | 309 | `web/params.py` and `web/kinds.py`: canonical and legacy parsing, every `400` (enum, length, repeat, conflict, window with `from`, `from > to`, `page_size`, regex), cursor round-trip and tamper cases, no `400` body echoing the value, `search_url` ordering, `resolve_kinds` exclusions, and a check that `store/` never imports `gatorcast.web`. Web apps: the `scheme` and `upstream` values and their mapping, exclusion of every non-web kind, `search_url` ordering, and `cmd` across kubectl and web. |
+| | `test_web_activity.py` | 155 | kubectl activity routes, parameter validation (400s), dashboard kubectl card, activity-page links. Web apps: the systems summary split and badges (a web-only system never gets the Kubernetes badge), per-kind Requests links, the system page's configured-TLS block (every `gwops` state) and Web activity table, the `/systems/{slug}/web` visit view and its validation, hostile and `/`-containing addresses, and the dashboard's split kubectl and web tiles. |
 | | `test_config_search.py` | 10 | Detection/search and kubectl-activity settings, including the `0 < gap <= max` validator. |
 | | `test_bootstrap.py` | 2 | App boots through its lifespan, `/healthz` returns OK, schema initializes. |
-| End-to-end | `test_e2e_search.py` | 1 | `/ingest` → classify → assembler → detect → search UI, asserting recorded content never appears in HTML or CSV. |
-| Secret hygiene | `test_secret_hygiene.py` | 40 | Posts `kubectl_audit_lines.ndjson` (planted sentinel secrets) through `/ingest`, with encryption off and on, then walks 87 seeded search URLs (every `type`, `user=` by username and by user id, `cmd=`, cursor walks, 15 CSV exports) plus a crawl of the linked pages, and asserts no sentinel, `command=` value or full `User-Agent` reaches the database, logs, UI or any export. |
+| End-to-end | `test_e2e_search.py` | 2 | `/ingest` → classify → assembler → detect → search UI, asserting recorded content never appears in HTML or CSV; and the same path for web apps (start line with a `gwops` object, requests, search pages, visit view, CSV). |
+| Secret hygiene | `test_secret_hygiene.py` | 206 | Posts `kubectl_audit_lines.ndjson` (planted sentinel secrets) through `/ingest`, with encryption off and on, then walks the seeded search URLs (every `type`, `user=` by username and by user id, `cmd=`, cursor walks, CSV exports) plus a crawl of the linked pages, and asserts no sentinel, `command=` value or full `User-Agent` reaches the database, logs, UI or any export. A second harness posts the web fixtures (credential-header sentinels, query-value sentinels, spoofed identity headers, `gwops` unknown-key and non-web `gwops` sentinels) and asserts none reaches the database, data volume, logs, any page (cursor pages and the visit view included) or any CSV. Path-token sentinels are asserted **present and unmasked** in the stored URLs and absent from logs and the volume, which pins the accepted risk. |
 
 `test_detect.py` is the source of truth for rule behavior — it asserts both that each rule
 fires on a positive sample and that look-alike-but-safe input does not.
@@ -93,15 +93,17 @@ There is no shared `conftest.py` fixture layer. Shared test data lives in `tests
 | `tests/fixtures/sample_log_lines.ndjson` | Three real Gateway lines: a recording chunk, an `Authenticated connection` start line (a different `conn_id`), and a legacy API-audit line. |
 | `tests/fixtures/kubectl_audit_lines.ndjson` | 13 synthetic lines: three start lines, API audits (one `failed`, one legacy line with no `request_id`), a status-101 exec audit, and k8s recording chunks including a `session finished` flush. Planted with `GC_SENTINEL_*` secrets for the hygiene test. |
 | `tests/fixtures/timeline.py` | Builder for the unified-search tests. Inserts synthetic `sessions`, `findings`, `api_requests`, `api_findings` and `connections` rows through the stores with controlled timestamps: two clusters and two users, a kubectl run spanning two connections under one `Kubectl-Session`, a k9s-style connection with 250 requests, a discovery-only command, an exec command linked to its recording, commands straddling a window edge, a failed connection, and rows with only a user id. Nothing in it comes from a real capture. |
-| `tests/samples.py` | `sample_lines()` helper that reads `sample_log_lines.ndjson`. |
+| `tests/fixtures/webapp_lines.ndjson` | 332 lines of `WEB_APP` traffic. The JSON traffic lines of a live gwops capture, sanitized (user ids, usernames, group ids, the tenant label and every credential header value replaced), plus synthetic lines for shapes the capture lacks: start lines carrying each `gwops` variant (every upstream and downstream mode, unmanaged with a free-text app name, `match: none` and `ambiguous`, a null gateway id, and invalid objects of each rejection kind), a start line with no object, non-web starts carrying a `gwops` object, requests with credential-header sentinels (values present and stripped), spoofed identity headers, path-token and query-value sentinels, unusual methods, a 101, a 502, a panic line, requests that arrive before their start line, and a redelivered batch. |
+| `tests/fixtures/webapp_interim_lines.ndjson` | 67 lines of what gwops forwards today and its filter will stop forwarding: non-JSON lines, gateway service and token-rejection lines, and SSH audit and operational lines (approximate shapes). Used to prove they are dropped without storing or logging content. |
+| `tests/samples.py` | `sample_lines()` helper that reads `sample_log_lines.ndjson`, plus the registries and helpers for the web fixtures (`webapp_lines`, `webapp_lines_for`, `webapp_batch`, `webapp_redelivery`, `webapp_interim_lines`, `webapp_mixed_batch`) and the `gwops` variant table. The app-to-mode mapping is inferred from the capture's rig app names and the interim SSH shapes are approximate; the module says so. |
 
 ### What CI runs
 
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml) is the only workflow. Its
-`test` job runs on `ubuntu-latest` with Python 3.12:
+`test` job runs on `ubuntu-latest` with Python 3.12.10:
 
 ```bash
-pip install -e ".[dev]"
+pip install -c constraints.txt -e ".[dev]"
 pytest -q
 ```
 
@@ -114,13 +116,13 @@ requests, and CI runs no linter or type checker. Run `pytest -q` locally before 
 ## 2. Seeding demo data
 
 [`scripts/seed_demo.py`](scripts/seed_demo.py) is the fastest way to populate the dashboard
-and search UI. It POSTs 8 synthetic sessions (varied users, systems, and dates) as a single
-NDJSON batch through the **real `/ingest` front door**. Each session is three log objects: an
+and search UI. It POSTs 8 synthetic sessions (varied users, systems, and dates) and 7 `WEB_APP`
+demo apps as a single NDJSON batch through the **real `/ingest` front door**. Each session is three log objects: an
 `Authenticated connection` start line, one recording chunk, and a `Connection closed` event.
 The start line creates a hidden pending connection, the chunk promotes it to a recording
 (and creates the session), and the close event seals the session to complete immediately
-instead of waiting on the idle backstop. The script sends no API-audit lines, so it does not
-exercise kubectl activity.
+instead of waiting on the idle backstop. The script sends no Kubernetes API-audit lines, so it
+does not exercise kubectl activity. The web apps are described below.
 
 Between them the sessions trip **every** built-in cast rule exactly once (21 findings in
 total), and the final two sessions in the script are controls: `c-bastion-04`, an ordinary
@@ -147,24 +149,49 @@ docker compose up -d
 
 # 2. Seed it.
 python scripts/seed_demo.py
-# -> POST /ingest -> 204 (24 objects, 8 sessions)
+# -> POST /ingest -> 204 (115 objects: 8 sessions, 7 web apps / 91 lines)
 
 # 3. Browse http://127.0.0.1:8080/dashboard?window=all — you should see 8 sessions,
 #    6 of them flagged, severity/category breakdowns, and the two clean sessions with no
-#    findings.
+#    findings, plus a Web requests tile (70 requests).
 ```
 
-`/ingest` returns `204 No Content`, which is what the script prints. The 24 objects are 8
-sessions times 3 lines; the count did not change when start lines started creating pending
-connections, because every seeded connection also delivers a chunk and so becomes a session.
+`/ingest` returns `204 No Content`, which is what the script prints. The 24 recording objects
+are 8 sessions times 3 lines; the count did not change when start lines started creating pending
+connections, because every seeded connection also delivers a chunk and so becomes a session. The
+91 web lines are 7 apps times 3 connections, each a start line plus 3 or 4 requests.
 
-**Use `?window=all` on the dashboard.** The seed timestamps are fixed dates between
-2026-06-12 and 2026-06-18. The dashboard defaults to the last 30 days, so once those dates
+### Web-app demo data
+
+Each demo app gets three connections (three different users) of 3, 3 and 4 requests: a `GET` with
+a query string, a `POST`, a `DELETE`, a 404, a 502, a 403 and a 503. Between them the seven apps
+cover every state the UI shows:
+
+| App (`resource_address`) | `gwops` object | Shows as |
+| --- | --- | --- |
+| `portal.demo.test` | `exact`, managed, TLS 1.3 down, `verify_full` up | `HTTPS`, no upstream marker |
+| `intranet.demo.test` | `exact`, managed, plaintext both legs | `HTTP`, `Plaintext upstream` |
+| `metrics.demo.test` | `exact`, managed, TLS 1.3 down, `insecure` up | `HTTPS`, `Unverified upstream` |
+| `billing.demo.test` | `exact`, managed, TLS 1.3 down, `verify_ca` up | `HTTPS`, `CA-only upstream` |
+| `wiki.demo.test` | `exact`, **unmanaged** (app `Legacy Wiki (prod)`), `gateway_id` null | `HTTPS`, `Plaintext upstream`, "gateway id not yet assigned" on the system page |
+| `plain.demo.test` | none: the start lines carry no `gwops` key | `TLS unknown`, "No gwops data" |
+| `orphan.demo.test` | `match: none` | `TLS unknown`, "gwops matched no web app" |
+
+The script does not seed a `match: ambiguous` object or a rejected one; the test suite covers both.
+Every request line also carries a dummy `Authorization: Bearer DEMO-NOT-A-REAL-TOKEN` header,
+which must never appear anywhere in the UI or a CSV export. A request to
+`/login?token=abc123def456` is stored as `/login?token=ab…6(12)`. Web ids are derived from fixed
+names, so running the script again posts the same `conn_id` and `request_id` values and ingest
+deduplicates them. Web results are at `/search?type=web`, per app at `/systems/<address>`, and
+filterable with `scheme` and `upstream` (for example `/search?type=web&upstream=plaintext`).
+
+**Use `?window=all` on the dashboard.** The recording seed timestamps are fixed dates between
+2026-06-12 and 2026-06-18, and the web seed starts at 2026-10-08 09:00 UTC. The dashboard defaults to the last 30 days, so once those dates
 are older than that, the default view shows nothing. For the same reason, the daily
 retention purge removes the seeded sessions once they are older than `RETENTION_DAYS`
 (default 90). Edit the timestamps in the script, or set `RETENTION_DAYS=0`, to keep them.
 `/systems` and `/search` are not windowed unless a `window` (or `from`/`to`) filter is set
-(the dashboard's links carry `window`). The script sends no API-audit lines, so after
+(the dashboard's links carry `window`). The script sends no Kubernetes API-audit lines, so after
 seeding `type=kubectl` in search is empty and the systems list shows no Kubernetes badges.
 
 The script is not part of the app and is safe to delete. To point it at a different host or

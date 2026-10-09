@@ -1,24 +1,26 @@
 {#
   Row macros for the unified Search results (spec §8.3, §8.6). Used by
-  _results.html and by the dashboard "recent activity" feed (spec §8.2). A future
-  `web_row` macro slots in here.
+  _results.html and by the dashboard "recent activity" feed (spec §8.2). Three macros:
+  recording_row (ssh, exec, failed), command_row (kubectl), web_row (web connection).
 
   Each macro emits ONE <tbody class="result">: a summary row (7 cells: Type, Start,
   System, User, Summary, Risk, action) plus an optional detail row. With
   `compact=true` (the dashboard feed) the detail row is omitted and a command row's
   action is "Details ›" to its single-command search (`focus_url`). `item` is a
-  plain dict built by routes._recording_item_view / _command_item_view (see the
-  template context contract). Metadata only: no recording content is ever rendered
+  plain dict built by routes._recording_item_view / _command_item_view /
+  _web_item_view (see the template context contract). Metadata only: no recording content is ever rendered
   (CLAUDE.md rules 5 and 6).
 
   Safety:
     * Everything is autoescaped. Never add |safe — `label`, `path`, request URLs and
       usernames are client-influenced.
     * Class names come only from `badge_class` (registry), `status_class` (fixed
-      map) and severity keys (sanitized to SEVERITY_RANK keys in the route).
+      map) and severity keys mapped through `sev_cls` (closed set, neutral fallback).
+    * Stored text (system, user, shell user, label, path, URL, app name) is wrapped
+      in <bdi> or carries a class that app.css isolates (unicode-bidi).
     * All links are pre-built by the route; nothing here builds a URL.
 #}
-{% from "_macros.html" import status_chip, failed_pill, severity_cell, request_table, user_link %}
+{% from "_macros.html" import status_chip, failed_pill, severity_cell, request_table, user_link, badge, web_status, sev_cls %}
 
 {# A recording-backed row: kinds ssh, exec, failed. #}
 {% macro recording_row(item, compact=false) %}
@@ -31,7 +33,7 @@
       <td>
         {% if item.duration_display %}<span class="duration">{{ item.duration_display }}</span>{% endif %}
         <span class="pill {{ item.status_class }}">{{ item.status_label }}</span>
-        {% if item.shell_user %}<span class="dim">shell <span class="mono">{{ item.shell_user }}</span></span>{% endif %}
+        {% if item.shell_user %}<span class="dim">shell <bdi class="mono">{{ item.shell_user }}</bdi></span>{% endif %}
         {% if item.command_url %}<a class="command-link" href="{{ item.command_url }}">kubectl command ›</a>{% endif %}
       </td>
       <td>{{ severity_cell(item.finding_count, item.max_severity) }}</td>
@@ -49,7 +51,7 @@
           <ul class="finding-strip" aria-label="Findings">
             {% for f in item.findings %}
               <li>
-                <span class="sev{{ ' sev-' ~ f.severity if f.severity else '' }}">{{ f.label }}</span>
+                <span class="sev {{ sev_cls(f.severity) if f.severity else '' }}">{{ f.label }}</span>
                 {% if f.jump_url %}<a class="jump" href="{{ f.jump_url }}" data-offset="{{ f.offset_seconds }}"><span aria-hidden="true">▶</span> jump</a>{% endif %}
               </li>
             {% endfor %}
@@ -122,6 +124,92 @@
             <a href="{{ item.activity_url }}">Open in activity view ›</a>
             {% if not item.open %}<a class="dim" href="{{ item.focus_url }}">Link to this command</a>{% endif %}
           </p>
+        </details>
+      </td>
+    </tr>
+    {% endif %}
+  </tbody>
+{% endmacro %}
+
+
+{#
+  A web connection row (WEBAPP_SPEC §8.5). The Type cell carries the kind pill, the
+  configured client-TLS badge and the upstream marker (all fixed SystemBadge objects
+  with static "configured, not proof" tooltips). The Summary cell shows, in order:
+    * the app element, ONLY when `item.has_app` (an exact gwops match): `app: <name>`
+      or the fixed `app: (unnamed)`, then the managed/unmanaged pill. The gateway id
+      rides in the double-quoted, autoescaped title attribute (`item.app_title`);
+    * the primary request (method + stored URL: normalized path, masked query);
+    * status, "N requests · duration", Visit ›, Focus ›.
+  A User-Agent or command label is never rendered for web rows. `item.app_label`,
+  `item.url` and `item.requests` are stored text: autoescaped only, never in an
+  href, class, id or style. Every link comes from the route (`visit_url`, `focus_url`).
+  The detail row is a native <details> (open under a cmd= focus) holding the shared
+  request table. With `compact=true` (dashboard feed) the detail row and the Focus
+  link are omitted and the action cell is "Details ›" (`focus_url`).
+#}
+{% macro web_row(item, compact=false) %}
+  <tbody class="result">
+    <tr class="result-row{{ ' is-failed' if item.outcome == 'failed' else '' }}">
+      <td>
+        <div class="badge-cluster">
+          <span class="pill {{ item.badge_class }}">{{ item.kind_label }}</span>
+          {{ badge(item.tls_badge) }}
+          {{ badge(item.upstream_marker) }}
+        </div>
+      </td>
+      <td class="mono dim nowrap">{{ item.at }}</td>
+      <td class="mono"><a href="{{ item.system_url }}">{{ item.system_label }}</a></td>
+      <td class="user-cell">{{ user_link(item.user_label, item.user_url) }}</td>
+      <td class="command-summary">
+        {% if item.has_app %}
+          <div class="web-app"{% if item.app_title %} title="{{ item.app_title }}"{% endif %}>
+            <span class="dim">app:</span>
+            <span class="app-name{{ ' is-unnamed' if item.app_unnamed else '' }}">{{ item.app_label }}</span>
+            {{ badge(item.managed_marker) }}
+          </div>
+        {% endif %}
+        <div class="request-cell">
+          <span class="method mono">{{ item.method or "" }}</span>
+          <span class="mono request-url">{{ item.url or "—" }}</span>
+        </div>
+        <div class="web-row-sub">
+          {{ web_status(item.status_code, item.status_label) }} {{ failed_pill(item.outcome) }}
+          <span class="dim">
+            {{ item.request_count }} request{{ "" if item.request_count == 1 else "s" }}
+            · {{ item.duration_display }}
+          </span>
+          <a class="web-row-link" href="{{ item.visit_url }}" aria-label="Visit view of {{ item.user_label }} on {{ item.system_label }}">Visit <span aria-hidden="true">›</span></a>
+          {% if not compact and not item.open %}
+            <a class="web-row-link" href="{{ item.focus_url }}" aria-label="Focus on this connection">Focus <span aria-hidden="true">›</span></a>
+          {% endif %}
+        </div>
+      </td>
+      <td>
+        {{ severity_cell(item.finding_count, item.max_severity) }}
+        {% if item.finding_count and item.max_severity %}
+          {% for label in item.finding_labels %}
+            <div class="finding-tag">{{ label }}</div>
+          {% endfor %}
+        {% endif %}
+      </td>
+      <td class="action-cell">
+        {% if compact %}
+          <a class="details-link" href="{{ item.focus_url }}" aria-label="Details of this web connection on {{ item.system_label }}">Details <span aria-hidden="true">›</span></a>
+        {% else %}
+          <span class="dim">—</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% if not compact %}
+    <tr class="command-requests result-detail">
+      <td colspan="7">
+        <details{% if item.open %} open{% endif %}>
+          <summary>Requests ({{ item.requests | length }})</summary>
+          {% if item.requests %}{{ request_table(item.requests) }}{% endif %}
+          {% if item.requests_truncated %}
+            <p class="truncated-notice">First {{ item.listed_count }} of {{ item.request_count }} requests — open the visit view for all.</p>
+          {% endif %}
         </details>
       </td>
     </tr>

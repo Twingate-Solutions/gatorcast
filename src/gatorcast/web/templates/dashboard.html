@@ -13,15 +13,17 @@
   `type` + the selected `window`, spec §8.1); the template never builds a /search
   URL. Each tile's value and label sit in ONE <a class="card-link">. The kubectl
   card's flagged-commands line and severity chips are sibling links, never nested
-  inside the tile link.
+  inside the tile link. The "Web requests" tile counts requests and links to the
+  web connections (web_requests_url / web_requests_label from the route).
 
   Feed: the newest items of every kind (discovery-only commands hidden, all time),
   rendered with the shared _rows.html macros in compact form.
 
-  Safety: everything is autoescaped; never add |safe. Severity class names come
-  only from SEVERITY_RANK keys (filtered in the route).
+  Safety: everything is autoescaped; never add |safe. Severity class names go
+  through sev_cls (closed set, neutral fallback). Stored text is isolated by <bdi> or an isolating class (app.css).
 #}
-{% from "_rows.html" import recording_row, command_row %}
+{% from "_rows.html" import recording_row, command_row, web_row %}
+{% from "_macros.html" import sev_cls %}
 
 {% block title %}Dashboard · Gatorcast{% endblock %}
 
@@ -31,7 +33,7 @@
       {% for row in rows %}
         <li>
           <a class="badge-link" href="{{ row.url }}">
-            <span class="sev {{ ('sev-' ~ row.label) if sev_by_label else 'sev-medium' }}">{{ row.label }}</span>
+            <span class="sev {{ sev_cls(row.label) if sev_by_label else 'sev-medium' }}">{{ row.label }}</span>
             <span class="badge-count">{{ row.count }}</span>
           </a>
         </li>
@@ -107,7 +109,7 @@
         </a>
         {% for row in api_severity_rows %}
           <a class="badge-link card-sub-item" href="{{ row.url }}">
-            <span class="sev sev-{{ row.label }}">{{ row.label }}</span>
+            <span class="sev {{ sev_cls(row.label) }}">{{ row.label }}</span>
             <span class="badge-count">{{ row.count }}</span>
           </a>
         {% endfor %}
@@ -115,6 +117,10 @@
       {% if stats.api_flagged_truncated %}
         <p class="card-note truncated-notice">Over {{ stats.api_flagged_commands }} flagged commands; counts are lower bounds.</p>
       {% endif %}
+    </div>
+    {# Web: the tile counts REQUESTS; its link lists connections (one row per connection). #}
+    <div class="card card-web">
+      {{ tile_link(web_requests_url, stats.web_requests_total, web_requests_label) }}
     </div>
   </div>
 
@@ -140,6 +146,8 @@
           {% for item in feed_items %}
             {% if item.row_macro == "command_row" %}
               {{ command_row(item, false, compact=true) }}
+            {% elif item.row_macro == "web_row" %}
+              {{ web_row(item, compact=true) }}
             {% else %}
               {{ recording_row(item, compact=true) }}
             {% endif %}

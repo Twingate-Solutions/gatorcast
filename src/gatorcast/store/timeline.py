@@ -9,6 +9,10 @@ One interleaved, keyset-paged timeline over every event kind:
   commands (spec §6.3): scan mode Q4/Q4b (with the two-arm ``user`` union),
   flagged mode Q5, the risk phases ``F``→``T``, hydration Q6a–c/Q7 through
   :func:`gatorcast.pipeline.activity.group_commands`, and focus Q9;
+* the **web_conns** source is a second instance of the same class, parametrized by
+  ``api_kind`` (WEBAPP_SPEC §8.1): one item per web connection, no discovery step,
+  a text filter over the stored URL, the ``scheme``/``upstream`` TLS filters on the
+  connection's start row, and the connection's ``gwops`` snapshot on hydration;
 * :func:`run_timeline` queries each selected source, merges by a total sort key
   with the frontier rule, hydrates only the emitted items, and builds the next
   :class:`Cursor` (spec §6.4).
@@ -44,6 +48,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cache
 from typing import Any, Final, Literal, Protocol
 
 import aiosqlite
@@ -51,11 +56,20 @@ import aiosqlite
 from gatorcast.db import FAILED_SQL, cmd_key, session_at
 from gatorcast.logging import get_logger
 from gatorcast.models import Session
-from gatorcast.pipeline.activity import Command, group_commands, parse_requested_at
+from gatorcast.pipeline.activity import (
+    MUTATING_METHODS,
+    Command,
+    group_commands,
+    is_discovery,
+    parse_requested_at,
+    pick_label,
+)
 from gatorcast.pipeline.detect import SEVERITY_RANK
 from gatorcast.store.activity import (
     _REQUEST_COLUMNS,
+    ActivityStore,
     ApiFindingRow,
+    ApiRequestRow,
     _row_to_finding,
     _row_to_request,
 )
@@ -72,23 +86,36 @@ KIND_SSH: Final = "ssh"
 KIND_EXEC: Final = "exec"
 KIND_FAILED: Final = "failed"
 KIND_KUBECTL: Final = "kubectl"
-KIND_KEYS: Final[tuple[str, ...]] = (KIND_SSH, KIND_EXEC, KIND_FAILED, KIND_KUBECTL)
+KIND_WEB: Final = "web"
+KIND_KEYS: Final[tuple[str, ...]] = (KIND_SSH, KIND_EXEC, KIND_FAILED, KIND_KUBECTL, KIND_WEB)
 
-# --- timeline sources (spec §6.1, §6.4) -----------------------------------------
+# --- timeline sources (spec §6.1, §6.4, WEBAPP_SPEC §8.1) -------------------------
 # A source is one keyset-paged query family. ``sessions`` serves the three
-# sessions-table kinds; ``api_commands`` serves kubectl commands. The rank breaks
-# merge ties (sessions before api_commands; a future source takes rank 2).
+# sessions-table kinds; ``api_commands`` serves kubectl commands; ``web_conns``
+# serves web-app connections (one item per connection, WEBAPP_SPEC §8.2). The rank
+# breaks merge ties (sessions, then api_commands, then web_conns).
+# ``api_requests.api_kind`` holds the same two strings as ``KIND_KUBECTL`` /
+# ``KIND_WEB``, so a kind key doubles as the stored discriminator.
 
 SOURCE_SESSIONS: Final = "sessions"
 SOURCE_API_COMMANDS: Final = "api_commands"
-SOURCE_RANK: Final[Mapping[str, int]] = {SOURCE_SESSIONS: 0, SOURCE_API_COMMANDS: 1}
+SOURCE_WEB: Final = "web_conns"
+SOURCE_RANK: Final[Mapping[str, int]] = {
+    SOURCE_SESSIONS: 0,
+    SOURCE_API_COMMANDS: 1,
+    SOURCE_WEB: 2,
+}
 
 KIND_SOURCE: Final[Mapping[str, str]] = {
     KIND_SSH: SOURCE_SESSIONS,
     KIND_EXEC: SOURCE_SESSIONS,
     KIND_FAILED: SOURCE_SESSIONS,
     KIND_KUBECTL: SOURCE_API_COMMANDS,
+    KIND_WEB: SOURCE_WEB,
 }
+
+# Sources backed by ``api_requests`` (one :class:`ApiCommandSource` each).
+API_SOURCES: Final[frozenset[str]] = frozenset({SOURCE_API_COMMANDS, SOURCE_WEB})
 
 # --- sorts --------------------------------------------------------------------
 
@@ -149,6 +176,19 @@ _MAX_RANK = 4  # SEVERITY_RANK["critical"]; 0 = no finding
 Position = tuple[str | int | float, ...]
 """One source's keyset position (shapes in :func:`check_position`)."""
 
+
+class CursorMismatch(ValueError):
+    """A paging cursor is malformed or does not fit the search it is used with.
+
+    Raised only by cursor validation: :func:`check_position` (a position of the wrong
+    shape for its source and sort), ``gatorcast.web.params.decode_cursor``, and the
+    cursor check at the top of :func:`run_timeline` (sort or kinds differ from the
+    query). Callers turn exactly this into a ``400``; any other ``ValueError`` from
+    the engine is an internal error and must propagate (``500``). Subclasses
+    ``ValueError`` so existing ``except ValueError`` callers keep working. The
+    message never contains the cursor value.
+    """
+
 SortKey = tuple[Any, ...]
 """A merge key: compared descending; ends in ``(source rank, id)`` so it is total."""
 
@@ -182,7 +222,23 @@ class UnifiedQuery:
         regex: Python regex, already validated to compile (recordings only).
         sort: ``newest`` | ``risk`` | ``duration``.
         discovery: True to include discovery-only kubectl commands.
-        cmd: Focus on the kubectl command containing this ``request_id``.
+        cmd: Focus on the command or web connection containing this ``request_id``.
+        scheme: Stored ``downstream_tls`` value to match on a web connection's start
+            row: ``'tls13'`` (``scheme=https``) or ``'none'`` (``scheme=http``).
+            ``None`` = no value filter.
+        scheme_null: True for ``scheme=unknown`` (``downstream_tls IS NULL``). When
+            true, ``scheme`` is ignored; ``parse_unified_query`` leaves it ``None``.
+        upstream: Stored ``upstream_tls`` value to match on the start row:
+            ``'verify_full'`` (``verified``), ``'verify_ca'`` (``ca_only``),
+            ``'insecure'`` (``unverified``) or ``'none'`` (``plaintext``).
+            ``None`` = no value filter.
+        upstream_null: True for ``upstream=unknown`` (``upstream_tls IS NULL``). When
+            true, ``upstream`` is ignored.
+
+    The TLS filters are stored values plus an is-null flag (WEBAPP_SPEC §8.3), so the
+    store never sees the URL vocabulary. Each value is a bound parameter; the SQL text
+    is a fixed fragment per column. Only the web source applies them; the kubectl
+    source ignores them (``gatorcast.web.kinds`` excludes kubectl when they are set).
     """
 
     kinds: frozenset[str]
@@ -204,6 +260,10 @@ class UnifiedQuery:
     sort: str = SORT_NEWEST
     discovery: bool = False
     cmd: str | None = None
+    scheme: str | None = None
+    scheme_null: bool = False
+    upstream: str | None = None
+    upstream_null: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,12 +354,13 @@ def check_position(source: str, sort: str, value: object) -> Position:
     sessions      duration   ``(has_duration 0|1, duration, conn_id)``
     api_commands  newest     ``("T", at, request_id)`` or ``("F", at, request_id)``
     api_commands  risk       ``("F", rank, at, request_id)`` or ``("T", at, request_id)``
+    web_conns     (as ``api_commands``: same shapes for each sort)
     ============  =========  =============================================
 
     ``at`` is ``YYYY-MM-DDTHH:MM:SS.mmmZ``; ``rank`` an int 0–4; ``duration`` a
     finite number ≥ 0; ``conn_id``/``request_id`` the classify safe-token patterns.
-    Booleans are never accepted as numbers. ``api_commands`` has no ``duration``
-    position (kubectl is excluded under that sort).
+    Booleans are never accepted as numbers. ``api_commands`` and ``web_conns`` have
+    no ``duration`` position (both kinds are excluded under that sort).
 
     Args:
         source: The source name (a key of :data:`SOURCE_RANK`).
@@ -310,11 +371,11 @@ def check_position(source: str, sort: str, value: object) -> Position:
         The position as a tuple.
 
     Raises:
-        ValueError: If the source, sort, or shape is not valid. The message never
-            contains the value.
+        CursorMismatch: If the source, sort, or shape is not valid. The message
+            never contains the value.
     """
     if not isinstance(value, (list, tuple)):
-        raise ValueError("position is not a list")
+        raise CursorMismatch("position is not a list")
     pos = tuple(value)
     ok = False
     if source == SOURCE_SESSIONS:
@@ -325,7 +386,7 @@ def check_position(source: str, sort: str, value: object) -> Position:
                 ok = _is_rank(rank) and _is_at(at) and _is_conn_id(cid)
             case "duration", (flag, dur, cid):
                 ok = type(flag) is int and flag in (0, 1) and _is_duration(dur) and _is_conn_id(cid)
-    elif source == SOURCE_API_COMMANDS:
+    elif source in API_SOURCES:
         match sort, pos:
             case "newest", (phase, at, rid):
                 ok = phase in (PHASE_SCAN, PHASE_FLAGGED) and _is_at(at) and _is_request_id(rid)
@@ -334,7 +395,7 @@ def check_position(source: str, sort: str, value: object) -> Position:
             case "risk", ("T", at, rid):  # PHASE_SCAN
                 ok = _is_at(at) and _is_request_id(rid)
     if not ok:
-        raise ValueError("position does not match its source and sort")
+        raise CursorMismatch("position does not match its source and sort")
     return pos
 
 
@@ -398,11 +459,13 @@ class CommandRef:
 
 @dataclass(frozen=True, slots=True)
 class CommandHit:
-    """A hydrated kubectl command (Q6a–c, Q7).
+    """A hydrated kubectl command or web connection (Q6a–c, Q7).
 
     ``command`` is :func:`~gatorcast.pipeline.activity.group_commands` over the
-    first :data:`_CMD_MAX_REQUESTS` requests (label, primary, listed requests).
-    The aggregate fields cover **every** row of the command and override the
+    first :data:`_CMD_MAX_REQUESTS` requests (label, listed requests). Its
+    ``primary`` is chosen over **every** row of the command
+    (:meth:`ApiCommandSource._primary`), so it may lie past the listed requests.
+    The aggregate fields cover every row of the command and override the
     command's own (spec §6.3 "Hydration").
 
     Attributes:
@@ -417,6 +480,20 @@ class CommandHit:
         finding_labels: Distinct finding labels, first-seen order.
         findings: ``request_id`` → findings, for every request of the command.
         recordings: Linked recording ``conn_id`` values (``request_id`` join only).
+        kind: ``"kubectl"`` or ``"web"``. A web hit is one connection; its
+            ``discovery_count`` is 0 and its primary request is the first
+            ``POST``/``PUT``/``PATCH``/``DELETE``, else the first request.
+        downstream_tls: Configured client-facing TLS mode on the start row
+            (``tls13`` | ``none``), or ``None`` (unknown; always ``None`` for kubectl).
+        upstream_tls: Configured app-facing TLS mode on the start row
+            (``verify_full`` | ``verify_ca`` | ``insecure`` | ``none``), or ``None``.
+        gwops_match: The connection's ``gwops`` match (``exact`` | ``none`` |
+            ``ambiguous``), or ``None``. Web hits only. ``gwops_app`` and
+            ``gwops_managed`` are stored only for ``exact``; show them only then.
+        gwops_gateway_id: The reporting gateway id. Web hits only; never log it.
+        gwops_app: The app name gwops reported (``exact`` only). Web hits only;
+            display only, never log it.
+        gwops_managed: ``True`` | ``False`` (``exact`` only), else ``None``.
     """
 
     ref: CommandRef
@@ -430,6 +507,13 @@ class CommandHit:
     finding_labels: tuple[str, ...]
     findings: Mapping[str, list[ApiFindingRow]]
     recordings: tuple[str, ...]
+    kind: str = KIND_KUBECTL
+    downstream_tls: str | None = None
+    upstream_tls: str | None = None
+    gwops_match: str | None = None
+    gwops_gateway_id: str | None = field(default=None, repr=False)
+    gwops_app: str | None = field(default=None, repr=False)
+    gwops_managed: bool | None = None
 
     @property
     def command_id(self) -> str:
@@ -489,14 +573,19 @@ class CommandHit:
         ).total_seconds()
 
     def visible_requests(self, include_discovery: bool = False) -> tuple[Any, ...]:
-        """The listed requests to render (discovery hidden unless asked).
+        """The listed requests to render (kubectl discovery hidden unless asked).
+
+        A web hit has no discovery step (WEBAPP_SPEC §7.2), so every listed request
+        is returned whatever ``include_discovery`` says.
 
         Args:
-            include_discovery: True to include discovery requests.
+            include_discovery: True to include discovery requests (kubectl only).
 
         Returns:
             The listed :class:`~gatorcast.store.activity.ApiRequestRow` values.
         """
+        if self.kind == KIND_WEB:
+            return self.command.requests
         return self.command.visible_requests(include_discovery)
 
 
@@ -505,7 +594,7 @@ class TimelineItem:
     """One timeline item (spec §6.1).
 
     Attributes:
-        kind: The kind key (``ssh`` / ``exec`` / ``failed`` / ``kubectl``).
+        kind: The kind key (``ssh`` / ``exec`` / ``failed`` / ``kubectl`` / ``web``).
         source: The source name.
         sort_key: Merge key, compared descending; ends in ``(source rank, id)``.
         position: The source's keyset position for this item.
@@ -584,10 +673,15 @@ class TimelinePage:
         excluded: Excluded kind → reason, passed through from ``resolve_kinds``.
         budget_hit: The page is short because a budget stopped a source; the UI
             shows *Continue scanning ›* (with ``next_cursor``) instead of *Next ›*.
-        scan_budget_hit: ``budget_hit`` and the kubectl scan budget caused it.
+        scan_budget_hit: ``budget_hit`` and a kubectl or web scan budget caused it.
+        scan_budget_sources: The api sources (``api_commands`` / ``web_conns``) whose
+            scan budget stopped them on this page; empty unless ``scan_budget_hit``.
+            Lets the notice name the kind(s) actually cut short.
         content_budget_hit: ``budget_hit`` and the recording content budget caused it.
         flagged_cap_hit: More flagged kubectl commands match than the cap.
-        focus_not_found: ``cmd=`` named no stored request.
+        focus_not_found: ``cmd=`` was given, an api source was queried, and no item
+            survived hydration: the request is unknown to every queried api kind,
+            or its rows vanished (retention) between resolving and hydrating it.
         scan_budget: The kubectl row budget in force (for the notice text).
         content_budget: The sidecar budget in force (for the notice text).
         flagged_cap: The flagged-command cap in force (for the notice text).
@@ -599,6 +693,7 @@ class TimelinePage:
     excluded: Mapping[str, str] = field(default_factory=dict)
     budget_hit: bool = False
     scan_budget_hit: bool = False
+    scan_budget_sources: frozenset[str] = frozenset()
     content_budget_hit: bool = False
     flagged_cap_hit: bool = False
     focus_not_found: bool = False
@@ -654,7 +749,31 @@ _PATH_LOWER = (
 )
 
 
-def _same_cmd(q: str, x: str, x_key: str | None = None) -> str:
+# ``api_kind`` as a SQL string literal. The value is chosen from this fixed map by the
+# code that builds a query (a source's own kind), never from request input, so the
+# fragment is static text (spec §10 "Parameters").
+_API_KIND_SQL: Final[Mapping[str, str]] = {KIND_KUBECTL: "'kubectl'", KIND_WEB: "'web'"}
+
+
+def _kind_sql(api_kind: str) -> str:
+    """Return the SQL literal for an ``api_kind`` (``'kubectl'`` or ``'web'``).
+
+    Args:
+        api_kind: A key of :data:`_API_KIND_SQL`.
+
+    Returns:
+        The quoted literal.
+
+    Raises:
+        ValueError: If ``api_kind`` is not a known kind.
+    """
+    try:
+        return _API_KIND_SQL[api_kind]
+    except KeyError:
+        raise ValueError("unknown api_kind") from None
+
+
+def _same_cmd(q: str, x: str, x_key: str | None = None, api_kind: str = KIND_KUBECTL) -> str:
     """``SAME_CMD(q, x)``: row ``q`` belongs to the command identified by ``x``.
 
     Args:
@@ -662,26 +781,70 @@ def _same_cmd(q: str, x: str, x_key: str | None = None) -> str:
         x: Alias of the row (or CTE row) identifying the command.
         x_key: SQL for ``x``'s command key; default renders ``CMD_KEY_SQL`` over
             ``x``'s columns. Pass ``"<x>.ck"`` for a CTE that carries the key.
+        api_kind: The kind the probe is restricted to.
 
     Returns:
         The SQL predicate (matches ``idx_api_req_cmd`` on ``q``).
     """
     key = x_key if x_key is not None else cmd_key(x)
-    # Unary ``+`` keeps the planner off idx_api_req_sys_user_time (two equality
-    # columns look cheaper than one expression) so the probe uses idx_api_req_cmd.
+    # Unary ``+`` keeps the planner off idx_api_req_sys_kind_user_time (two equality
+    # columns look cheaper than one expression) so the probe uses idx_api_req_cmd. The
+    # ``api_kind`` term carries the same ``+``: a plain equality flips the probe to a
+    # scan of the kind's rows, while ``+`` leaves it a residual filter on the probed
+    # row. A command key is single-kind, so the term never removes a row of a command.
     return (
         f"{cmd_key(q)} = {key} AND +{q}.resource_address IS {x}.resource_address "
-        f"AND +{q}.user_key IS {x}.user_key"
+        f"AND +{q}.user_key IS {x}.user_key AND +{q}.api_kind = {_kind_sql(api_kind)}"
     )
 
 
-def _text_exists(x: str, x_key: str | None = None) -> str:
-    """``EXISTS`` a request of ``x``'s command whose path or command matches (2 params)."""
+def _text_exists(x: str, x_key: str | None = None, api_kind: str = KIND_KUBECTL) -> str:
+    """``EXISTS`` a request of ``x``'s command (or web connection) matching the text.
+
+    kubectl: the lower-cased path (before ``?``) or ``kubectl_command`` contains the
+    needle (2 params). web: the lower-cased stored ``url`` (normalized path plus
+    masked query) contains the needle (1 param). Use :func:`_text_params` for the
+    parameters.
+    """
+    same = _same_cmd("t", x, x_key, api_kind)
+    if api_kind == KIND_WEB:
+        return f"EXISTS (SELECT 1 FROM api_requests t WHERE {same} AND instr(lower(t.url), ?) > 0)"
     path = _PATH_LOWER.format(a="t")
     return (
-        f"EXISTS (SELECT 1 FROM api_requests t WHERE {_same_cmd('t', x, x_key)} "
+        f"EXISTS (SELECT 1 FROM api_requests t WHERE {same} "
         f"AND (instr({path}, ?) > 0 OR instr(lower(COALESCE(t.kubectl_command, '')), ?) > 0))"
     )
+
+
+def _text_params(needle: str, api_kind: str) -> tuple[str, ...]:
+    """The bound parameters of :func:`_text_exists` for a lower-cased ``needle``."""
+    return (needle,) if api_kind == KIND_WEB else (needle, needle)
+
+
+def _tls_clauses(q: UnifiedQuery, alias: str) -> tuple[list[str], list[object]]:
+    """The ``scheme`` / ``upstream`` predicates over a start row (web, spec §8.3).
+
+    Args:
+        q: The query (``scheme``, ``scheme_null``, ``upstream``, ``upstream_null``).
+        alias: Alias of the start row (code-supplied, never input).
+
+    Returns:
+        ``(clauses, params)``: ``<alias>.<column> IS NULL`` for an is-null flag, else
+        ``<alias>.<column> = ?`` with the stored value bound. Empty when neither
+        filter is set.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    for column, value, is_null in (
+        ("downstream_tls", q.scheme, q.scheme_null),
+        ("upstream_tls", q.upstream, q.upstream_null),
+    ):
+        if is_null:
+            clauses.append(f"{alias}.{column} IS NULL")
+        elif value is not None:
+            clauses.append(f"{alias}.{column} = ?")
+            params.append(value)
+    return clauses, params
 
 
 def _has_flag_filters(q: UnifiedQuery) -> bool:
@@ -1062,7 +1225,8 @@ class SessionsSource:
 _SCAN_COLS = (
     "r.request_id AS request_id, r.requested_at AS requested_at, "
     "r.resource_address AS resource_address, r.user_key AS user_key, "
-    "r.conn_id AS conn_id, r.kubectl_session AS kubectl_session"
+    "r.conn_id AS conn_id, r.kubectl_session AS kubectl_session, "
+    "r.downstream_tls AS downstream_tls, r.upstream_tls AS upstream_tls"
 )
 # ``r.method`` is in no index, so Q4b cannot pick a covering full scan + sort over
 # idx_api_req_cmd; it walks the same time index as Q4.
@@ -1072,11 +1236,12 @@ _API_RANK_F2 = _rank_case("f2.severity")
 
 
 def _api_row_filters(
-    q: UnifiedQuery, after: tuple[str, str] | None
+    q: UnifiedQuery, after: tuple[str, str] | None, api_kind: str
 ) -> tuple[list[str], list[object]]:
-    """Row filters of a scan arm (system, window, keyset), alias ``r``."""
-    clauses: list[str] = []
-    params: list[object] = []
+    """Row filters of a scan arm (kind, system, window, keyset), alias ``r``."""
+    _kind_sql(api_kind)  # reject an unknown kind before it is bound
+    clauses: list[str] = ["r.api_kind = ?"]
+    params: list[object] = [api_kind]
     if q.system_set:
         clauses.append("r.resource_address IS ?")
         params.append(q.system)
@@ -1101,12 +1266,14 @@ def _scan_rows_sql(
     cols: str,
     arm_limit: int,
     outer_limit: int,
+    api_kind: str,
 ) -> tuple[str, list[object]]:
     """The ``api_requests`` walk in ``(requested_at, request_id)`` DESC order.
 
-    Without ``user``: one range on ``idx_api_req_sys_time`` / ``idx_api_req_time``.
-    With ``user``: a ``UNION`` of two keyset arms (``username = ?`` on
-    ``idx_api_req_user_time``, ``user_id = ?`` on ``idx_api_req_userid_time``),
+    Every arm is restricted to ``api_kind = ?`` (bound). Without ``user``: one range
+    on ``idx_api_req_sys_kind_time`` / ``idx_api_req_kind_time``. With ``user``: a
+    ``UNION`` of two keyset arms (``username = ?`` on ``idx_api_req_kind_user_time``,
+    ``user_id = ?`` on ``idx_api_req_kind_userid_time``),
     each stopping at ``arm_limit``; ``UNION`` drops a row matched by both.
 
     Args:
@@ -1115,11 +1282,12 @@ def _scan_rows_sql(
         cols: Select list (aliased to bare names).
         arm_limit: Per-arm ``LIMIT`` (user union only).
         outer_limit: Final ``LIMIT``.
+        api_kind: ``'kubectl'`` or ``'web'``.
 
     Returns:
         ``(sql, params)``.
     """
-    base, base_params = _api_row_filters(q, after)
+    base, base_params = _api_row_filters(q, after, api_kind)
     tail = " LIMIT ?"
     tail_params: list[object] = [int(outer_limit)]
     if q.user is None:
@@ -1146,46 +1314,61 @@ def api_scan_sql(
     want: int,
     budget: int,
     no_findings: bool,
+    api_kind: str = KIND_KUBECTL,
+    discovery: bool = True,
 ) -> tuple[str, list[object]]:
     """Build Q4: one page of command start rows, examining at most ``budget`` rows.
 
     The ``scanned`` CTE has a ``LIMIT`` and the outer query a ``WHERE``, so SQLite
     runs it as a co-routine (not flattened) and the budget is enforced.
 
+    For web (``discovery=False``): no discovery condition (a web connection has no
+    discovery step), the text filter reads the stored ``url``, and the ``scheme`` /
+    ``upstream`` filters are residual predicates on the start row ``s`` (the
+    ``scanned`` row that passed the earliest-row test), so the connection's single
+    snapshot decides.
+
     Args:
-        q: The query (``system``, ``user``, window, ``text``, ``discovery``).
+        q: The query (``system``, ``user``, window, ``text``, ``discovery``, and for
+            web ``scheme``/``upstream``).
         after: ``(at, request_id)`` keyset, or ``None``.
         want: Start rows wanted (``LIMIT``).
         budget: Rows examined at most (:data:`_API_SCAN_BUDGET`).
         no_findings: Add the command-has-no-finding clause (``has_findings=false``,
             risk phase ``T``).
+        api_kind: ``'kubectl'`` (default) or ``'web'``.
+        discovery: True (kubectl) to require a non-discovery request in the command
+            unless ``q.discovery``; False (web) for no discovery condition.
 
     Returns:
         ``(sql, params)``. Columns: ``request_id, requested_at, resource_address,
         user_key, ck``.
     """
     scanned, params = _scan_rows_sql(
-        q, after, cols=_SCAN_COLS, arm_limit=budget, outer_limit=budget
+        q, after, cols=_SCAN_COLS, arm_limit=budget, outer_limit=budget, api_kind=api_kind
     )
     conds = [
         "NOT EXISTS (SELECT 1 FROM api_requests p WHERE "
-        f"{_same_cmd('p', 's')} AND p.requested_at <= s.requested_at "
+        f"{_same_cmd('p', 's', None, api_kind)} AND p.requested_at <= s.requested_at "
         "AND (p.requested_at < s.requested_at OR p.request_id < s.request_id))"
     ]
-    if not q.discovery:
+    if discovery and not q.discovery:
         conds.append(
-            f"EXISTS (SELECT 1 FROM api_requests d WHERE {_same_cmd('d', 's')} "
+            f"EXISTS (SELECT 1 FROM api_requests d WHERE {_same_cmd('d', 's', None, api_kind)} "
             "AND gc_is_discovery(d.method, d.url) = 0)"
         )
     if q.text is not None:
-        conds.append(_text_exists("s"))
-        needle = q.text.lower()
-        params.extend((needle, needle))
+        conds.append(_text_exists("s", None, api_kind))
+        params.extend(_text_params(q.text.lower(), api_kind))
     if no_findings:
         conds.append(
             "NOT EXISTS (SELECT 1 FROM api_requests n JOIN api_findings nf "
-            f"ON nf.request_id = n.request_id WHERE {_same_cmd('n', 's')})"
+            f"ON nf.request_id = n.request_id WHERE {_same_cmd('n', 's', None, api_kind)})"
         )
+    if api_kind == KIND_WEB:
+        tls_conds, tls_params = _tls_clauses(q, "s")
+        conds.extend(tls_conds)
+        params.extend(tls_params)
     sql = (
         f"WITH scanned AS ({scanned}) "
         "SELECT s.request_id AS request_id, s.requested_at AS requested_at, "
@@ -1199,7 +1382,11 @@ def api_scan_sql(
 
 
 def api_scan_frontier_sql(
-    q: UnifiedQuery, after: tuple[str, str] | None, *, budget: int
+    q: UnifiedQuery,
+    after: tuple[str, str] | None,
+    *,
+    budget: int,
+    api_kind: str = KIND_KUBECTL,
 ) -> tuple[str, list[object]]:
     """Build Q4b: the rows at offsets ``budget - 1`` and ``budget`` of the Q4 walk.
 
@@ -1210,6 +1397,7 @@ def api_scan_frontier_sql(
         q: The query.
         after: The same keyset as Q4.
         budget: The Q4 budget.
+        api_kind: The same kind as Q4.
 
     Returns:
         ``(sql, params)``. Columns: ``requested_at, request_id``.
@@ -1218,7 +1406,12 @@ def api_scan_frontier_sql(
     # range index), limited to ``budget + 1`` rows; the outer query reads the two
     # edge rows from that co-routine without re-sorting.
     walk, params = _scan_rows_sql(
-        q, after, cols=_FRONTIER_COLS, arm_limit=budget + 1, outer_limit=budget + 1
+        q,
+        after,
+        cols=_FRONTIER_COLS,
+        arm_limit=budget + 1,
+        outer_limit=budget + 1,
+        api_kind=api_kind,
     )
     sql = (
         f"WITH walk AS ({walk}) SELECT requested_at, request_id FROM walk "
@@ -1228,10 +1421,11 @@ def api_scan_frontier_sql(
     return sql, params
 
 
-def _hit_sql(q: UnifiedQuery, cap: int) -> tuple[str, list[object]]:
+def _hit_sql(q: UnifiedQuery, cap: int, api_kind: str) -> tuple[str, list[object]]:
     """The ``hit`` CTE body of Q5: distinct commands with a qualifying finding."""
-    clauses: list[str] = []
-    params: list[object] = []
+    _kind_sql(api_kind)  # reject an unknown kind before it is bound
+    clauses: list[str] = ["r.api_kind = ?"]
+    params: list[object] = [api_kind]
     if q.severity is not None:
         allowed = _severities_at_or_above(q.severity)
         if allowed:
@@ -1262,16 +1456,19 @@ def _hit_sql(q: UnifiedQuery, cap: int) -> tuple[str, list[object]]:
     sql = (
         "SELECT DISTINCT r.resource_address AS resource_address, r.user_key AS user_key, "
         f"{cmd_key('r')} AS ck "
-        f"FROM api_findings f JOIN api_requests r ON r.request_id = f.request_id{where} "
+        "FROM api_findings f CROSS JOIN api_requests r "
+        f"ON r.request_id = f.request_id{where} "
         "LIMIT ?"
     )
     params.append(int(cap) + 1)
     return sql, params
 
 
-def api_flagged_count_sql(q: UnifiedQuery, *, cap: int) -> tuple[str, list[object]]:
+def api_flagged_count_sql(
+    q: UnifiedQuery, *, cap: int, api_kind: str = KIND_KUBECTL
+) -> tuple[str, list[object]]:
     """Count the ``hit`` set of Q5 (at most ``cap + 1``), for the cap notice."""
-    hit, params = _hit_sql(q, cap)
+    hit, params = _hit_sql(q, cap, api_kind)
     return f"SELECT COUNT(*) AS n FROM ({hit})", params
 
 
@@ -1283,23 +1480,31 @@ def api_flagged_sql(
     cap: int,
     risk: bool,
     any_finding: bool,
+    api_kind: str = KIND_KUBECTL,
 ) -> tuple[str, list[object]]:
     """Build Q5: flagged commands found from ``api_findings`` (spec §6.3).
 
+    For ``api_kind='web'`` the text filter reads the stored ``url`` and the
+    ``scheme`` / ``upstream`` filters are residual predicates on the connection's
+    start row, read by a primary-key join on ``c.start_id`` (added only when a TLS
+    filter is set).
+
     Args:
-        q: The query (finding filters, ``system``, ``user``, window, ``text``).
+        q: The query (finding filters, ``system``, ``user``, window, ``text``, and
+            for web ``scheme``/``upstream``).
         after: Keyset ``(rank, at, id)`` (risk) or ``(at, id)`` (newest), or ``None``.
         want: ``LIMIT``.
         cap: :data:`_FLAGGED_CMD_CAP`; ``hit`` reads at most ``cap + 1`` commands.
         risk: Order by max rank first.
         any_finding: Risk phase ``F`` with no finding filter (``max_rank >= 1``).
+        api_kind: ``'kubectl'`` (default) or ``'web'``.
 
     Returns:
         ``(sql, params)``. Columns: ``request_id, requested_at, resource_address,
         user_key, ck, max_rank, hit_n``.
     """
-    hit, params = _hit_sql(q, cap)
-    same_h = _same_cmd("q", "h", "h.ck")
+    hit, params = _hit_sql(q, cap, api_kind)
+    same_h = _same_cmd("q", "h", "h.ck", api_kind)
     conds: list[str] = ["c.start_id IS NOT NULL"]
     if q.from_ is not None:
         conds.append("c.start_at >= ?")
@@ -1313,9 +1518,15 @@ def api_flagged_sql(
     if any_finding:
         conds.append("c.max_rank >= 1")
     if q.text is not None:
-        conds.append(_text_exists("c", "c.ck"))
-        needle = q.text.lower()
-        params.extend((needle, needle))
+        conds.append(_text_exists("c", "c.ck", api_kind))
+        params.extend(_text_params(q.text.lower(), api_kind))
+    start_join = ""
+    if api_kind == KIND_WEB:
+        tls_conds, tls_params = _tls_clauses(q, "sr")
+        if tls_conds:
+            start_join = " JOIN api_requests sr ON sr.request_id = c.start_id"
+            conds.extend(tls_conds)
+            params.extend(tls_params)
     if after is not None:
         if risk:
             conds.append("(c.max_rank, c.start_at, c.start_id) < (?, ?, ?)")
@@ -1341,47 +1552,127 @@ def api_flagged_sql(
         "SELECT c.start_id AS request_id, c.start_at AS requested_at, "
         "c.resource_address AS resource_address, c.user_key AS user_key, c.ck AS ck, "
         "COALESCE(c.max_rank, 0) AS max_rank, (SELECT COUNT(*) FROM hit) AS hit_n "
-        f"FROM cmd c WHERE {' AND '.join(conds)} {order} LIMIT ?"
+        f"FROM cmd c{start_join} WHERE {' AND '.join(conds)} {order} LIMIT ?"
     )
     params.append(int(want))
     return sql, params
 
 
-# Q9 focus: resolve any request of a command to the command, then its start row.
-FOCUS_RESOLVE_SQL: Final = (
-    f"SELECT resource_address, user_key, {cmd_key()} AS ck "
-    "FROM api_requests WHERE request_id = ?"
-)
-# Unary ``+``: see _same_cmd (keeps these lookups on idx_api_req_cmd).
-_SAME_KEY = f"{cmd_key('q')} = ? AND +q.resource_address IS ? AND +q.user_key IS ?"
-FOCUS_START_SQL: Final = (
-    "SELECT q.request_id AS request_id, q.requested_at AS requested_at "
-    f"FROM api_requests q WHERE {_SAME_KEY} ORDER BY q.requested_at, q.request_id LIMIT 1"
-)
+# Per-kind focus (Q9) and hydration (Q6a-c, Q7) SQL. Every statement carries an
+# ``api_kind`` term chosen from a fixed two-value map (:func:`_kind_sql`), never from
+# input. The module-level ``FOCUS_*`` / ``CMD_*`` constants below are the kubectl set
+# with their original binding shapes (``tests/test_query_plans.py`` binds them as
+# ``(ck, resource_address, user_key)``); a web source builds its own set with ``_cmd_sql``.
 
+
+@dataclass(frozen=True, slots=True)
+class _CmdSql:
+    """The focus and hydration statements of one ``api_kind``.
+
+    ``resolve`` takes ``(request_id,)``; ``start``, ``aggregate``, ``findings``,
+    ``recordings``, ``first_mutating`` and ``first_non_discovery`` take ``(ck,
+    resource_address, user_key)``; ``requests`` takes the same plus a ``LIMIT``.
+
+    ``first_mutating`` / ``first_non_discovery`` pick the primary request when it is
+    not among the listed (``requests``) rows: each walks the command's rows on
+    ``idx_api_req_cmd`` in ``(requested_at, request_id)`` order with the method /
+    discovery test as a residual filter and stops at the first match (``LIMIT 1``).
+    ``first_non_discovery`` is empty for a kind without discovery (web).
+    """
+
+    resolve: str
+    start: str
+    aggregate: str
+    findings: str
+    recordings: str
+    requests: str
+    first_mutating: str
+    first_non_discovery: str
+
+
+@cache
+def _cmd_sql(api_kind: str, discovery: bool = True) -> _CmdSql:
+    """Build the Q9 / Q6a–c / Q7 statements for ``api_kind``.
+
+    Args:
+        api_kind: ``'kubectl'`` or ``'web'``.
+        discovery: True to count discovery requests in the aggregate
+            (``gc_is_discovery``). False (web) reports ``discovery_count`` 0 without
+            calling it.
+
+    Returns:
+        The statement set.
+    """
+    kind = _kind_sql(api_kind)
+    # Unary ``+``: see _same_cmd (keeps these lookups on idx_api_req_cmd rather than
+    # idx_api_req_sys_kind_user_time, with ``api_kind`` a residual filter on the row).
+    same_key = (
+        f"{cmd_key('q')} = ? AND +q.resource_address IS ? AND +q.user_key IS ? "
+        f"AND +q.api_kind = {kind}"
+    )
+    discovery_sql = (
+        "COALESCE(SUM(gc_is_discovery(q.method, q.url)), 0)" if discovery else "0"
+    )
+    # Static literal list from the code-defined MUTATING_METHODS (never input).
+    mutating_sql = ", ".join(f"'{m}'" for m in sorted(MUTATING_METHODS))
+    first_by = "ORDER BY q.requested_at, q.request_id LIMIT 1"
+    return _CmdSql(
+        resolve=(
+            f"SELECT resource_address, user_key, {cmd_key()} AS ck "
+            f"FROM api_requests WHERE request_id = ? AND api_kind = {kind}"
+        ),
+        start=(
+            "SELECT q.request_id AS request_id, q.requested_at AS requested_at "
+            f"FROM api_requests q WHERE {same_key} "
+            "ORDER BY q.requested_at, q.request_id LIMIT 1"
+        ),
+        aggregate=(
+            "SELECT COUNT(*) AS request_count, MIN(q.requested_at) AS first_at, "
+            f"MAX(q.requested_at) AS last_at, {discovery_sql} AS discovery_count "
+            f"FROM api_requests q WHERE {same_key}"
+        ),
+        findings=(  # rule metadata only
+            "SELECT f.id AS id, f.request_id AS request_id, f.rule_id AS rule_id, "
+            "f.category AS category, f.severity AS severity, f.label AS label, "
+            "f.created_at AS created_at "
+            "FROM api_requests q JOIN api_findings f ON f.request_id = q.request_id "
+            f"WHERE {same_key} ORDER BY f.id"
+        ),
+        recordings=(  # request_id join only, never conn_id
+            "SELECT q.request_id AS request_id, s.conn_id AS conn_id "
+            "FROM api_requests q JOIN sessions s ON s.request_id = q.request_id "
+            f"WHERE {same_key} ORDER BY COALESCE(s.started_at, s.created_at), s.conn_id"
+        ),
+        # ``gc_ds`` / ``gc_us``: the configured TLS modes; ``_row_to_request`` ignores
+        # them, and the first row (the start row) supplies the hit's modes.
+        requests=(
+            f"SELECT {_REQUEST_COLUMNS}, q.downstream_tls AS gc_ds, q.upstream_tls AS gc_us "
+            f"FROM api_requests q WHERE {same_key} "
+            "ORDER BY q.requested_at, q.request_id LIMIT ?"
+        ),
+        first_mutating=(
+            f"SELECT {_REQUEST_COLUMNS} FROM api_requests q WHERE {same_key} "
+            f"AND upper(q.method) IN ({mutating_sql}) {first_by}"
+        ),
+        first_non_discovery=(
+            f"SELECT {_REQUEST_COLUMNS} FROM api_requests q WHERE {same_key} "
+            f"AND gc_is_discovery(q.method, q.url) = 0 {first_by}"
+            if discovery
+            else ""
+        ),
+    )
+
+
+_KUBECTL_SQL: Final = _cmd_sql(KIND_KUBECTL, True)
+
+# Q9 focus: resolve any request of a command to the command, then its start row.
+FOCUS_RESOLVE_SQL: Final = _KUBECTL_SQL.resolve
+FOCUS_START_SQL: Final = _KUBECTL_SQL.start
 # Hydration, per command; params ``(ck, resource_address, user_key)``.
-CMD_AGGREGATE_SQL: Final = (  # Q6a
-    "SELECT COUNT(*) AS request_count, MIN(q.requested_at) AS first_at, "
-    "MAX(q.requested_at) AS last_at, "
-    "COALESCE(SUM(gc_is_discovery(q.method, q.url)), 0) AS discovery_count "
-    f"FROM api_requests q WHERE {_SAME_KEY}"
-)
-CMD_FINDINGS_SQL: Final = (  # Q6b (rule metadata only)
-    "SELECT f.id AS id, f.request_id AS request_id, f.rule_id AS rule_id, "
-    "f.category AS category, f.severity AS severity, f.label AS label, "
-    "f.created_at AS created_at "
-    "FROM api_requests q JOIN api_findings f ON f.request_id = q.request_id "
-    f"WHERE {_SAME_KEY} ORDER BY f.id"
-)
-CMD_RECORDINGS_SQL: Final = (  # Q6c (request_id join only, never conn_id)
-    "SELECT q.request_id AS request_id, s.conn_id AS conn_id "
-    "FROM api_requests q JOIN sessions s ON s.request_id = q.request_id "
-    f"WHERE {_SAME_KEY} ORDER BY COALESCE(s.started_at, s.created_at), s.conn_id"
-)
-CMD_REQUESTS_SQL: Final = (  # Q7 (params + LIMIT)
-    f"SELECT {_REQUEST_COLUMNS} FROM api_requests q WHERE {_SAME_KEY} "
-    "ORDER BY q.requested_at, q.request_id LIMIT ?"
-)
+CMD_AGGREGATE_SQL: Final = _KUBECTL_SQL.aggregate  # Q6a
+CMD_FINDINGS_SQL: Final = _KUBECTL_SQL.findings  # Q6b
+CMD_RECORDINGS_SQL: Final = _KUBECTL_SQL.recordings  # Q6c
+CMD_REQUESTS_SQL: Final = _KUBECTL_SQL.requests  # Q7 (params + LIMIT)
 
 
 def _max_severity(severities: Iterable[str]) -> str | None:
@@ -1394,17 +1685,53 @@ def _max_severity(severities: Iterable[str]) -> str | None:
 
 
 class ApiCommandSource:
-    """The ``api_commands`` timeline source: kubectl commands (spec §6.3)."""
+    """An ``api_requests``-backed timeline source (spec §6.3, WEBAPP_SPEC §8.1).
+
+    One class, two instances (:func:`build_sources`): kubectl commands
+    (``api_commands``, ``api_kind='kubectl'``, discovery logic on) and web
+    connections (``web_conns``, ``api_kind='web'``, discovery off). Every query the
+    instance runs is restricted to its ``api_kind``.
+    """
 
     name: str = SOURCE_API_COMMANDS
 
-    def __init__(self, db: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        api_kind: str = KIND_KUBECTL,
+        name: str = SOURCE_API_COMMANDS,
+        kind: str | None = None,
+        discovery: bool = True,
+        findings: bool = True,
+    ) -> None:
         """Initialize the source.
 
         Args:
             db: The shared aiosqlite connection (``gc_is_discovery`` registered).
+            api_kind: The ``api_requests.api_kind`` this instance serves
+                (``'kubectl'`` or ``'web'``).
+            name: The source name (a key of :data:`SOURCE_RANK`).
+            kind: The timeline kind of its items; defaults to ``api_kind``.
+            discovery: True to apply the kubectl discovery logic (hide discovery-only
+                commands, count discovery requests); False for web.
+            findings: True when this kind can have ``api_findings`` rows. False (web)
+                makes flagged mode (Q5 and its count) return an empty, exhausted page
+                without running SQL.
+
+        Raises:
+            ValueError: If ``api_kind`` or ``name`` is unknown.
         """
+        _kind_sql(api_kind)
+        if name not in API_SOURCES:
+            raise ValueError("unknown source name")
         self._db = db
+        self._api_kind = api_kind
+        self._kind = kind if kind is not None else api_kind
+        self._discovery = discovery
+        self._findings = findings
+        self._cmd = _cmd_sql(api_kind, discovery)
+        self.name = name
 
     async def _all(self, sql: str, params: Sequence[object]) -> list[aiosqlite.Row]:
         cursor = await self._db.execute(sql, params)
@@ -1423,14 +1750,14 @@ class ApiCommandSource:
 
         Args:
             q: The query.
-            kinds: The selected kinds (must include ``kubectl``).
+            kinds: The selected kinds (must include this source's kind).
             after: Keyset position, or ``None`` for the top.
             limit: Page size.
 
         Returns:
             The :class:`SourcePage`.
         """
-        if KIND_KUBECTL not in kinds:
+        if self._kind not in kinds:
             return SourcePage(items=[], exhausted=True)
         if q.cmd is not None:
             return await self._focus(q, after)
@@ -1486,17 +1813,25 @@ class ApiCommandSource:
     ) -> SourcePage:
         """Scan mode: Q4, then Q4b when the page is short (spec §6.3)."""
         budget = max(1, int(_API_SCAN_BUDGET))
-        sql, params = api_scan_sql(q, after, want=want, budget=budget, no_findings=no_findings)
+        sql, params = api_scan_sql(
+            q,
+            after,
+            want=want,
+            budget=budget,
+            no_findings=no_findings,
+            api_kind=self._api_kind,
+            discovery=self._discovery,
+        )
         rows = await self._all(sql, params)
-        items = [_command_item(row, PHASE_SCAN, 0, risk) for row in rows]
+        items = [self._item(row, PHASE_SCAN, 0, risk) for row in rows]
         if len(items) >= want:
             return SourcePage(items=items, exhausted=False)
-        sql, params = api_scan_frontier_sql(q, after, budget=budget)
+        sql, params = api_scan_frontier_sql(q, after, budget=budget, api_kind=self._api_kind)
         edge = await self._all(sql, params)
         if len(edge) < 2:
             return SourcePage(items=items, exhausted=True)
         at, rid = edge[0]["requested_at"], edge[0]["request_id"]
-        rank_src = SOURCE_RANK[SOURCE_API_COMMANDS]
+        rank_src = SOURCE_RANK[self.name]
         key: SortKey = (0, at, rank_src, rid) if risk else (at, rank_src, rid)
         return SourcePage(
             items=items,
@@ -1516,19 +1851,34 @@ class ApiCommandSource:
         any_finding: bool,
     ) -> SourcePage:
         """Flagged mode: Q5 (spec §6.3)."""
+        if not self._findings:
+            # Web has no detection rules (every built-in ApiRule is KUBERNETES-only and
+            # ``detect_api`` skips other resource types), so no web request has an
+            # ``api_findings`` row and Q5 could only return nothing. Q5 already binds
+            # ``r.api_kind = ?`` (``_hit_sql``), but its ``hit`` CTE drives from
+            # ``api_findings``: every finding row (all kubectl today) is joined to its
+            # request before the kind test discards it, so running Q5 for web would
+            # cost a pass over all findings for no result (spec §10 "Bounded work").
+            # Enabling a future web rule needs ``findings=True`` for the web source in
+            # ``build_sources`` plus a query-plan check of Q5 under ``api_kind='web'``.
+            return SourcePage(items=[], exhausted=True)
         cap = max(1, int(_FLAGGED_CMD_CAP))
         sql, params = api_flagged_sql(
-            q, after, want=limit + 1, cap=cap, risk=risk, any_finding=any_finding
+            q,
+            after,
+            want=limit + 1,
+            cap=cap,
+            risk=risk,
+            any_finding=any_finding,
+            api_kind=self._api_kind,
         )
         rows = await self._all(sql, params)
         if rows:
             hit_n = int(rows[0]["hit_n"])
         else:
-            sql, params = api_flagged_count_sql(q, cap=cap)
+            sql, params = api_flagged_count_sql(q, cap=cap, api_kind=self._api_kind)
             hit_n = int((await self._all(sql, params))[0]["n"])
-        items = [
-            _command_item(row, PHASE_FLAGGED, int(row["max_rank"]), risk) for row in rows
-        ]
+        items = [self._item(row, PHASE_FLAGGED, int(row["max_rank"]), risk) for row in rows]
         notices = frozenset({NOTICE_FLAGGED_CAP}) if hit_n > cap else frozenset()
         return SourcePage(items=items, exhausted=len(items) <= limit, notices=notices)
 
@@ -1536,14 +1886,14 @@ class ApiCommandSource:
         """Focus (Q9): the one command containing ``q.cmd``; other filters ignored."""
         if after is not None:
             return SourcePage(items=[], exhausted=True)
-        rows = await self._all(FOCUS_RESOLVE_SQL, (q.cmd,))
+        rows = await self._all(self._cmd.resolve, (q.cmd,))
         if not rows:
             return SourcePage(
                 items=[], exhausted=True, notices=frozenset({NOTICE_FOCUS_MISSING})
             )
         ident = rows[0]
         key_params = (ident["ck"], ident["resource_address"], ident["user_key"])
-        start = await self._all(FOCUS_START_SQL, key_params)
+        start = await self._all(self._cmd.start, key_params)
         if not start:  # pragma: no cover - the resolved row itself always matches
             return SourcePage(
                 items=[], exhausted=True, notices=frozenset({NOTICE_FOCUS_MISSING})
@@ -1555,7 +1905,7 @@ class ApiCommandSource:
             user_key=ident["user_key"],
             ck=ident["ck"],
         )
-        rank_src = SOURCE_RANK[SOURCE_API_COMMANDS]
+        rank_src = SOURCE_RANK[self.name]
         key: SortKey
         if q.sort == SORT_RISK:
             key = (0, ref.requested_at, rank_src, ref.request_id)
@@ -1564,8 +1914,8 @@ class ApiCommandSource:
         else:
             key = (ref.requested_at, rank_src, ref.request_id)
         item = TimelineItem(
-            kind=KIND_KUBECTL,
-            source=SOURCE_API_COMMANDS,
+            kind=self._kind,
+            source=self.name,
             sort_key=key,
             position=(PHASE_SCAN, ref.requested_at, ref.request_id),
             at=ref.requested_at,
@@ -1578,6 +1928,11 @@ class ApiCommandSource:
     ) -> list[TimelineItem | None]:
         """Hydrate each command: Q6a aggregates, Q6b findings, Q6c recordings, Q7 list.
 
+        A web instance then reads the ``gwops`` snapshot of every hydrated
+        connection with one primary-key ``IN (...)`` read
+        (:meth:`~gatorcast.store.activity.ActivityStore.gwops_for_connections`),
+        bounded by the page size.
+
         Args:
             q: The query (unused; part of the source contract).
             items: Unhydrated command items.
@@ -1586,41 +1941,78 @@ class ApiCommandSource:
             Items with :class:`CommandHit` data, aligned; ``None`` for a command
             whose rows vanished (retention) between paging and hydration.
         """
-        out: list[TimelineItem | None] = []
+        hits: list[CommandHit | None] = []
         for it in items:
             ref = it.data
             assert isinstance(ref, CommandRef)
-            hit = await self._hydrate_one(ref)
-            out.append(replace(it, data=hit) if hit is not None else None)
+            hits.append(await self._hydrate_one(ref))
+        if self._kind == KIND_WEB:
+            hits = await self._attach_gwops(hits)
+        return [
+            replace(it, data=hit) if hit is not None else None
+            for it, hit in zip(items, hits, strict=True)
+        ]
+
+    async def _attach_gwops(self, hits: list[CommandHit | None]) -> list[CommandHit | None]:
+        """Fill the ``gwops_*`` fields of web hits from ``connections`` (one read)."""
+        conn_ids = [h.conn_id for h in hits if h is not None]
+        if not conn_ids:
+            return hits
+        snapshots = await ActivityStore(self._db).gwops_for_connections(conn_ids)
+        out: list[CommandHit | None] = []
+        for hit in hits:
+            snap = snapshots.get(hit.conn_id) if hit is not None else None
+            if hit is None or snap is None:
+                out.append(hit)
+                continue
+            out.append(
+                replace(
+                    hit,
+                    gwops_match=snap.gwops_match,
+                    gwops_gateway_id=snap.gwops_gateway_id,
+                    gwops_app=snap.gwops_app,
+                    gwops_managed=snap.gwops_managed,
+                )
+            )
         return out
 
     async def _hydrate_one(self, ref: CommandRef) -> CommandHit | None:
         """Load one command's display data (spec §6.3 "Hydration")."""
         key = (ref.ck, ref.resource_address, ref.user_key)
-        rows = [
-            _row_to_request(r)
-            for r in await self._all(CMD_REQUESTS_SQL, (*key, max(1, int(_CMD_MAX_REQUESTS))))
-        ]
-        if not rows:
+        raw = await self._all(self._cmd.requests, (*key, max(1, int(_CMD_MAX_REQUESTS))))
+        if not raw:
             return None
-        agg = (await self._all(CMD_AGGREGATE_SQL, key))[0]
+        rows = [_row_to_request(r) for r in raw]
+        # The first row is the start row (ordered by requested_at, request_id).
+        downstream_tls: str | None = raw[0]["gc_ds"]
+        upstream_tls: str | None = raw[0]["gc_us"]
+        agg = (await self._all(self._cmd.aggregate, key))[0]
         findings: dict[str, list[ApiFindingRow]] = {}
-        for row in await self._all(CMD_FINDINGS_SQL, key):
+        for row in await self._all(self._cmd.findings, key):
             finding = _row_to_finding(row)
             findings.setdefault(finding.request_id, []).append(finding)
         recordings: dict[str, str] = {}
         recording_order: list[str] = []
-        for row in await self._all(CMD_RECORDINGS_SQL, key):
+        for row in await self._all(self._cmd.recordings, key):
             recordings.setdefault(row["request_id"], row["conn_id"])
             recording_order.append(row["conn_id"])
         command = group_commands(rows, recordings, findings=findings)[0]
+        request_count = int(agg["request_count"])
+        primary = await self._primary(key, rows, truncated=request_count > len(rows))
+        if not self._discovery:
+            # No discovery step (WEBAPP_SPEC §7.2): nothing counts as discovery.
+            command = replace(
+                command, primary=primary, label=pick_label(primary, rows), discovery_count=0
+            )
+        elif primary.request_id != command.primary.request_id:
+            command = replace(command, primary=primary, label=pick_label(primary, rows))
         all_findings = sorted(
             (f for fs in findings.values() for f in fs), key=lambda f: f.id
         )
         return CommandHit(
             ref=ref,
             command=command,
-            request_count=int(agg["request_count"]),
+            request_count=request_count,
             discovery_count=int(agg["discovery_count"]),
             started_at=agg["first_at"],
             ended_at=agg["last_at"],
@@ -1629,7 +2021,61 @@ class ApiCommandSource:
             finding_labels=tuple(dict.fromkeys(f.label for f in all_findings)),
             findings=findings,
             recordings=tuple(dict.fromkeys(recording_order)),
+            kind=self._kind,
+            downstream_tls=downstream_tls,
+            upstream_tls=upstream_tls,
         )
+
+    async def _primary(
+        self,
+        key: tuple[str, str | None, str | None],
+        rows: Sequence[ApiRequestRow],
+        *,
+        truncated: bool,
+    ) -> ApiRequestRow:
+        """Pick the primary request over **every** row of the command, not only the listed.
+
+        Rules (kubectl spec §7; WEBAPP_SPEC §8.1): kubectl — the first mutating
+        (``POST``/``PUT``/``PATCH``/``DELETE``) request, else the first non-discovery
+        request, else the first request (a mutating request is never discovery, which
+        requires ``GET``). Web — the first mutating request, else the first request.
+
+        ``rows`` are the first :data:`_CMD_MAX_REQUESTS` rows in order, so a match
+        among them is the first overall and needs no query. Only when the list is
+        ``truncated`` and holds no match does a bounded ``LIMIT 1`` query on
+        ``idx_api_req_cmd`` look past it (``first_mutating``, then for kubectl
+        ``first_non_discovery``). A primary found that way is not among the listed
+        requests.
+
+        Args:
+            key: ``(ck, resource_address, user_key)``.
+            rows: The listed requests (non-empty), ``(requested_at, request_id)`` order.
+            truncated: True when the command has more rows than ``rows``.
+
+        Returns:
+            The primary request row.
+        """
+        mutating = next((r for r in rows if r.method.upper() in MUTATING_METHODS), None)
+        if mutating is not None:
+            return mutating
+        if truncated:
+            found = await self._all(self._cmd.first_mutating, key)
+            if found:
+                return _row_to_request(found[0])
+        if not self._discovery:
+            return rows[0]
+        listed = next((r for r in rows if not is_discovery(r.method, r.url)), None)
+        if listed is not None:
+            return listed
+        if truncated:
+            found = await self._all(self._cmd.first_non_discovery, key)
+            if found:
+                return _row_to_request(found[0])
+        return rows[0]
+
+    def _item(self, row: aiosqlite.Row, phase: str, rank: int, risk: bool) -> TimelineItem:
+        """Map a Q4/Q5 row to an unhydrated item of this source."""
+        return _command_item(row, phase, rank, risk, kind=self._kind, source=self.name)
 
 
 def _tail(after: Position | None) -> tuple[Any, ...] | None:
@@ -1637,8 +2083,10 @@ def _tail(after: Position | None) -> tuple[Any, ...] | None:
     return None if after is None else tuple(after[1:])
 
 
-def _command_item(row: aiosqlite.Row, phase: str, rank: int, risk: bool) -> TimelineItem:
-    """Map a Q4/Q5 row to an unhydrated command item."""
+def _command_item(
+    row: aiosqlite.Row, phase: str, rank: int, risk: bool, *, kind: str, source: str
+) -> TimelineItem:
+    """Map a Q4/Q5 row to an unhydrated command (or web connection) item."""
     ref = CommandRef(
         request_id=row["request_id"],
         requested_at=row["requested_at"],
@@ -1647,7 +2095,7 @@ def _command_item(row: aiosqlite.Row, phase: str, rank: int, risk: bool) -> Time
         ck=row["ck"],
         rank=rank,
     )
-    rank_src = SOURCE_RANK[SOURCE_API_COMMANDS]
+    rank_src = SOURCE_RANK[source]
     position: Position
     key: SortKey
     if risk:
@@ -1661,8 +2109,8 @@ def _command_item(row: aiosqlite.Row, phase: str, rank: int, risk: bool) -> Time
         key = (ref.requested_at, rank_src, ref.request_id)
         position = (phase, ref.requested_at, ref.request_id)
     return TimelineItem(
-        kind=KIND_KUBECTL,
-        source=SOURCE_API_COMMANDS,
+        kind=kind,
+        source=source,
         sort_key=key,
         position=position,
         at=ref.requested_at,
@@ -1680,18 +2128,47 @@ def build_sources(
     casts: CastStore,
     *,
     content_budget: int = DEFAULT_CONTENT_BUDGET,
+    kinds: Iterable[str] | None = None,
 ) -> list[TimelineSource]:
-    """Return the default sources, in source-rank order.
+    """Return the sources for the wanted kinds, in source-rank order.
 
     Args:
         db: The shared aiosqlite connection.
         casts: The cast store (sidecars for content search).
         content_budget: Sidecars read per page (``SEARCH_REGEX_MAX_CANDIDATES``).
+        kinds: The kinds the caller will query, or ``None`` for every kind. A source
+            is built only when one of its kinds is wanted.
 
     Returns:
-        ``[SessionsSource, ApiCommandSource]``.
+        Up to ``[SessionsSource, ApiCommandSource (kubectl, api_commands),
+        ApiCommandSource (web, web_conns)]``.
     """
-    return [SessionsSource(db, casts, content_budget=content_budget), ApiCommandSource(db)]
+    wanted = frozenset(KIND_KEYS if kinds is None else kinds)
+    sources: list[TimelineSource] = []
+    if wanted & {KIND_SSH, KIND_EXEC, KIND_FAILED}:
+        sources.append(SessionsSource(db, casts, content_budget=content_budget))
+    if KIND_KUBECTL in wanted:
+        sources.append(
+            ApiCommandSource(
+                db,
+                api_kind=KIND_KUBECTL,
+                name=SOURCE_API_COMMANDS,
+                kind=KIND_KUBECTL,
+                discovery=True,
+            )
+        )
+    if KIND_WEB in wanted:
+        sources.append(
+            ApiCommandSource(
+                db,
+                api_kind=KIND_WEB,
+                name=SOURCE_WEB,
+                kind=KIND_WEB,
+                discovery=False,
+                findings=False,
+            )
+        )
+    return sources
 
 
 async def run_timeline(
@@ -1728,14 +2205,15 @@ async def run_timeline(
         The :class:`TimelinePage`.
 
     Raises:
-        ValueError: If the cursor does not match the query, or a needed source is
-            missing from ``sources``.
+        CursorMismatch: If the cursor's sort or kinds do not match the query.
+        ValueError: If a needed source is missing from ``sources`` (an internal
+            error, deliberately not a :class:`CursorMismatch`).
     """
     limit = max(1, int(limit))
     kind_set = frozenset(kinds)
     kinds_sorted = tuple(sorted(kind_set))
     if cursor is not None and (cursor.sort != q.sort or tuple(cursor.kinds) != kinds_sorted):
-        raise ValueError("cursor does not match the query")
+        raise CursorMismatch("cursor does not match the query")
     positions: dict[str, Position | Literal["done"]] = (
         dict(cursor.positions) if cursor is not None else {}
     )
@@ -1808,17 +2286,30 @@ async def run_timeline(
     items = [h for i in range(len(taken)) if (h := hydrated.get(i)) is not None]
 
     notices: frozenset[str] = frozenset().union(*(p.notices for p in pages.values()))
+    # A focus (``cmd``) is missing when no api source found the request (the kubectl
+    # and web sources each look it up under their own ``api_kind``), or when one
+    # resolved it but its rows vanished (retention) before hydration. ``focus_found``
+    # is therefore read from the hydrated items, not from the source pages.
+    focus_found = any(isinstance(it.data, CommandHit) for it in items)
+    focus_resolved = any(p.items for name, p in pages.items() if name in API_SOURCES)
+    focus_not_found = (
+        q.cmd is not None
+        and (NOTICE_FOCUS_MISSING in notices or focus_resolved)
+        and not focus_found
+    )
     budget_hit = len(taken) < limit and next_cursor is not None
+    scan_sources = frozenset(frontier_used & API_SOURCES) if budget_hit else frozenset()
     return TimelinePage(
         items=items,
         next_cursor=next_cursor,
         kinds=kinds_sorted,
         excluded=dict(excluded or {}),
         budget_hit=budget_hit,
-        scan_budget_hit=budget_hit and SOURCE_API_COMMANDS in frontier_used,
+        scan_budget_hit=bool(scan_sources),
+        scan_budget_sources=scan_sources,
         content_budget_hit=budget_hit and SOURCE_SESSIONS in frontier_used,
         flagged_cap_hit=NOTICE_FLAGGED_CAP in notices,
-        focus_not_found=NOTICE_FOCUS_MISSING in notices,
+        focus_not_found=focus_not_found,
         scan_budget=int(_API_SCAN_BUDGET),
         content_budget=next(
             (int(getattr(s, "content_budget", 0)) for s in sources if s.name == SOURCE_SESSIONS),
@@ -1826,3 +2317,46 @@ async def run_timeline(
         ),
         flagged_cap=int(_FLAGGED_CMD_CAP),
     )
+
+
+# =================================================================================
+# Row-level configured TLS (WEBAPP_SPEC §8.4, §8.5)
+# =================================================================================
+
+_TLS_CHUNK = 500
+"""Request ids per primary-key ``IN (...)`` read in :func:`request_tls_modes`."""
+
+
+async def request_tls_modes(
+    db: aiosqlite.Connection, request_ids: Iterable[str]
+) -> dict[str, tuple[str | None, str | None]]:
+    """Read the configured TLS modes stored on each of a set of ``api_requests`` rows.
+
+    The row-level ``downstream_tls`` / ``upstream_tls`` are what the ``scheme`` /
+    ``upstream`` search filters test, so the visit view and the "Configured web app
+    TLS" block prefer them over the connection snapshot. ``ApiRequestRow`` does not
+    carry the two columns, so they are read here: primary-key lookups, at most
+    :data:`_TLS_CHUNK` ids per query, duplicates ignored. Values are returned as
+    stored (never logged).
+
+    Args:
+        db: The shared aiosqlite connection.
+        request_ids: The ``request_id`` values to look up.
+
+    Returns:
+        ``request_id → (downstream_tls, upstream_tls)`` for every id that has a row.
+    """
+    ids = list(dict.fromkeys(request_ids))
+    result: dict[str, tuple[str | None, str | None]] = {}
+    for start in range(0, len(ids), _TLS_CHUNK):
+        chunk = ids[start : start + _TLS_CHUNK]
+        cursor = await db.execute(
+            "SELECT request_id, downstream_tls, upstream_tls FROM api_requests "
+            f"WHERE request_id IN ({_placeholders(len(chunk))})",
+            chunk,
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        for row in rows:
+            result[row["request_id"]] = (row["downstream_tls"], row["upstream_tls"])
+    return result

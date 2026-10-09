@@ -11,10 +11,10 @@
   come only from the registry (badge_class), fixed status maps (status_class), and
   severity keys. Every /search link is pre-built by the route.
 
-  Row dispatch is on `item.row_macro`: "recording_row" (ssh, exec, failed) or
-  "command_row" (kubectl). Both macros live in _rows.html.
+  Row dispatch is on `item.row_macro`: "recording_row" (ssh, exec, failed),
+  "command_row" (kubectl) or "web_row" (web connection). All live in _rows.html.
 #}
-{% from "_rows.html" import recording_row, command_row %}
+{% from "_rows.html" import recording_row, command_row, web_row %}
 
 <div class="results-meta">
   <span class="results-count">Showing {{ shown_count }}</span>
@@ -31,7 +31,7 @@
 
 {% if focus %}
   <p class="notice notice-focus">
-    Showing one kubectl command —
+    {{ focus.heading }} —
     <a href="{{ focus.clear_url }}" hx-get="{{ focus.clear_url }}" hx-target="#results" hx-indicator="#results" hx-push-url="true">clear</a>
   </p>
   {% if focus.not_found %}<p class="notice notice-warn">{{ focus.not_found_text }}</p>{% endif %}
@@ -59,6 +59,8 @@
       {% for item in items %}
         {% if item.row_macro == "command_row" %}
           {{ command_row(item, show_discovery) }}
+        {% elif item.row_macro == "web_row" %}
+          {{ web_row(item) }}
         {% else %}
           {{ recording_row(item) }}
         {% endif %}

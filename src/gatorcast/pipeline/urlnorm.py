@@ -19,6 +19,25 @@ from urllib.parse import unquote
 
 _QUERY_OR_FRAGMENT = re.compile(r"[?#]")
 _REPEATED_SLASH = re.compile(r"/{2,}")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def replace_lone_surrogates(text: str) -> str:
+    """Replace every lone surrogate code point in ``text`` with U+FFFD.
+
+    A JSON ``\\ud800`` escape decodes to a lone surrogate, which cannot be encoded
+    as UTF-8: SQLite raises ``UnicodeEncodeError`` on INSERT and a cast write fails,
+    so the whole line would be dropped. ``classify`` applies this to every string it
+    lets through to storage, and :func:`normalize_url` to every URL. U+FFFD matches
+    what ``unquote`` already yields for an invalid UTF-8 percent-escape.
+
+    Args:
+        text: Any string.
+
+    Returns:
+        ``text`` with each U+D800 to U+DFFF code point replaced by U+FFFD.
+    """
+    return _LONE_SURROGATE.sub("�", text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +84,9 @@ def normalize_url(raw_url: str) -> NormalizedUrl:
     Returns:
         The normalized path and, when it can be trusted, the raw query string.
     """
+    # Lone surrogates would crash the SQLite INSERT (see replace_lone_surrogates);
+    # replace them up front so every downstream form (K8s, web, detection) is safe.
+    raw_url = replace_lone_surrogates(raw_url)
     without_fragment = raw_url.partition("#")[0]
     path, sep, query = without_fragment.partition("?")
     path = unquote(path)

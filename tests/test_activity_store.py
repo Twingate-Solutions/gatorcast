@@ -103,6 +103,7 @@ def make_req(
         username=username,
         method=method,
         url=url,
+        url_web=url,
         status_code=status_code,
         outcome=outcome,
         kubectl_command=kubectl_command,
@@ -319,6 +320,10 @@ async def test_api_requests_schema_has_only_allowlisted_columns(db) -> None:
         "kubectl_session",
         "user_agent",
         "created_at",
+        # Session 11 (WEBAPP_SPEC 4.2): storage-policy discriminator and configured TLS modes
+        "api_kind",
+        "downstream_tls",
+        "upstream_tls",
     }
 
 
@@ -331,6 +336,7 @@ async def test_insert_request_stores_no_extra_input_data(store: ActivityStore, d
             "requested_at": T0,
             "method": "GET",
             "url": "/api",
+            "url_web": "/api",
             "authorization": "Bearer GC_SENTINEL_TOKEN",
             "cookie": "session=GC_SENTINEL_TOKEN",
             "remote_addr": "10.0.0.5:51000",
@@ -1217,13 +1223,14 @@ async def test_purge_before_cascades_findings_with_foreign_keys_off(
     assert await count(db, "api_findings") == 0
 
 
-async def test_purge_before_connections_by_created_at(store: ActivityStore, db) -> None:
-    """Connections are purged by created_at against the same cutoff."""
+async def test_purge_before_connections_by_last_activity(store: ActivityStore, db) -> None:
+    """M: connections are purged on ``COALESCE(last_seen_at, created_at)`` against the same cutoff."""
     for conn_id in ("old", "boundary", "new"):
         await store.upsert_connection_start(conn_id, None, None, None, None)
-    await set_connection_times(db, "old", created="2026-09-30 23:59:59")
-    await set_connection_times(db, "boundary", created="2026-10-01 00:00:00")
-    await set_connection_times(db, "new", created="2026-10-02 00:00:00")
+        await set_connection_times(db, conn_id, created="2026-09-01 00:00:00")
+    await set_connection_times(db, "old", last_seen="2026-09-30 23:59:59")
+    await set_connection_times(db, "boundary", last_seen="2026-10-01 00:00:00")
+    await set_connection_times(db, "new", last_seen="2026-10-02 00:00:00")
 
     api_deleted, conns_deleted = await store.purge_before("2026-10-01T00:00:00Z")
 
@@ -1233,6 +1240,44 @@ async def test_purge_before_connections_by_created_at(store: ActivityStore, db) 
     assert await store.get_connection("new") is not None
 
 
+async def test_purge_before_keeps_an_old_created_connection_that_was_seen_recently(
+    store: ActivityStore, db
+) -> None:
+    """M: creation time alone never purges a connection that is still active."""
+    await store.upsert_connection_start("long-lived", None, None, None, None)
+    await set_connection_times(db, "long-lived", created="2026-01-01 00:00:00", last_seen="2026-10-02 00:00:00")
+
+    assert await store.purge_before("2026-10-01T00:00:00Z") == (0, 0)
+    assert await store.get_connection("long-lived") is not None
+
+
+async def test_purge_before_keeps_a_stale_connection_that_a_request_still_references(
+    store: ActivityStore, db
+) -> None:
+    """M: no purge while an ``api_requests`` row references the connection, however old its own clocks."""
+    await store.upsert_connection_start("busy", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await add_web_request(store, "recent", conn_id="busy", at="2026-12-01T00:00:00.000Z")
+    await set_connection_times(db, "busy", created="2026-01-01 00:00:00", last_seen="2026-01-01 00:00:00")
+
+    assert await store.purge_before("2026-10-01T00:00:00Z") == (0, 0)
+    assert await store.get_connection("busy") is not None
+    assert await count(db, "api_requests") == 1
+
+
+async def test_purge_before_removes_the_connection_once_its_last_request_is_purged_too(
+    store: ActivityStore, db
+) -> None:
+    """M: an old connection whose only requests are also past the cutoff goes in the same call."""
+    await store.upsert_connection_start("gone", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await add_web_request(store, "old-req", conn_id="gone", at="2026-01-01T00:00:00.000Z")
+    await db.execute("UPDATE api_requests SET created_at = '2026-01-01 00:00:00'")
+    await set_connection_times(db, "gone", created="2026-01-01 00:00:00", last_seen="2026-01-01 00:00:00")
+    await db.commit()
+
+    assert await store.purge_before("2026-10-01T00:00:00Z") == (1, 1)
+    assert await store.get_connection("gone") is None
+
+
 async def test_purge_before_counts_both_tables(store: ActivityStore, db) -> None:
     """The returned tuple is (api_requests_deleted, connections_deleted)."""
     for i in range(3):
@@ -1240,7 +1285,7 @@ async def test_purge_before_counts_both_tables(store: ActivityStore, db) -> None
     await add_request(store, "keep", requested_at="2026-10-05T00:00:00.000Z")
     for conn_id in ("c-old1", "c-old2"):
         await store.upsert_connection_start(conn_id, None, None, None, None)
-        await set_connection_times(db, conn_id, created="2026-09-01 00:00:00")
+        await set_connection_times(db, conn_id, created="2026-09-01 00:00:00", last_seen="2026-09-01 00:00:00")
     await store.upsert_connection_start("c-new", None, None, None, None)
 
     assert await store.purge_before("2026-10-01T00:00:00Z") == (3, 2)
@@ -1422,3 +1467,974 @@ async def test_purge_before_early_year_cutoff_is_valid(store: ActivityStore, db)
     await store.upsert_connection_start("c1", None, None, None, None)
     assert await store.purge_before(datetime(999, 1, 1, tzinfo=UTC)) == (0, 0)
     assert await count(db, "api_requests") == 1
+
+
+# ---------------------------------------------------------------------------
+# Session 11 (web apps): api_kind storage, resource_type, web backfill, empty expiry,
+# per-kind reads (WEBAPP_SPEC 4.2, 4.4, 6; gwops/TLS snapshot tests are T12)
+# ---------------------------------------------------------------------------
+
+from gatorcast.store.activity import API_KINDS, RequestStorage  # noqa: E402
+
+WEB_ADDR = "wiki.corp.internal"
+
+
+def web_storage(req: ApiRequest, **overrides) -> RequestStorage:
+    """The web-policy storage form of ``req``: masked URL, User-Agent only."""
+    base = {
+        "api_kind": "web",
+        "url": req.url_web or req.url,
+        "user_agent": req.user_agent,
+        "kubectl_command": None,
+        "kubectl_session": None,
+    }
+    base.update(overrides)
+    return RequestStorage(**base)
+
+
+async def kind_of(db, request_id: str) -> str:
+    """The stored ``api_kind`` of one request."""
+    return (await rows(db, "SELECT api_kind FROM api_requests WHERE request_id = ?", (request_id,)))[0][
+        "api_kind"
+    ]
+
+
+async def add_web_request(
+    store: ActivityStore, request_id: str, *, conn_id: str = "web-conn", at: str = T0, url: str = "/home"
+) -> None:
+    """Insert one web-policy request (no kubectl headers, ``url`` stored as given)."""
+    req = make_req(request_id, conn_id=conn_id, requested_at=at, url=url, kubectl_command=None,
+                   kubectl_session=None)
+    assert await store.insert_request(
+        req, WEB_ADDR, storage=RequestStorage(api_kind="web", url=url, user_agent="ua", kubectl_command=None,
+                                              kubectl_session=None)
+    )
+
+
+def test_api_kinds_are_exactly_kubectl_and_web() -> None:
+    assert API_KINDS == frozenset({"kubectl", "web"})
+
+
+def test_request_storage_rejects_an_unknown_api_kind() -> None:
+    with pytest.raises(ValueError):
+        RequestStorage(api_kind="graphql", url="/x", user_agent=None, kubectl_command=None,
+                       kubectl_session=None)
+
+
+def test_request_storage_kubectl_form_uses_the_kubernetes_url_and_headers() -> None:
+    req = make_req(url="/api/v1/pods", kubectl_command="kubectl get", kubectl_session="s1")
+    storage = RequestStorage.kubectl(req)
+    assert (storage.api_kind, storage.url) == ("kubectl", "/api/v1/pods")
+    assert (storage.kubectl_command, storage.kubectl_session) == ("kubectl get", "s1")
+    assert storage.user_agent == req.user_agent
+    assert storage.downstream_tls is None and storage.upstream_tls is None
+
+
+async def test_insert_request_defaults_to_the_kubectl_form(store: ActivityStore, db) -> None:
+    await add_request(store, "k1", url="/api/v1/pods")
+    row = (await rows(db, "SELECT * FROM api_requests WHERE request_id = 'k1'"))[0]
+    assert row["api_kind"] == "kubectl"
+    assert row["url"] == "/api/v1/pods"
+    assert row["kubectl_command"] == "kubectl get"
+    assert row["kubectl_session"] == "sess-1"
+    assert row["downstream_tls"] is None and row["upstream_tls"] is None
+
+
+async def test_insert_request_with_web_storage_writes_the_chosen_form_not_the_request(
+    store: ActivityStore, db
+) -> None:
+    """The store writes exactly the RequestStorage values: URL, kind and headers come from it."""
+    req = make_req("w1", url="/api/v1/pods", kubectl_command="kubectl get", kubectl_session="s1")
+    storage = RequestStorage(api_kind="web", url="/report?month=…(2)", user_agent="web-ua",
+                             kubectl_command=None, kubectl_session=None)
+    assert await store.insert_request(req, WEB_ADDR, storage=storage)
+    row = (await rows(db, "SELECT * FROM api_requests WHERE request_id = 'w1'"))[0]
+    assert row["api_kind"] == "web"
+    assert row["url"] == "/report?month=…(2)"
+    assert row["user_agent"] == "web-ua"
+    assert row["kubectl_command"] is None and row["kubectl_session"] is None
+    assert row["resource_address"] == WEB_ADDR
+    assert row["method"] == "GET" and row["username"] == USERNAME
+
+
+async def test_web_request_with_findings_storage_stores_the_findings_it_is_given(
+    store: ActivityStore, db
+) -> None:
+    """The store applies no policy: findings are stored when the caller passes them."""
+    req = make_req("w2")
+    assert await store.insert_request_with_findings(
+        req, WEB_ADDR, [make_finding("kube-delete")], storage=web_storage(req)
+    )
+    assert await count(db, "api_findings") == 1
+
+
+async def test_redelivered_web_request_is_ignored(store: ActivityStore, db) -> None:
+    req = make_req("w3")
+    assert await store.insert_request(req, WEB_ADDR, storage=web_storage(req))
+    assert not await store.insert_request(req, WEB_ADDR, storage=web_storage(req))
+    assert not await store.insert_request(req, WEB_ADDR)  # even under the other policy
+    assert await count(db, "api_requests") == 1
+    assert await kind_of(db, "w3") == "web"
+
+
+# --- resource_type on connections ---
+
+
+async def test_upsert_connection_start_stores_resource_type(store: ActivityStore) -> None:
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    conn = await store.get_connection("c1")
+    assert conn is not None
+    assert conn.resource_type == "WEB_APP"
+    assert conn.state == "pending"
+
+
+async def test_upsert_connection_start_defaults_resource_type_to_none(store: ActivityStore) -> None:
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, WEB_ADDR, T0)
+    conn = await store.get_connection("c1")
+    assert conn is not None and conn.resource_type is None
+
+
+async def test_resource_type_is_first_write_wins_and_is_never_cleared_or_replaced(store: ActivityStore) -> None:
+    """A: a repeated or forged start line can neither clear nor change a stored type."""
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    await store.upsert_connection_start("c1", None, None, None, None, None)  # NULL never clears
+    assert (await store.get_connection("c1")).resource_type == "KUBERNETES"
+    await store.upsert_connection_start("c1", None, None, None, None, "SSH")  # non-null does not replace
+    assert (await store.get_connection("c1")).resource_type == "KUBERNETES"
+    await store.upsert_connection_start("c1", None, None, None, None, "WEB_APP")
+    assert (await store.get_connection("c1")).resource_type == "KUBERNETES"
+
+
+async def test_a_processed_start_with_a_null_type_is_not_filled_by_a_later_start(
+    store: ActivityStore, db
+) -> None:
+    """A: a pre-upgrade processed start (started_at set, type NULL) keeps NULL (Kubernetes policy), no backfill."""
+    await store.upsert_connection_start("legacy", USER_ID, USERNAME, CLUSTER, T0, None)
+    await add_provisional_kubectl(store, "e1", "legacy", T0)
+
+    await store.upsert_connection_start("legacy", USER_ID, USERNAME, WEB_ADDR, T1, "WEB_APP", exact_obj())
+
+    conn = await store.get_connection("legacy")
+    assert conn is not None and conn.resource_type is None
+    assert await snapshot_row(db, "legacy") == ALL_NULL  # the snapshot is first-write-wins too
+    assert await kind_of(db, "e1") == "kubectl"
+    assert await count(db, "api_findings") == 1  # no web backfill: findings stay
+
+
+async def test_a_minimal_row_takes_the_type_of_the_first_start_line(store: ActivityStore) -> None:
+    """A: the minimal row ``set_state`` inserts for a request that beat its start line is typed by it."""
+    await store.set_state("early", "api", has_api=True)
+    await store.upsert_connection_start("early", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    conn = await store.get_connection("early")
+    assert conn is not None and conn.resource_type == "KUBERNETES"
+    # ... and from then on it is fixed.
+    await store.upsert_connection_start("early", USER_ID, USERNAME, CLUSTER, T1, "WEB_APP")
+    assert (await store.get_connection("early")).resource_type == "KUBERNETES"
+
+
+async def test_a_forged_web_start_cannot_retype_a_kubernetes_connection_or_disable_its_rules(
+    store: ActivityStore, db
+) -> None:
+    """A: KUBERNETES start, kubectl rows with findings, then a forged WEB_APP start: nothing changes."""
+    await store.upsert_connection_start("k", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    req = make_req("r1", conn_id="k", requested_at=T1)
+    assert await store.insert_request_with_findings(
+        req, CLUSTER, [make_finding("kube-delete", "high")], storage=RequestStorage.kubectl(req)
+    )
+
+    await store.upsert_connection_start("k", USER_ID, USERNAME, WEB_ADDR, T2, "WEB_APP", exact_obj())
+
+    conn = await store.get_connection("k")
+    assert conn is not None and conn.resource_type == "KUBERNETES"
+    assert await snapshot_row(db, "k") == ALL_NULL
+    row = (await rows(db, "SELECT api_kind, kubectl_command FROM api_requests WHERE request_id = 'r1'"))[0]
+    assert (row["api_kind"], row["kubectl_command"]) == ("kubectl", "kubectl get")
+    assert await count(db, "api_findings") == 1
+
+
+async def test_a_forged_kubernetes_start_cannot_retype_a_web_connection(store: ActivityStore, db) -> None:
+    """A (reverse): WEB_APP start with web rows, then a KUBERNETES start: stays WEB_APP, rows stay web."""
+    await start_web(store, "w", exact_obj())
+    await add_web_request(store, "w1", conn_id="w", at=T1)
+
+    await store.upsert_connection_start("w", USER_ID, USERNAME, CLUSTER, T2, "KUBERNETES")
+
+    assert (await store.get_connection("w")).resource_type == "WEB_APP"
+    assert await kind_of(db, "w1") == "web"
+    assert await snapshot_row(db, "w") == EXACT_COLUMNS
+
+
+async def test_set_state_minimal_row_has_no_type_and_no_start_time(store: ActivityStore) -> None:
+    """The row an early request creates is minimal: no identity, no type, no started_at."""
+    await store.set_state("early", "api", has_api=True)
+    conn = await store.get_connection("early")
+    assert conn is not None
+    assert conn.resource_type is None and conn.started_at is None and conn.resource_address is None
+    assert conn.state == "api" and conn.has_api is True
+
+
+async def test_set_state_accepts_empty_and_rejects_unknown_states(store: ActivityStore) -> None:
+    await store.set_state("c1", "empty")
+    assert (await store.get_connection("c1")).state == "empty"
+    with pytest.raises(ValueError):
+        await store.set_state("c1", "closed")
+
+
+# --- web backfill (WEBAPP_SPEC 4.4) ---
+
+
+async def add_provisional_kubectl(store: ActivityStore, request_id: str, conn_id: str, at: str, **kw) -> None:
+    """A request stored before its start line: provisional kubectl, no cluster yet."""
+    await store.set_state(conn_id, "api", has_api=True)
+    req = make_req(request_id, conn_id=conn_id, requested_at=at, **kw)
+    assert await store.insert_request_with_findings(
+        req, None, [make_finding("kube-delete", "high")], storage=RequestStorage.kubectl(req)
+    )
+
+
+async def test_web_start_line_converts_earlier_requests_to_web_and_removes_their_findings(
+    store: ActivityStore, db
+) -> None:
+    await add_provisional_kubectl(store, "e1", "late", T0, url="/items/42?x=…(1)", method="DELETE")
+    await add_provisional_kubectl(store, "e2", "late", T1, url="/home")
+    assert await count(db, "api_findings") == 2
+
+    await store.upsert_connection_start("late", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+
+    assert [await kind_of(db, r) for r in ("e1", "e2")] == ["web", "web"]
+    assert await count(db, "api_findings") == 0
+    got = await rows(
+        db,
+        "SELECT request_id, url, kubectl_command, kubectl_session, resource_address "
+        "FROM api_requests ORDER BY request_id",
+    )
+    assert [(r["request_id"], r["url"]) for r in got] == [("e1", "/items/42?x=…(1)"), ("e2", "/home")]
+    assert all(r["kubectl_command"] is None and r["kubectl_session"] is None for r in got)
+    assert all(r["resource_address"] == WEB_ADDR for r in got)  # cluster backfill still happens
+
+
+async def test_web_backfill_touches_only_that_connection(store: ActivityStore, db) -> None:
+    await add_provisional_kubectl(store, "mine", "late", T0)
+    await add_provisional_kubectl(store, "other", "other-conn", T1)
+    await store.upsert_connection_start("late", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+
+    assert await kind_of(db, "mine") == "web"
+    assert await kind_of(db, "other") == "kubectl"
+    other_findings = await rows(db, "SELECT request_id FROM api_findings")
+    assert [r["request_id"] for r in other_findings] == ["other"]
+
+
+async def test_web_backfill_leaves_rows_that_are_already_web_alone(store: ActivityStore, db) -> None:
+    await add_web_request(store, "w-already", conn_id="late", url="/keep?q=…(3)")
+    await add_provisional_kubectl(store, "w-early", "late", T1)
+    await store.upsert_connection_start("late", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    assert await kind_of(db, "w-already") == "web"
+    assert await kind_of(db, "w-early") == "web"
+    url = (await rows(db, "SELECT url FROM api_requests WHERE request_id = 'w-already'"))[0]["url"]
+    assert url == "/keep?q=…(3)"
+
+
+async def test_web_backfill_is_repeatable_for_a_redelivered_start_line(store: ActivityStore, db) -> None:
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    for _ in range(3):
+        await store.upsert_connection_start("late", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    assert await kind_of(db, "e1") == "web"
+    assert await count(db, "api_requests") == 1
+    assert await count(db, "api_findings") == 0
+
+
+@pytest.mark.parametrize("resource_type", ["KUBERNETES", None])
+async def test_kubernetes_or_untyped_start_line_does_not_convert_rows(
+    store: ActivityStore, db, resource_type: str | None
+) -> None:
+    """A KUBERNETES start line (or none) leaves provisional rows kubectl, findings intact."""
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    await store.upsert_connection_start("late", USER_ID, USERNAME, CLUSTER, T0, resource_type)
+    assert await kind_of(db, "e1") == "kubectl"
+    assert await count(db, "api_findings") == 1
+    row = (await rows(db, "SELECT kubectl_command, kubectl_session FROM api_requests"))[0]
+    assert (row["kubectl_command"], row["kubectl_session"]) == ("kubectl get", "sess-1")
+
+
+@pytest.mark.parametrize("resource_type", ["WEB_APP", "SSH", "DATABASE"])
+async def test_any_non_kubernetes_type_converts_earlier_rows(
+    store: ActivityStore, db, resource_type: str
+) -> None:
+    """The backfill condition is "non-null and not KUBERNETES" (WEBAPP_SPEC 4.4)."""
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    await store.upsert_connection_start("late", USER_ID, USERNAME, WEB_ADDR, T0, resource_type)
+    assert await kind_of(db, "e1") == "web"
+
+
+# --- expire_pending: WEB_APP -> empty (WEBAPP_SPEC 6) ---
+
+
+async def test_expire_pending_turns_an_idle_web_app_connection_into_empty(store: ActivityStore, db) -> None:
+    await store.upsert_connection_start("web", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await set_connection_times(db, "web", last_seen=await seconds_ago(db, 600))
+    expired = await store.expire_pending(60)
+    assert [(c.conn_id, c.state) for c in expired] == [("web", "empty")]
+    assert (await store.get_connection("web")).state == "empty"
+
+
+@pytest.mark.parametrize("resource_type", ["SSH", "KUBERNETES", None, "DATABASE"])
+async def test_expire_pending_keeps_error_for_every_other_type(
+    store: ActivityStore, db, resource_type: str | None
+) -> None:
+    await store.upsert_connection_start("c", USER_ID, USERNAME, CLUSTER, T0, resource_type)
+    await set_connection_times(db, "c", last_seen=await seconds_ago(db, 600))
+    expired = await store.expire_pending(60)
+    assert [(c.conn_id, c.state) for c in expired] == [("c", "error")]
+
+
+async def test_expire_pending_mixed_batch_labels_each_connection_by_its_type(
+    store: ActivityStore, db
+) -> None:
+    for conn_id, rtype in (("a-web", "WEB_APP"), ("b-ssh", "SSH"), ("c-k8s", "KUBERNETES")):
+        await store.upsert_connection_start(conn_id, USER_ID, USERNAME, CLUSTER, T0, rtype)
+        await set_connection_times(db, conn_id, last_seen=await seconds_ago(db, 600))
+    expired = {c.conn_id: c.state for c in await store.expire_pending(60)}
+    assert expired == {"a-web": "empty", "b-ssh": "error", "c-k8s": "error"}
+
+
+async def test_expire_pending_does_not_expire_empty_connections_again(store: ActivityStore, db) -> None:
+    await store.upsert_connection_start("web", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await set_connection_times(db, "web", last_seen=await seconds_ago(db, 600))
+    assert len(await store.expire_pending(60)) == 1
+    assert await store.expire_pending(60) == []  # idempotent: only `pending` rows expire
+
+
+async def test_expire_pending_leaves_a_web_connection_that_received_a_request(
+    store: ActivityStore, db
+) -> None:
+    await store.upsert_connection_start("web", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await store.set_state("web", "api", has_api=True)
+    await set_connection_times(db, "web", last_seen=await seconds_ago(db, 600))
+    assert await store.expire_pending(60) == []
+    assert (await store.get_connection("web")).state == "api"
+
+
+async def test_empty_connection_moves_to_api_on_a_later_set_state(store: ActivityStore) -> None:
+    await store.set_state("c1", "empty")
+    await store.set_state("c1", "api", has_api=True)
+    conn = await store.get_connection("c1")
+    assert conn.state == "api" and conn.has_api is True
+
+
+# --- per-kind reads (WEBAPP_SPEC 8.5) ---
+
+
+async def test_requests_for_system_defaults_to_kubectl_and_excludes_web_rows(store: ActivityStore) -> None:
+    await store.insert_request(make_req("k", requested_at=T0), WEB_ADDR)
+    await add_web_request(store, "w", at=T1)
+    default = await store.requests_for_system(WEB_ADDR, T0, T3)
+    assert [r.request_id for r in default] == ["k"]
+    assert [r.request_id for r in await store.requests_for_system(WEB_ADDR, T0, T3, api_kind="kubectl")] == ["k"]
+
+
+async def test_requests_for_system_with_web_kind_returns_only_web_rows(store: ActivityStore) -> None:
+    await store.insert_request(make_req("k", requested_at=T0), WEB_ADDR)
+    await add_web_request(store, "w1", at=T1)
+    await add_web_request(store, "w2", at=T2)
+    got = await store.requests_for_system(WEB_ADDR, T0, T3, api_kind="web")
+    assert [r.request_id for r in got] == ["w1", "w2"]
+
+
+async def test_requests_in_bounds_filters_by_kind(store: ActivityStore) -> None:
+    await store.insert_request(make_req("k", requested_at=T1), WEB_ADDR)
+    await add_web_request(store, "w", at=T1)
+    kube = await store.requests_in_bounds(WEB_ADDR, USER_ID, T0, T3)
+    web = await store.requests_in_bounds(WEB_ADDR, USER_ID, T0, T3, api_kind="web")
+    assert [r.request_id for r in kube] == ["k"]
+    assert [r.request_id for r in web] == ["w"]
+
+
+@pytest.mark.parametrize("bad", ["Web", "", "all", "kubectl; DROP TABLE api_requests"])
+async def test_per_kind_reads_reject_an_unknown_kind(store: ActivityStore, bad: str) -> None:
+    with pytest.raises(ValueError):
+        await store.requests_for_system(WEB_ADDR, T0, T3, api_kind=bad)
+    with pytest.raises(ValueError):
+        await store.requests_in_bounds(WEB_ADDR, USER_ID, T0, T3, api_kind=bad)
+
+
+# --- retention covers web rows ---
+
+
+async def test_purge_before_removes_old_web_rows_and_their_connections(store: ActivityStore, db) -> None:
+    await store.upsert_connection_start("web", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    await add_web_request(store, "w-old", conn_id="web", at="2026-01-01T00:00:00.000Z")
+    await add_web_request(store, "w-new", conn_id="web", at="2026-12-01T00:00:00.000Z")
+    await set_connection_times(db, "web", created="2026-01-01 00:00:00", last_seen="2026-01-01 00:00:00")
+    await db.execute("UPDATE api_requests SET created_at = '2026-01-01 00:00:00' WHERE request_id = 'w-old'")
+    await db.commit()
+
+    deleted_requests, deleted_connections = await store.purge_before("2026-06-01T00:00:00.000Z")
+
+    # M: the old row goes, but the connection stays while ``w-new`` still references it.
+    assert (deleted_requests, deleted_connections) == (1, 0)
+    assert [r["request_id"] for r in await rows(db, "SELECT request_id FROM api_requests")] == ["w-new"]
+    assert await store.get_connection("web") is not None
+
+    await db.execute("DELETE FROM api_requests")
+    await db.commit()
+    assert await store.purge_before("2026-06-01T00:00:00.000Z") == (0, 1)
+    assert await store.get_connection("web") is None
+
+
+# ---------------------------------------------------------------------------
+# Session 11 T12: gwops/TLS snapshot on connections (WEBAPP_SPEC 3.3, 4.3-4.5)
+# ---------------------------------------------------------------------------
+
+from gatorcast.models import GwopsSnapshot, GwopsWebApp  # noqa: E402
+
+GATEWAY_ID = "R2F0ZXdheToxMjk0"
+SNAPSHOT_COLUMNS = (
+    "gwops_match", "gwops_gateway_id", "gwops_app", "gwops_managed",
+    "downstream_tls", "downstream_port", "upstream_tls", "upstream_port",
+)
+ALL_NULL = dict.fromkeys(SNAPSHOT_COLUMNS)
+
+
+def exact_obj(**overrides) -> GwopsWebApp:
+    """A valid ``exact`` object: tls13 down, verify_full up."""
+    fields = {
+        "match": "exact", "gateway_id": GATEWAY_ID, "app": "verifier-a", "managed": True,
+        "downstream_tls": "tls13", "downstream_port": 443,
+        "upstream_tls": "verify_full", "upstream_port": 8443,
+    }
+    fields.update(overrides)
+    return GwopsWebApp(**fields)
+
+
+EXACT_COLUMNS = {
+    "gwops_match": "exact", "gwops_gateway_id": GATEWAY_ID, "gwops_app": "verifier-a",
+    "gwops_managed": 1, "downstream_tls": "tls13", "downstream_port": 443,
+    "upstream_tls": "verify_full", "upstream_port": 8443,
+}
+OTHER_EXACT = dict(
+    match="exact", gateway_id="Q29uZmxpY3Q=", app="other-app", managed=False,
+    downstream_tls="none", downstream_port=80, upstream_tls="insecure", upstream_port=9000,
+)
+OTHER_EXACT_COLUMNS = {
+    "gwops_match": "exact", "gwops_gateway_id": "Q29uZmxpY3Q=", "gwops_app": "other-app",
+    "gwops_managed": 0, "downstream_tls": "none", "downstream_port": 80,
+    "upstream_tls": "insecure", "upstream_port": 9000,
+}
+
+
+async def snapshot_row(db, conn_id: str) -> dict:
+    """The eight raw snapshot columns of one connection."""
+    got = await rows(db, f"SELECT {', '.join(SNAPSHOT_COLUMNS)} FROM connections WHERE conn_id = ?", (conn_id,))
+    assert len(got) == 1, conn_id
+    return dict(got[0])
+
+
+async def start_web(store: ActivityStore, conn_id: str, gwops: GwopsWebApp | None, **kw) -> None:
+    """Process a WEB_APP start line carrying ``gwops``."""
+    args = {"user_id": USER_ID, "username": USERNAME, "resource_address": WEB_ADDR, "started_at": T0}
+    args.update(kw)
+    await store.upsert_connection_start(
+        conn_id, args["user_id"], args["username"], args["resource_address"], args["started_at"],
+        "WEB_APP", gwops,
+    )
+
+
+async def tls_of(db, request_id: str) -> tuple[str | None, str | None]:
+    """(downstream_tls, upstream_tls) stored on one request row."""
+    got = await rows(
+        db, "SELECT downstream_tls, upstream_tls FROM api_requests WHERE request_id = ?", (request_id,)
+    )
+    return (got[0]["downstream_tls"], got[0]["upstream_tls"])
+
+
+# --- what is stored per match ---
+
+
+async def test_exact_object_stores_all_eight_snapshot_columns(store: ActivityStore, db) -> None:
+    await start_web(store, "c1", exact_obj())
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+async def test_connection_row_exposes_the_snapshot_columns_with_managed_as_bool(store: ActivityStore) -> None:
+    await start_web(store, "c1", exact_obj())
+    conn = await store.get_connection("c1")
+    assert conn is not None
+    assert (conn.gwops_match, conn.gwops_gateway_id, conn.gwops_app) == ("exact", GATEWAY_ID, "verifier-a")
+    assert conn.gwops_managed is True
+    assert (conn.downstream_tls, conn.downstream_port) == ("tls13", 443)
+    assert (conn.upstream_tls, conn.upstream_port) == ("verify_full", 8443)
+
+
+async def test_unmanaged_object_stores_managed_zero_and_reads_back_false_not_none(
+    store: ActivityStore, db
+) -> None:
+    await start_web(store, "c1", exact_obj(managed=False))
+    assert (await snapshot_row(db, "c1"))["gwops_managed"] == 0
+    assert (await store.get_connection("c1")).gwops_managed is False
+
+
+@pytest.mark.parametrize(
+    ("down", "up"),
+    [("none", "none"), ("tls13", "none"), ("tls13", "verify_ca"), ("tls13", "verify_full"),
+     ("none", "insecure"), ("tls13", "insecure")],
+)
+async def test_every_downstream_and_upstream_mode_is_stored_verbatim(
+    store: ActivityStore, db, down: str, up: str
+) -> None:
+    await start_web(store, "c1", exact_obj(downstream_tls=down, upstream_tls=up))
+    got = await snapshot_row(db, "c1")
+    assert (got["downstream_tls"], got["upstream_tls"]) == (down, up)
+
+
+@pytest.mark.parametrize("match", ["none", "ambiguous"])
+async def test_none_and_ambiguous_store_only_match_and_gateway_id(
+    store: ActivityStore, db, match: str
+) -> None:
+    await start_web(store, "c1", GwopsWebApp(match=match, gateway_id=GATEWAY_ID))
+    assert await snapshot_row(db, "c1") == {**ALL_NULL, "gwops_match": match, "gwops_gateway_id": GATEWAY_ID}
+
+
+@pytest.mark.parametrize("match", ["none", "ambiguous"])
+async def test_none_and_ambiguous_never_store_app_fields_even_if_the_model_carries_them(
+    store: ActivityStore, db, match: str
+) -> None:
+    """The store maps by match, so stray fields on a hand-built model cannot leak into columns."""
+    obj = GwopsWebApp(**{**OTHER_EXACT, "match": match})
+    await start_web(store, "c1", obj)
+    assert await snapshot_row(db, "c1") == {
+        **ALL_NULL, "gwops_match": match, "gwops_gateway_id": "Q29uZmxpY3Q=",
+    }
+    conn = await store.get_connection("c1")
+    assert conn.downstream_tls is None and conn.upstream_tls is None and conn.gwops_app is None
+
+
+@pytest.mark.parametrize("match", ["exact", "none", "ambiguous"])
+async def test_gateway_id_null_is_accepted_and_stored_as_null(store: ActivityStore, db, match: str) -> None:
+    obj = exact_obj(gateway_id=None) if match == "exact" else GwopsWebApp(match=match, gateway_id=None)
+    await start_web(store, "c1", obj)
+    got = await snapshot_row(db, "c1")
+    assert got["gwops_match"] == match and got["gwops_gateway_id"] is None
+    assert (got["downstream_tls"] is not None) == (match == "exact")  # the rest follows the match
+
+
+async def test_exact_with_no_app_stores_null_app_and_keeps_the_rest(store: ActivityStore, db) -> None:
+    """A bad app was dropped by the classifier: app NULL, everything else stored."""
+    await start_web(store, "c1", exact_obj(app=None))
+    assert await snapshot_row(db, "c1") == {**EXACT_COLUMNS, "gwops_app": None}
+
+
+async def test_no_object_stores_all_eight_columns_null_but_keeps_the_type(store: ActivityStore, db) -> None:
+    await start_web(store, "c1", None)
+    assert await snapshot_row(db, "c1") == ALL_NULL
+    assert (await store.get_connection("c1")).resource_type == "WEB_APP"
+
+
+async def test_start_without_gwops_argument_defaults_to_a_null_snapshot(store: ActivityStore, db) -> None:
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    assert await snapshot_row(db, "c1") == ALL_NULL
+
+
+# --- first write wins ---
+
+
+@pytest.mark.parametrize(
+    ("first", "repeat"),
+    [
+        (exact_obj(), exact_obj()),  # byte-identical
+        (exact_obj(), GwopsWebApp(**OTHER_EXACT)),  # different exact object
+        (exact_obj(), GwopsWebApp(match="none", gateway_id="Q29uZmxpY3Q=")),
+        (exact_obj(), GwopsWebApp(match="ambiguous", gateway_id=None)),
+        (exact_obj(), None),  # a repeat with no object
+        (GwopsWebApp(match="none", gateway_id=GATEWAY_ID), exact_obj()),
+        (GwopsWebApp(match="ambiguous", gateway_id=GATEWAY_ID), GwopsWebApp(match="none", gateway_id="x")),
+        (GwopsWebApp(match="none", gateway_id=GATEWAY_ID), None),
+    ],
+    ids=["same", "other-exact", "to-none", "to-ambiguous", "to-null", "none-to-exact", "amb-to-none",
+         "none-to-null"],
+)
+async def test_a_repeated_start_line_never_changes_the_snapshot(
+    store: ActivityStore, db, first: GwopsWebApp, repeat: GwopsWebApp | None
+) -> None:
+    await start_web(store, "c1", first)
+    before = await snapshot_row(db, "c1")
+    await start_web(store, "c1", repeat)
+    await start_web(store, "c1", repeat)
+    assert await snapshot_row(db, "c1") == before
+
+
+async def test_a_null_snapshot_is_not_filled_in_by_a_repeated_start_line_with_an_object(
+    store: ActivityStore, db
+) -> None:
+    """First processing had no object (or a rejected one): TLS stays unknown, never retro-filled."""
+    await start_web(store, "c1", None)
+    await start_web(store, "c1", exact_obj())
+    await start_web(store, "c1", GwopsWebApp(match="none", gateway_id=GATEWAY_ID))
+    assert await snapshot_row(db, "c1") == ALL_NULL
+    conn = await store.get_connection("c1")
+    assert conn.downstream_tls is None and conn.upstream_tls is None and conn.gwops_match is None
+
+
+async def test_a_null_snapshot_stays_null_when_the_first_start_line_had_no_timestamp(
+    store: ActivityStore, db
+) -> None:
+    """started_at stays NULL here but resource_type is set, so the row is not the minimal one."""
+    await start_web(store, "c1", None, started_at=None)
+    await start_web(store, "c1", exact_obj(), started_at=None)
+    assert await snapshot_row(db, "c1") == ALL_NULL
+
+
+async def test_a_repeat_with_a_different_resource_type_does_not_touch_the_snapshot(
+    store: ActivityStore, db
+) -> None:
+    await start_web(store, "c1", exact_obj())
+    await store.upsert_connection_start("c1", None, None, None, None, "KUBERNETES", None)
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+async def test_a_repeat_updates_last_seen_but_not_the_snapshot_or_state(store: ActivityStore, db) -> None:
+    await start_web(store, "c1", exact_obj())
+    await store.set_state("c1", "api", has_api=True)
+    await start_web(store, "c1", GwopsWebApp(**OTHER_EXACT))
+    conn = await store.get_connection("c1")
+    assert (conn.state, conn.has_api) == ("api", True)
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+async def test_the_first_start_line_after_an_early_request_takes_the_snapshot(store: ActivityStore, db) -> None:
+    """The minimal row set_state inserts for a request that beat its start line is not a snapshot."""
+    await store.set_state("c1", "api", has_api=True)
+    assert await snapshot_row(db, "c1") == ALL_NULL
+    await start_web(store, "c1", exact_obj())
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+async def test_after_an_early_request_a_repeat_still_cannot_replace_the_first_snapshot(
+    store: ActivityStore, db
+) -> None:
+    await store.set_state("c1", "api", has_api=True)
+    await start_web(store, "c1", exact_obj())
+    await start_web(store, "c1", GwopsWebApp(**OTHER_EXACT))
+    await start_web(store, "c1", None)
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+async def test_after_an_early_request_a_first_start_without_an_object_fixes_a_null_snapshot(
+    store: ActivityStore, db
+) -> None:
+    await store.set_state("c1", "api", has_api=True)
+    await start_web(store, "c1", None)
+    await start_web(store, "c1", exact_obj())
+    assert await snapshot_row(db, "c1") == ALL_NULL
+
+
+async def test_snapshots_of_different_connections_are_independent(store: ActivityStore, db) -> None:
+    await start_web(store, "a", exact_obj())
+    await start_web(store, "b", GwopsWebApp(**OTHER_EXACT))
+    await start_web(store, "c", None)
+    assert await snapshot_row(db, "a") == EXACT_COLUMNS
+    assert await snapshot_row(db, "b") == OTHER_EXACT_COLUMNS
+    assert await snapshot_row(db, "c") == ALL_NULL
+
+
+async def test_identity_and_type_still_follow_the_coalesce_rules_while_the_snapshot_is_fixed(
+    store: ActivityStore, db
+) -> None:
+    """Only the eight columns are first-write-wins; the existing columns keep their own rules."""
+    await store.upsert_connection_start("c1", None, None, None, T0, "WEB_APP", exact_obj())
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, WEB_ADDR, T1, "WEB_APP", None)
+    conn = await store.get_connection("c1")
+    assert (conn.user_id, conn.username, conn.resource_address) == (USER_ID, USERNAME, WEB_ADDR)
+    assert conn.started_at == T0
+    assert await snapshot_row(db, "c1") == EXACT_COLUMNS
+
+
+# --- request TLS columns and the web backfill ---
+
+
+async def test_web_storage_with_modes_writes_them_on_the_request_row(store: ActivityStore, db) -> None:
+    req = make_req("w1", kubectl_command=None, kubectl_session=None)
+    storage = web_storage(req, downstream_tls="tls13", upstream_tls="insecure")
+    assert await store.insert_request(req, WEB_ADDR, storage=storage)
+    assert await tls_of(db, "w1") == ("tls13", "insecure")
+
+
+async def test_web_storage_without_modes_and_kubectl_storage_leave_tls_null(store: ActivityStore, db) -> None:
+    web = make_req("w1", kubectl_command=None, kubectl_session=None)
+    assert await store.insert_request(web, WEB_ADDR, storage=web_storage(web))
+    await add_request(store, "k1")
+    assert await tls_of(db, "w1") == (None, None)
+    assert await tls_of(db, "k1") == (None, None)
+
+
+async def test_web_backfill_binds_the_stored_exact_modes_to_the_earlier_requests(
+    store: ActivityStore, db
+) -> None:
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    await add_provisional_kubectl(store, "e2", "late", T1)
+    assert await tls_of(db, "e1") == (None, None)
+
+    await start_web(store, "late", exact_obj(downstream_tls="tls13", upstream_tls="verify_ca"))
+
+    assert await tls_of(db, "e1") == ("tls13", "verify_ca")
+    assert await tls_of(db, "e2") == ("tls13", "verify_ca")
+    assert [await kind_of(db, r) for r in ("e1", "e2")] == ["web", "web"]
+
+
+@pytest.mark.parametrize(
+    "gwops",
+    [None, GwopsWebApp(match="none", gateway_id=GATEWAY_ID), GwopsWebApp(match="ambiguous", gateway_id=None)],
+    ids=["no-object", "none", "ambiguous"],
+)
+async def test_web_backfill_leaves_tls_null_when_the_snapshot_has_no_modes(
+    store: ActivityStore, db, gwops: GwopsWebApp | None
+) -> None:
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    await start_web(store, "late", gwops)
+    assert await tls_of(db, "e1") == (None, None)
+    assert await kind_of(db, "e1") == "web"
+
+
+async def test_web_backfill_binds_the_stored_modes_on_first_processing_only(store: ActivityStore, db) -> None:
+    """A: the backfill runs only on first processing, so a repeat start cannot convert rows or swap modes.
+
+    The modes are bound from the stored snapshot (read back after the upsert), which on first
+    processing is the incoming object's. A repeat start with a DIFFERENT object changes neither
+    the snapshot nor any row.
+    """
+    # First processing on a minimal row (a request beat its start line): converts and binds.
+    await add_provisional_kubectl(store, "e0", "late", T0)
+    await start_web(store, "late", exact_obj(downstream_tls="tls13", upstream_tls="verify_full"))
+    assert await kind_of(db, "e0") == "web"
+    assert await tls_of(db, "e0") == ("tls13", "verify_full")
+    # A kubectl row stored under the provisional policy afterwards (e.g. a redelivered early
+    # request), then a start line with a DIFFERENT object is processed again.
+    await add_provisional_kubectl(store, "e1", "late", T1)
+    await start_web(store, "late", GwopsWebApp(**OTHER_EXACT))
+    assert await kind_of(db, "e1") == "kubectl"  # no second backfill
+    assert await tls_of(db, "e1") == (None, None)
+    assert await tls_of(db, "e0") == ("tls13", "verify_full")
+    assert await snapshot_row(db, "late") == EXACT_COLUMNS
+
+
+async def test_web_backfill_binds_null_when_the_first_start_had_no_object_even_if_a_repeat_has_one(
+    store: ActivityStore, db
+) -> None:
+    """A: a repeat can neither fill the NULL snapshot nor trigger a backfill with its own modes."""
+    await add_provisional_kubectl(store, "e0", "late", T0)
+    await start_web(store, "late", None)
+    assert await kind_of(db, "e0") == "web"
+    assert await tls_of(db, "e0") == (None, None)
+    await add_provisional_kubectl(store, "e1", "late", T1)
+    await start_web(store, "late", exact_obj())
+    assert await tls_of(db, "e1") == (None, None)
+    assert await kind_of(db, "e1") == "kubectl"  # not a first processing: no backfill
+    assert await snapshot_row(db, "late") == ALL_NULL
+
+
+async def test_web_backfill_does_not_overwrite_the_modes_of_rows_that_are_already_web(
+    store: ActivityStore, db
+) -> None:
+    """Only kubectl rows are converted; an already-web row keeps whatever it was stored with."""
+    req = make_req("w-old", conn_id="late", kubectl_command=None, kubectl_session=None)
+    assert await store.insert_request(
+        req, WEB_ADDR, storage=web_storage(req, downstream_tls="none", upstream_tls="none")
+    )
+    await add_provisional_kubectl(store, "e1", "late", T1)
+    await start_web(store, "late", exact_obj())
+    assert await tls_of(db, "w-old") == ("none", "none")
+    assert await tls_of(db, "e1") == ("tls13", "verify_full")
+
+
+async def test_web_backfill_touches_only_its_own_connections_modes(store: ActivityStore, db) -> None:
+    await add_provisional_kubectl(store, "mine", "late", T0)
+    await add_provisional_kubectl(store, "other", "elsewhere", T1)
+    await start_web(store, "late", exact_obj())
+    assert await tls_of(db, "mine") == ("tls13", "verify_full")
+    assert await tls_of(db, "other") == (None, None)
+    assert await kind_of(db, "other") == "kubectl"
+
+
+async def test_a_kubernetes_start_binds_no_modes_and_converts_nothing(store: ActivityStore, db) -> None:
+    await add_provisional_kubectl(store, "e1", "late", T0)
+    await store.upsert_connection_start("late", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    assert await tls_of(db, "e1") == (None, None)
+    assert await kind_of(db, "e1") == "kubectl"
+
+
+# --- gwops_for_connections ---
+
+
+async def test_gwops_for_connections_returns_the_stored_snapshot_per_connection(
+    store: ActivityStore,
+) -> None:
+    await start_web(store, "exact", exact_obj())
+    await start_web(store, "none", GwopsWebApp(match="none", gateway_id=GATEWAY_ID))
+    await start_web(store, "amb", GwopsWebApp(match="ambiguous", gateway_id=None))
+
+    got = await store.gwops_for_connections(["exact", "none", "amb"])
+
+    assert set(got) == {"exact", "none", "amb"}
+    assert all(isinstance(v, GwopsSnapshot) for v in got.values())
+    assert got["exact"] == GwopsSnapshot(
+        gwops_match="exact", gwops_gateway_id=GATEWAY_ID, gwops_app="verifier-a", gwops_managed=True,
+        downstream_tls="tls13", downstream_port=443, upstream_tls="verify_full", upstream_port=8443,
+    )
+    assert got["none"] == GwopsSnapshot(gwops_match="none", gwops_gateway_id=GATEWAY_ID)
+    assert got["amb"] == GwopsSnapshot(gwops_match="ambiguous")
+
+
+async def test_gwops_for_connections_maps_a_connection_without_an_object_to_an_all_none_snapshot(
+    store: ActivityStore,
+) -> None:
+    """Existing row, no stored object: TLS unknown, present in the result rather than absent."""
+    await start_web(store, "no-object", None)
+    await store.upsert_connection_start("k8s", USER_ID, USERNAME, CLUSTER, T0, "KUBERNETES")
+    await store.set_state("minimal", "api", has_api=True)
+
+    got = await store.gwops_for_connections(["no-object", "k8s", "minimal"])
+
+    assert got == {name: GwopsSnapshot() for name in ("no-object", "k8s", "minimal")}
+    for snapshot in got.values():
+        assert all(value is None for value in snapshot.model_dump().values())
+
+
+async def test_gwops_for_connections_omits_unknown_ids(store: ActivityStore) -> None:
+    await start_web(store, "known", exact_obj())
+    got = await store.gwops_for_connections(["known", "missing-1", "missing-2"])
+    assert set(got) == {"known"}
+
+
+async def test_gwops_for_connections_with_no_ids_returns_empty_without_querying(
+    store: ActivityStore, db
+) -> None:
+    statements: list[str] = []
+    await db.set_trace_callback(statements.append)
+    try:
+        assert await store.gwops_for_connections([]) == {}
+        assert await store.gwops_for_connections(iter(())) == {}
+    finally:
+        await db.set_trace_callback(None)
+    assert not [s for s in statements if "FROM connections" in s]
+
+
+async def test_gwops_for_connections_ignores_duplicate_ids_and_accepts_any_iterable(
+    store: ActivityStore,
+) -> None:
+    await start_web(store, "a", exact_obj())
+    await start_web(store, "b", None)
+    got = await store.gwops_for_connections(c for c in ["a", "a", "b", "a", "b"])
+    assert set(got) == {"a", "b"}
+    assert got["a"].gwops_match == "exact" and got["b"].gwops_match is None
+
+
+@pytest.mark.parametrize("total", [1, 499, 500, 501, 1000, 1001, 1203])
+async def test_gwops_for_connections_chunks_in_groups_of_500_and_returns_every_row(
+    store: ActivityStore, db, total: int
+) -> None:
+    """More than 500 ids span several queries; nothing is lost or mixed up at a chunk edge."""
+    ids = [f"conn-{i:05d}" for i in range(total)]
+    await db.executemany(
+        "INSERT INTO connections (conn_id, resource_type, gwops_match, gwops_gateway_id, gwops_app, "
+        "gwops_managed, downstream_tls, downstream_port, upstream_tls, upstream_port) "
+        "VALUES (?, 'WEB_APP', 'exact', ?, ?, ?, 'tls13', ?, 'verify_full', ?)",
+        [(cid, f"gw-{i}", f"app-{i}", i % 2, 1000 + i, 2000 + i) for i, cid in enumerate(ids)],
+    )
+    await db.commit()
+
+    statements: list[str] = []
+    await db.set_trace_callback(statements.append)
+    try:
+        got = await store.gwops_for_connections(ids + ["not-a-connection"])
+    finally:
+        await db.set_trace_callback(None)
+
+    assert len(got) == total
+    assert "not-a-connection" not in got
+    for i in {0, total // 2, total - 1, 499 % total, 500 % total}:
+        snap = got[ids[i]]
+        assert (snap.gwops_gateway_id, snap.gwops_app) == (f"gw-{i}", f"app-{i}")
+        assert snap.gwops_managed is bool(i % 2)
+        assert (snap.downstream_port, snap.upstream_port) == (1000 + i, 2000 + i)
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT CONN_ID, GWOPS_MATCH")]
+    assert len(selects) == -(-(total + 1) // 500)  # ceil((total + the missing id) / 500)
+
+
+async def test_gwops_for_connections_does_not_read_other_connections(store: ActivityStore) -> None:
+    await start_web(store, "wanted", exact_obj())
+    await start_web(store, "unwanted", GwopsWebApp(**OTHER_EXACT))
+    got = await store.gwops_for_connections(["wanted"])
+    assert set(got) == {"wanted"}
+
+
+async def test_gwops_for_connections_reflects_first_write_wins(store: ActivityStore) -> None:
+    await start_web(store, "c1", exact_obj())
+    await start_web(store, "c1", GwopsWebApp(**OTHER_EXACT))
+    await start_web(store, "c2", None)
+    await start_web(store, "c2", exact_obj())
+    got = await store.gwops_for_connections(["c1", "c2"])
+    assert got["c1"].gwops_gateway_id == GATEWAY_ID and got["c1"].gwops_app == "verifier-a"
+    assert got["c2"] == GwopsSnapshot()
+
+
+# --- the models never print the snapshot's identifying fields ---
+
+
+async def test_snapshot_and_connection_reprs_hide_gateway_id_and_app(store: ActivityStore) -> None:
+    await start_web(store, "c1", exact_obj(app="SENTINEL_APP_REPR", gateway_id="SENTINEL_GW_REPR"))
+    snapshot = (await store.gwops_for_connections(["c1"]))["c1"]
+    conn = await store.get_connection("c1")
+    for text in (repr(snapshot), repr(conn), str(snapshot)):
+        assert "SENTINEL_APP_REPR" not in text and "SENTINEL_GW_REPR" not in text
+    assert "tls13" in repr(snapshot)  # the modes are not secret
+
+
+def test_gwops_snapshot_is_frozen_and_defaults_to_all_none() -> None:
+    snapshot = GwopsSnapshot()
+    assert all(value is None for value in snapshot.model_dump().values())
+    assert set(snapshot.model_dump()) == set(SNAPSHOT_COLUMNS)
+    with pytest.raises(ValueError):
+        snapshot.downstream_tls = "none"  # type: ignore[misc]
+
+
+# --- retention and storage ---
+
+
+async def test_purged_connection_takes_its_snapshot_with_it(store: ActivityStore, db) -> None:
+    await start_web(store, "old", exact_obj())
+    await set_connection_times(db, "old", created="2026-01-01 00:00:00", last_seen="2026-01-01 00:00:00")
+    _, conns_deleted = await store.purge_before("2026-06-01T00:00:00.000Z")
+    assert conns_deleted == 1
+    assert await store.gwops_for_connections(["old"]) == {}
+
+
+# --- Session 12 fix loop: first-processing edge, system_api_kinds, purge keeps referenced connections ---
+
+
+async def test_a_typeless_start_without_a_timestamp_is_not_retyped_by_a_later_web_start(
+    store: ActivityStore,
+) -> None:
+    """A: the first start line carried neither ``ts`` nor ``resource_type``; it is still a processed start."""
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, CLUSTER, None, None)
+    await store.upsert_connection_start("c1", USER_ID, USERNAME, WEB_ADDR, T0, "WEB_APP")
+    assert (await store.get_connection("c1")).resource_type is None
+
+
+async def test_system_api_kinds_reports_which_kinds_a_system_has_ever_stored(
+    store: ActivityStore, repo: SessionRepository
+) -> None:
+    """``system_api_kinds`` for a named system and for the NULL (unknown) bucket."""
+    assert await repo.system_api_kinds(WEB_ADDR) == (False, False)
+    assert await repo.system_api_kinds(None) == (False, False)
+    await store.insert_request(make_req("k1", requested_at=T0), CLUSTER)
+    await add_web_request(store, "w1", at=T1)
+    await store.insert_request(make_req("k-null", requested_at=T2), None)
+    assert await repo.system_api_kinds(CLUSTER) == (True, False)
+    assert await repo.system_api_kinds(WEB_ADDR) == (False, True)
+    assert await repo.system_api_kinds(None) == (True, False)  # the NULL bucket has its own kinds
+    req = make_req("w-null", requested_at=T3, kubectl_command=None, kubectl_session=None)
+    assert await store.insert_request(
+        req, None, storage=RequestStorage(api_kind="web", url="/x", user_agent="ua",
+                                          kubectl_command=None, kubectl_session=None)
+    )
+    assert await repo.system_api_kinds(None) == (True, True)
+    assert await repo.system_api_kinds("never-seen.example") == (False, False)

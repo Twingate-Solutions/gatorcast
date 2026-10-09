@@ -113,16 +113,16 @@ _EXPECTED_INDEXES = {
     # connections
     "idx_connections_state_seen",
     "idx_connections_created",
-    # api_requests
-    "idx_api_req_sys_time",
-    "idx_api_req_sys_user_time",
+    # api_requests (Session 11, WEBAPP_SPEC 4.2: scan indexes lead with api_kind)
     "idx_api_req_conn",
     "idx_api_req_session",
-    "idx_api_req_time",
+    "idx_api_req_kind_time",
+    "idx_api_req_kind_user_time",
+    "idx_api_req_kind_userid_time",
+    "idx_api_req_sys_kind_time",
+    "idx_api_req_sys_kind_user_time",
     # api_requests, Session 10 (spec §7.1)
     "idx_api_req_cmd",
-    "idx_api_req_user_time",
-    "idx_api_req_userid_time",
     # api_findings
     "idx_api_findings_request",
     "idx_api_findings_severity",
@@ -185,16 +185,24 @@ async def test_session9_tables_and_columns_exist(tmp_path):
         assert await cols("connections") == {
             "conn_id", "user_id", "username", "resource_address", "started_at",
             "state", "has_api", "created_at", "last_seen_at",
+            # Session 11 (WEBAPP_SPEC 4.2): type and the gwops/TLS snapshot
+            "resource_type", "gwops_match", "gwops_gateway_id", "gwops_app", "gwops_managed",
+            "downstream_tls", "downstream_port", "upstream_tls", "upstream_port",
+            # Session 12 review fix: first-processing marker for start lines
+            "start_seen",
         }
         assert await cols("api_requests") == {
             "request_id", "conn_id", "resource_address", "user_key", "user_id",
             "username", "requested_at", "method", "url", "status_code", "outcome",
             "kubectl_command", "kubectl_session", "user_agent", "created_at",
+            # Session 11: storage policy discriminator and the denormalized configured modes
+            "api_kind", "downstream_tls", "upstream_tls",
         }
         assert await cols("api_findings") == {
             "id", "request_id", "rule_id", "category", "severity", "label", "created_at",
         }
         assert "request_id" in await cols("sessions")
+        assert "resource_type" in await cols("sessions")
     finally:
         await db.close()
 
@@ -221,9 +229,14 @@ async def test_composite_indexes_cover_expected_columns(tmp_path):
             cur = await db.execute(f"PRAGMA index_info({name})")  # noqa: S608 - fixed literals
             return [r[2] for r in sorted(await cur.fetchall(), key=lambda r: r[0])]
 
-        assert await index_cols("idx_api_req_sys_time") == ["resource_address", "requested_at"]
-        assert await index_cols("idx_api_req_sys_user_time") == [
-            "resource_address", "user_key", "requested_at",
+        assert await index_cols("idx_api_req_kind_time") == [
+            "api_kind", "requested_at", "request_id",
+        ]
+        assert await index_cols("idx_api_req_sys_kind_time") == [
+            "resource_address", "api_kind", "requested_at", "request_id",
+        ]
+        assert await index_cols("idx_api_req_sys_kind_user_time") == [
+            "resource_address", "api_kind", "user_key", "requested_at", "request_id",
         ]
         assert await index_cols("idx_connections_state_seen") == ["state", "last_seen_at"]
         assert await index_cols("idx_sessions_request") == ["request_id"]
@@ -738,7 +751,12 @@ async def test_migration_without_casts_dir_skips_file_check(tmp_path):
 
 # --- Session 10 T1: indexes, SQL fragments, gc_is_discovery (spec §7.1–§7.3) ---
 
-_SESSION10_INDEXES = {"idx_api_req_cmd", "idx_api_req_user_time", "idx_api_req_userid_time", "idx_sessions_at"}
+_SESSION10_INDEXES = {
+    "idx_api_req_cmd",
+    "idx_api_req_kind_user_time",
+    "idx_api_req_kind_userid_time",
+    "idx_sessions_at",
+}
 
 # SQLITE_DETERMINISTIC, as reported in the flags column of PRAGMA function_list.
 _SQLITE_DETERMINISTIC = 0x800
@@ -772,8 +790,12 @@ async def test_session10_indexes_have_expected_keys(tmp_path):
     try:
         assert _SESSION10_INDEXES <= await _names(db, "index")
         assert await _index_info(db, "idx_api_req_cmd") == [None, "requested_at", "request_id"]
-        assert await _index_info(db, "idx_api_req_user_time") == ["username", "requested_at", "request_id"]
-        assert await _index_info(db, "idx_api_req_userid_time") == ["user_id", "requested_at", "request_id"]
+        assert await _index_info(db, "idx_api_req_kind_user_time") == [
+            "api_kind", "username", "requested_at", "request_id",
+        ]
+        assert await _index_info(db, "idx_api_req_kind_userid_time") == [
+            "api_kind", "user_id", "requested_at", "request_id",
+        ]
         assert await _index_info(db, "idx_sessions_at") == [None, "conn_id"]
     finally:
         await db.close()
@@ -825,7 +847,11 @@ async def test_legacy_sessions_without_started_at_skips_idx_sessions_at(tmp_path
         assert "idx_sessions_started" not in indexes
         # indexes on present columns, and the api_requests indexes, are still built
         assert {"idx_sessions_status", "idx_sessions_request"} <= indexes
-        assert {"idx_api_req_cmd", "idx_api_req_user_time", "idx_api_req_userid_time"} <= indexes
+        assert {
+            "idx_api_req_cmd",
+            "idx_api_req_kind_user_time",
+            "idx_api_req_kind_userid_time",
+        } <= indexes
         assert await _user_version(db) == 1
     finally:
         await db.close()
@@ -1012,5 +1038,447 @@ async def test_gc_is_discovery_is_deterministic_and_works_over_rows(tmp_path):
             "SELECT request_id FROM api_requests WHERE gc_is_discovery(method, url) = 1"
         )
         assert {r[0] for r in await cur.fetchall()} == {"d1", "d2"}
+    finally:
+        await db.close()
+
+
+# --- Session 11 T4/T8: web-app columns, kind-prefixed indexes, retired indexes (WEBAPP_SPEC 4.2) ---
+
+_RETIRED = (
+    "idx_api_req_time",
+    "idx_api_req_user_time",
+    "idx_api_req_userid_time",
+    "idx_api_req_sys_time",
+    "idx_api_req_sys_user_time",
+)
+_NEW_API_INDEXES = {
+    "idx_api_req_kind_time",
+    "idx_api_req_kind_user_time",
+    "idx_api_req_kind_userid_time",
+    "idx_api_req_sys_kind_time",
+    "idx_api_req_sys_kind_user_time",
+}
+_SESSION11_CONNECTION_COLUMNS = {
+    "resource_type", "gwops_match", "gwops_gateway_id", "gwops_app", "gwops_managed",
+    "downstream_tls", "downstream_port", "upstream_tls", "upstream_port",
+}
+
+# A Session 10 database: no Session 11 columns, and the five api_requests indexes that Session 11
+# replaces with api_kind-prefixed ones.
+_PRE_S11_DDL = (
+    """CREATE TABLE sessions (
+        conn_id TEXT PRIMARY KEY, username TEXT, resource_address TEXT, shell_user TEXT,
+        started_at TEXT, ended_at TEXT, duration_seconds REAL, width INTEGER, height INTEGER,
+        chunk_count INTEGER DEFAULT 0, size_bytes INTEGER DEFAULT 0, cast_path TEXT,
+        status TEXT DEFAULT 'provisional', finding_count INTEGER DEFAULT 0, max_severity TEXT,
+        request_id TEXT, sealed_terminal INTEGER,
+        created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')))""",
+    """CREATE TABLE connections (
+        conn_id TEXT PRIMARY KEY, user_id TEXT, username TEXT, resource_address TEXT,
+        started_at TEXT, state TEXT NOT NULL DEFAULT 'pending', has_api INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')), last_seen_at TEXT DEFAULT (datetime('now')))""",
+    """CREATE TABLE api_requests (
+        request_id TEXT PRIMARY KEY, conn_id TEXT NOT NULL, resource_address TEXT, user_key TEXT,
+        user_id TEXT, username TEXT, requested_at TEXT NOT NULL, method TEXT NOT NULL,
+        url TEXT NOT NULL, status_code INTEGER, outcome TEXT NOT NULL DEFAULT 'completed',
+        kubectl_command TEXT, kubectl_session TEXT, user_agent TEXT,
+        created_at TEXT DEFAULT (datetime('now')))""",
+    "CREATE INDEX idx_api_req_time ON api_requests(requested_at, request_id)",
+    "CREATE INDEX idx_api_req_user_time ON api_requests(username, requested_at, request_id)",
+    "CREATE INDEX idx_api_req_userid_time ON api_requests(user_id, requested_at, request_id)",
+    "CREATE INDEX idx_api_req_sys_time ON api_requests(resource_address, requested_at)",
+    "CREATE INDEX idx_api_req_sys_user_time ON api_requests(resource_address, user_key, requested_at)",
+)
+
+
+async def _make_pre_s11_db(path) -> None:
+    """A Session 10 shaped DB at user_version 1 holding one connection and two requests."""
+    conn = await aiosqlite.connect(path)
+    try:
+        for ddl in _PRE_S11_DDL:
+            await conn.execute(ddl)
+        await conn.execute(
+            "INSERT INTO connections (conn_id, resource_address, state) "
+            "VALUES ('old-conn', 'old.cluster', 'api')"
+        )
+        await conn.executemany(
+            "INSERT INTO api_requests (request_id, conn_id, resource_address, requested_at, method, url) "
+            "VALUES (?, 'old-conn', 'old.cluster', ?, 'GET', '/api/v1/pods')",
+            [("old-1", "2026-10-01T10:00:00.000Z"), ("old-2", "2026-10-01T10:00:01.000Z")],
+        )
+        await conn.execute("PRAGMA user_version = 1")
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_has_session11_connection_columns(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        cur = await db.execute("SELECT name FROM pragma_table_info('connections')")
+        assert _SESSION11_CONNECTION_COLUMNS <= {r[0] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT name FROM pragma_table_info('sessions')")
+        assert "resource_type" in {r[0] for r in await cur.fetchall()}
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_has_the_five_kind_prefixed_indexes_and_none_of_the_retired(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        indexes = await _names(db, "index")
+        assert _NEW_API_INDEXES <= indexes
+        assert not set(_RETIRED) & indexes
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_kind_prefixed_index_keys_lead_with_the_equality_columns(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        assert await _index_info(db, "idx_api_req_kind_time") == ["api_kind", "requested_at", "request_id"]
+        assert await _index_info(db, "idx_api_req_kind_user_time") == [
+            "api_kind", "username", "requested_at", "request_id",
+        ]
+        assert await _index_info(db, "idx_api_req_kind_userid_time") == [
+            "api_kind", "user_id", "requested_at", "request_id",
+        ]
+        assert await _index_info(db, "idx_api_req_sys_kind_time") == [
+            "resource_address", "api_kind", "requested_at", "request_id",
+        ]
+        assert await _index_info(db, "idx_api_req_sys_kind_user_time") == [
+            "resource_address", "api_kind", "user_key", "requested_at", "request_id",
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_no_web_app_manifest_tables_exist(tmp_path):
+    """WEBAPP_SPEC 4.2: the withdrawn manifest design's tables are never created."""
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        tables = await _names(db, "table")
+        assert "web_apps" not in tables
+        assert "web_app_gateways" not in tables
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_kind_defaults_to_kubectl_and_is_not_null(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        await db.execute(
+            "INSERT INTO api_requests (request_id, conn_id, requested_at, method, url) "
+            "VALUES ('r1', 'c1', '2026-10-01T10:00:00.000Z', 'GET', '/x')"
+        )
+        await db.commit()
+        cur = await db.execute("SELECT api_kind, downstream_tls, upstream_tls FROM api_requests")
+        row = await cur.fetchone()
+        assert row["api_kind"] == "kubectl"
+        assert row["downstream_tls"] is None and row["upstream_tls"] is None
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO api_requests (request_id, conn_id, requested_at, method, url, api_kind) "
+                "VALUES ('r2', 'c1', '2026-10-01T10:00:00.000Z', 'GET', '/x', NULL)"
+            )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_snapshot_columns_default_to_null(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        await db.execute("INSERT INTO connections (conn_id) VALUES ('c1')")
+        await db.commit()
+        cur = await db.execute("SELECT * FROM connections WHERE conn_id = 'c1'")
+        row = await cur.fetchone()
+        for col in _SESSION11_CONNECTION_COLUMNS:
+            assert row[col] is None, col
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_from_pre_session11_db_adds_columns_and_keeps_rows_as_kubectl(tmp_path):
+    path = tmp_path / "s10.db"
+    await _make_pre_s11_db(path)
+    db = await init_db(path)
+    try:
+        cur = await db.execute("SELECT name FROM pragma_table_info('connections')")
+        assert _SESSION11_CONNECTION_COLUMNS <= {r[0] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT name FROM pragma_table_info('api_requests')")
+        assert {"api_kind", "downstream_tls", "upstream_tls"} <= {r[0] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT name FROM pragma_table_info('sessions')")
+        assert "resource_type" in {r[0] for r in await cur.fetchall()}
+        # No data migration: every existing row becomes kubectl through the column default.
+        cur = await db.execute("SELECT request_id, api_kind FROM api_requests ORDER BY request_id")
+        assert [tuple(r) for r in await cur.fetchall()] == [("old-1", "kubectl"), ("old-2", "kubectl")]
+        cur = await db.execute("SELECT conn_id, state, resource_type FROM connections")
+        assert [tuple(r) for r in await cur.fetchall()] == [("old-conn", "api", None)]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_drops_the_retired_indexes_and_converges_on_20(tmp_path):
+    path = tmp_path / "s10.db"
+    await _make_pre_s11_db(path)
+    conn = await aiosqlite.connect(path)
+    try:
+        before = await _names(conn, "index")
+    finally:
+        await conn.close()
+    assert set(_RETIRED) <= before  # the fixture really starts with the old names
+
+    db = await init_db(path)
+    try:
+        indexes = {n for n in await _names(db, "index") if n.startswith("idx_")}
+        assert not set(_RETIRED) & indexes
+        assert _NEW_API_INDEXES <= indexes
+        assert indexes == _EXPECTED_INDEXES
+        assert len(indexes) == 20
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgraded_db_schema_is_stable_on_second_boot_and_matches_fresh_index_set(tmp_path):
+    path = tmp_path / "s10.db"
+    await _make_pre_s11_db(path)
+    db = await init_db(path)
+    try:
+        first = await _schema_snapshot(db)
+        assert await _user_version(db) == 1  # no user_version bump for Session 11
+    finally:
+        await db.close()
+    db = await init_db(path)
+    try:
+        assert await _schema_snapshot(db) == first
+    finally:
+        await db.close()
+
+    fresh = await init_db(tmp_path / "fresh.db")
+    try:
+        assert {n for n in await _names(fresh, "index") if n.startswith("idx_")} == _EXPECTED_INDEXES
+    finally:
+        await fresh.close()
+
+
+@pytest.mark.asyncio
+async def test_retired_index_drop_is_idempotent_when_they_are_already_gone(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        for name in _RETIRED:
+            await db.execute(f"DROP INDEX IF EXISTS {name}")  # noqa: S608 - fixed literals
+        await db.commit()
+    finally:
+        await db.close()
+    db = await init_db(tmp_path / "gatorcast.db")  # must not raise
+    try:
+        assert not set(_RETIRED) & await _names(db, "index")
+    finally:
+        await db.close()
+
+
+def test_connection_states_include_the_hidden_empty_state():
+    from gatorcast.store.activity import CONNECTION_STATES
+
+    assert CONNECTION_STATES == frozenset({"pending", "recording", "api", "error", "empty"})
+
+
+# --- Session 11 T12: gwops/TLS snapshot columns, types and defaults (WEBAPP_SPEC 3.3, 4.2) ---
+
+# column -> declared type, for the nine Session 11 columns on connections (type + the eight snapshot columns)
+_CONNECTION_COLUMN_TYPES = {
+    "resource_type": "TEXT",
+    "gwops_match": "TEXT",
+    "gwops_gateway_id": "TEXT",
+    "gwops_app": "TEXT",
+    "gwops_managed": "INTEGER",
+    "downstream_tls": "TEXT",
+    "downstream_port": "INTEGER",
+    "upstream_tls": "TEXT",
+    "upstream_port": "INTEGER",
+}
+_SNAPSHOT_COLUMNS = tuple(c for c in _CONNECTION_COLUMN_TYPES if c != "resource_type")
+_API_TLS_COLUMN_TYPES = {"downstream_tls": "TEXT", "upstream_tls": "TEXT"}
+
+
+async def _column_info(db, table: str) -> dict[str, tuple[str, int, object]]:
+    """``name -> (declared type, notnull, default)`` from ``pragma_table_info``."""
+    cur = await db.execute(
+        "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info(?)", (table,)
+    )
+    return {r["name"]: (r["type"], r["notnull"], r["dflt_value"]) for r in await cur.fetchall()}
+
+
+async def _fresh_db(tmp_path):
+    return await init_db(tmp_path / "gatorcast.db")
+
+
+async def _upgraded_db(tmp_path):
+    path = tmp_path / "s10.db"
+    await _make_pre_s11_db(path)
+    return await init_db(path)
+
+
+@pytest.fixture(params=["fresh", "upgraded"])
+async def s11_db(request, tmp_path):
+    """The Session 11 schema reached two ways: a fresh install and an upgrade of a Session 10 DB."""
+    db = await (_fresh_db(tmp_path) if request.param == "fresh" else _upgraded_db(tmp_path))
+    yield db
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_connections_gwops_and_tls_columns_have_the_documented_types_and_no_constraints(s11_db):
+    """Nine nullable columns with no default: TEXT for modes/ids/app, INTEGER for ports and managed."""
+    info = await _column_info(s11_db, "connections")
+    for column, declared in _CONNECTION_COLUMN_TYPES.items():
+        assert column in info, column
+        assert info[column] == (declared, 0, None), column
+
+
+@pytest.mark.asyncio
+async def test_connections_has_exactly_eight_gwops_tls_snapshot_columns(s11_db):
+    """The snapshot is exactly match, gateway id, app, managed, two modes and two ports."""
+    info = await _column_info(s11_db, "connections")
+    snapshot = {c for c in info if c.startswith(("gwops_", "downstream_", "upstream_"))}
+    assert snapshot == set(_SNAPSHOT_COLUMNS)
+    assert len(snapshot) == 8
+
+
+@pytest.mark.asyncio
+async def test_api_requests_tls_columns_are_nullable_text_with_no_default(s11_db):
+    """The two denormalized modes on api_requests: TEXT, nullable, no default."""
+    info = await _column_info(s11_db, "api_requests")
+    for column, declared in _API_TLS_COLUMN_TYPES.items():
+        assert info[column] == (declared, 0, None), column
+
+
+@pytest.mark.asyncio
+async def test_api_requests_api_kind_is_not_null_text_defaulting_to_kubectl(s11_db):
+    """The discriminator that the TLS columns ride with: NOT NULL, default 'kubectl'."""
+    info = await _column_info(s11_db, "api_requests")
+    assert info["api_kind"] == ("TEXT", 1, "'kubectl'")
+
+
+@pytest.mark.asyncio
+async def test_api_requests_has_no_gwops_columns(s11_db):
+    """Only the two modes are denormalized onto requests; match, gateway id, app, ports are not."""
+    info = await _column_info(s11_db, "api_requests")
+    assert not {c for c in info if c.startswith("gwops_")}
+    assert "downstream_port" not in info and "upstream_port" not in info
+
+
+@pytest.mark.asyncio
+async def test_sessions_table_gains_no_gwops_or_tls_columns(s11_db):
+    """The snapshot lives on connections only."""
+    info = await _column_info(s11_db, "sessions")
+    assert not {c for c in info if c.startswith(("gwops_", "downstream_", "upstream_"))}
+
+
+@pytest.mark.asyncio
+async def test_no_index_covers_a_gwops_or_tls_column(s11_db):
+    """The snapshot is read by primary key and copied at write time: nothing indexes it."""
+    cur = await s11_db.execute(
+        "SELECT m.name AS idx, i.name AS col FROM sqlite_master m, pragma_index_info(m.name) i "
+        "WHERE m.type = 'index' AND m.tbl_name IN ('connections', 'api_requests')"
+    )
+    covered = {r["col"] for r in await cur.fetchall()}
+    assert not covered & (set(_SNAPSHOT_COLUMNS) | set(_API_TLS_COLUMN_TYPES))
+
+
+@pytest.mark.asyncio
+async def test_no_web_app_manifest_tables_exist_after_either_install_path(s11_db):
+    """WEBAPP_SPEC 4.2: the withdrawn manifest design's tables are absent fresh or upgraded."""
+    tables = await _names(s11_db, "table")
+    assert "web_apps" not in tables and "web_app_gateways" not in tables
+    assert not {t for t in tables if t.startswith("web_app")}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_columns_store_modes_ports_and_managed_with_the_declared_affinities(s11_db):
+    """A full exact snapshot round-trips: ports and managed stay integers, modes and ids stay text."""
+    await s11_db.execute(
+        "INSERT INTO connections (conn_id, resource_type, gwops_match, gwops_gateway_id, gwops_app, "
+        "gwops_managed, downstream_tls, downstream_port, upstream_tls, upstream_port) "
+        "VALUES ('c1', 'WEB_APP', 'exact', 'R2F0ZXdheToxMjk0', 'verifier-a', 1, 'tls13', 443, "
+        "'verify_full', 8443)"
+    )
+    await s11_db.commit()
+    cur = await s11_db.execute(
+        "SELECT typeof(gwops_match) a, typeof(gwops_gateway_id) b, typeof(gwops_app) c, "
+        "typeof(gwops_managed) d, typeof(downstream_tls) e, typeof(downstream_port) f, "
+        "typeof(upstream_tls) g, typeof(upstream_port) h FROM connections WHERE conn_id = 'c1'"
+    )
+    row = await cur.fetchone()
+    assert tuple(row) == ("text", "text", "text", "integer", "text", "integer", "text", "integer")
+
+
+@pytest.mark.asyncio
+async def test_upgrade_leaves_existing_connections_with_a_null_snapshot(tmp_path):
+    """No retroactive fill: the pre-upgrade connection has every Session 11 column NULL."""
+    db = await _upgraded_db(tmp_path)
+    try:
+        cur = await db.execute("SELECT * FROM connections WHERE conn_id = 'old-conn'")
+        row = await cur.fetchone()
+        assert row["state"] == "api" and row["resource_address"] == "old.cluster"
+        for column in _CONNECTION_COLUMN_TYPES:
+            assert row[column] is None, column
+        cur = await db.execute("SELECT downstream_tls, upstream_tls FROM api_requests")
+        assert [tuple(r) for r in await cur.fetchall()] == [(None, None), (None, None)]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_adds_only_the_missing_connection_columns_when_some_already_exist(tmp_path):
+    """A half-migrated connections table (resource_type and one snapshot column present) is completed."""
+    path = tmp_path / "half.db"
+    await _make_pre_s11_db(path)
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.execute("ALTER TABLE connections ADD COLUMN resource_type TEXT")
+        await conn.execute("ALTER TABLE connections ADD COLUMN gwops_match TEXT")
+        await conn.execute("UPDATE connections SET resource_type = 'KUBERNETES', gwops_match = 'none'")
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = await init_db(path)
+    try:
+        info = await _column_info(db, "connections")
+        for column, declared in _CONNECTION_COLUMN_TYPES.items():
+            assert info[column] == (declared, 0, None), column
+        cur = await db.execute("SELECT resource_type, gwops_match, gwops_gateway_id FROM connections")
+        assert [tuple(r) for r in await cur.fetchall()] == [("KUBERNETES", "none", None)]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_second_boot_does_not_alter_the_session11_connection_or_request_columns(tmp_path):
+    """init_db is idempotent for the new columns: same declared types and data after a re-open."""
+    db = await _fresh_db(tmp_path)
+    try:
+        await db.execute(
+            "INSERT INTO connections (conn_id, gwops_match, downstream_tls) VALUES ('c1', 'none', 'tls13')"
+        )
+        await db.commit()
+        before = (await _column_info(db, "connections"), await _column_info(db, "api_requests"))
+    finally:
+        await db.close()
+    db = await _fresh_db(tmp_path)
+    try:
+        assert (await _column_info(db, "connections"), await _column_info(db, "api_requests")) == before
+        cur = await db.execute("SELECT gwops_match, downstream_tls FROM connections")
+        assert [tuple(r) for r in await cur.fetchall()] == [("none", "tls13")]
     finally:
         await db.close()

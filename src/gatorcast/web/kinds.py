@@ -25,6 +25,7 @@ from gatorcast.store.timeline import (
     KIND_KUBECTL,
     KIND_SOURCE,
     KIND_SSH,
+    KIND_WEB,
     SORT_DURATION,
     SORT_NEWEST,
     SORT_RISK,
@@ -50,6 +51,7 @@ __all__ = [
 # resolve_kinds checks them ("the first filter it cannot evaluate"). Names match the
 # canonical URL parameter, except ``text``/``regex`` (``q`` in either mode, or the
 # legacy ``keyword``/``regex``) and ``from``/``to`` (also set by ``window``).
+# ``scheme``/``upstream`` are the web connections' configured-TLS filters (spec §8.3).
 
 FILTER_NAMES: Final[tuple[str, ...]] = (
     "system",
@@ -66,17 +68,25 @@ FILTER_NAMES: Final[tuple[str, ...]] = (
     "max_duration",
     "text",
     "regex",
+    "scheme",
+    "upstream",
     "cmd",
 )
 
-# Filters evaluable by the sessions-table kinds. ``cmd`` is the only one missing.
+# Filters evaluable by the sessions-table kinds: not ``cmd`` or the web TLS filters.
 # ``discovery`` is not a constraint for recordings (ignored), so it is never checked.
-_REC_FILTERS: Final = frozenset(FILTER_NAMES) - {"cmd"}
+_REC_FILTERS: Final = frozenset(FILTER_NAMES) - {"cmd", "scheme", "upstream"}
 _REC_SORTS: Final = frozenset({SORT_NEWEST, SORT_RISK, SORT_DURATION})
 
-# Filters evaluable by kubectl commands: not status, durations, or regex.
-_CMD_FILTERS: Final = frozenset(FILTER_NAMES) - {"status", "min_duration", "max_duration", "regex"}
+# Filters evaluable by kubectl commands: not status, durations, regex, or the web TLS filters.
+_CMD_FILTERS: Final = frozenset(FILTER_NAMES) - {
+    "status", "min_duration", "max_duration", "regex", "scheme", "upstream",
+}
 _CMD_SORTS: Final = frozenset({SORT_NEWEST, SORT_RISK})
+
+# Filters evaluable by web connections: not status, durations, or regex (spec §8.3).
+# Web shares the kubectl sorts.
+_WEB_FILTERS: Final = frozenset(FILTER_NAMES) - {"status", "min_duration", "max_duration", "regex"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,10 +94,10 @@ class EventKind:
     """One event family shown in the unified timeline (spec §4.1).
 
     Attributes:
-        key: URL ``type`` value and CSV ``kind`` (``ssh``/``exec``/``failed``/``kubectl``).
+        key: URL ``type`` value and CSV ``kind`` (``ssh``/``exec``/``failed``/``kubectl``/``web``).
         label: Human label for the type badge.
         badge_class: CSS modifier for the badge (registry-supplied, never stored data).
-        source: Timeline source name (``sessions`` | ``api_commands``).
+        source: Timeline source name (``sessions`` | ``api_commands`` | ``web_conns``).
         row_macro: Macro in ``_rows.html`` that renders the row.
         filters: Filter names (:data:`FILTER_NAMES`) this kind can evaluate.
         sorts: Sort values this kind supports.
@@ -102,7 +112,7 @@ class EventKind:
     sorts: frozenset[str]
 
 
-# Insertion order = display order in the type select (ssh, exec, failed, kubectl).
+# Insertion order = display order in the type select (ssh, exec, failed, kubectl, web).
 KINDS: Final[dict[str, EventKind]] = {
     KIND_SSH: EventKind(
         KIND_SSH, "SSH session", "pill-ssh", KIND_SOURCE[KIND_SSH], "recording_row",
@@ -120,6 +130,10 @@ KINDS: Final[dict[str, EventKind]] = {
         KIND_KUBECTL, "kubectl command", "pill-kubectl", KIND_SOURCE[KIND_KUBECTL],
         "command_row", _CMD_FILTERS, _CMD_SORTS,
     ),
+    KIND_WEB: EventKind(
+        KIND_WEB, "Web connection", "pill-web", KIND_SOURCE[KIND_WEB],
+        "web_row", _WEB_FILTERS, _CMD_SORTS,
+    ),
 }
 assert tuple(KINDS) == KIND_KEYS, "KINDS must follow store.timeline.KIND_KEYS"
 
@@ -133,6 +147,7 @@ TYPE_GROUPS: Final[dict[str, frozenset[str]]] = {
     KIND_EXEC: frozenset({KIND_EXEC}),
     KIND_FAILED: frozenset({KIND_FAILED}),
     KIND_KUBECTL: frozenset({KIND_KUBECTL}),
+    KIND_WEB: frozenset({KIND_WEB}),
 }
 TYPE_VALUES: Final[tuple[str, ...]] = tuple(TYPE_GROUPS)
 
@@ -144,6 +159,7 @@ TYPE_LABELS: Final[list[tuple[str, str]]] = [
     (KIND_EXEC, "kubectl exec recordings"),
     (KIND_FAILED, "Failed connections"),
     (KIND_KUBECTL, "kubectl commands"),
+    (KIND_WEB, "Web requests"),
 ]
 
 # Exclusion reason (a FILTER_NAMES entry, or "sort") → wording for the notice
@@ -154,7 +170,9 @@ EXCLUSION_LABELS: Final[dict[str, str]] = {
     "max_duration": "Maximum duration filter",
     "regex": "regex search",
     "sort": "Longest-first sort",
-    "cmd": "kubectl command focus",
+    "scheme": "HTTP/HTTPS filter",
+    "upstream": "Upstream TLS filter",
+    "cmd": "Command/connection focus",
 }
 
 
@@ -188,6 +206,8 @@ def active_filters(query: UnifiedQuery) -> list[str]:
         "max_duration": query.max_duration is not None,
         "text": query.text is not None,
         "regex": query.regex is not None,
+        "scheme": query.scheme is not None or query.scheme_null,
+        "upstream": query.upstream is not None or query.upstream_null,
     }
     return [name for name in FILTER_NAMES if present.get(name, False)]
 

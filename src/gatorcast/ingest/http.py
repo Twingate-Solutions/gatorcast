@@ -111,8 +111,13 @@ async def ingest(
             await queue.put(unwrapped)
             accepted += 1
     else:
-        # NDJSON / x-ndjson / text/plain: one candidate per line.
-        for line in text.splitlines():
+        # NDJSON / x-ndjson / text/plain: one candidate per line. Split on "\n"
+        # only: str.splitlines() also breaks on U+0085, U+2028,
+        # U+2029, \v, \f and \x1c-\x1e, which can appear raw inside a JSON string
+        # (terminal output in an asciicast chunk) and would tear the line into
+        # unparseable fragments. One trailing "\r" is dropped so CRLF bodies work.
+        for line in text.split("\n"):
+            line = line.removesuffix("\r")
             if not line.strip():
                 continue
             obj = normalize(line)

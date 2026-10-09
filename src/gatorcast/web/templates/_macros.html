@@ -10,7 +10,12 @@
       usernames are attacker-influenced.
     * Never interpolate stored text into a class name. The status band is computed
       from the integer status code, "failed" is matched by equality, and severity
-      is always a SEVERITY_RANK key (sanitized in the route).
+      and session status go through sev_cls / status_cls below, which map a closed
+      set of keys to fixed class names (anything else gets a neutral class).
+    * Stored text shown inline (usernames, system addresses, URLs, shell users, gwops
+      app names) is wrapped in <bdi> or carries a class that app.css gives
+      `unicode-bidi: isolate`, so a bidi override inside the value cannot reorder
+      neighbouring text.
 
   Visual language (see app.css, "kubectl activity"):
     * HTTP status    -> small monospace chip; 4xx/5xx are amber (--warn).
@@ -19,6 +24,23 @@
                         is deliberately different from any non-2xx status: a 502 that
                         the Gateway logged as completed gets only the amber chip.
 #}
+
+{#
+  Fixed-map class lookups. The argument may be stored text; only the literal class
+  names on the right-hand side are ever emitted. Unknown values get a neutral class.
+#}
+{% macro sev_cls(severity) -%}
+  {{- {'critical': 'sev-critical', 'high': 'sev-high', 'medium': 'sev-medium', 'low': 'sev-low'}.get(severity, 'sev-none') -}}
+{%- endmacro %}
+
+{% macro status_cls(status) -%}
+  {{- {'complete': 'pill-complete', 'provisional': 'pill-provisional', 'error': 'pill-error'}.get(status, 'pill-unknown') -}}
+{%- endmacro %}
+
+{# Session status pill: fixed class and fixed label per known status, "unknown" otherwise. #}
+{% macro status_pill(status) -%}
+  <span class="pill {{ status_cls(status) }}">{{ {'complete': 'complete', 'provisional': 'in progress', 'error': 'error'}.get(status, 'unknown') }}</span>
+{%- endmacro %}
 
 {% macro status_chip(code) -%}
   {%- if code is number -%}
@@ -37,7 +59,7 @@
 
 {% macro severity_cell(count, severity) -%}
   {%- if count and severity -%}
-    <span class="sev sev-{{ severity }}">{{ severity }} · {{ count }}</span>
+    <span class="sev {{ sev_cls(severity) }}">{{ severity }} · {{ count }}</span>
   {%- else -%}
     <span class="dim">—</span>
   {%- endif -%}
@@ -104,6 +126,81 @@
   {%- elif url -%}
     <a class="user-link" href="{{ url }}">{{ label }}</a>
   {%- else -%}
-    {{ label }}
+    <bdi>{{ label }}</bdi>
+  {%- endif -%}
+{%- endmacro %}
+
+
+{#
+  A fixed badge, upstream marker, or managed marker built by the route's SystemBadge
+  maps (WEBAPP_SPEC §8.4). `b` is a SystemBadge or None (None renders nothing).
+
+    * label, css_class and title are fixed strings from a map keyed by a stored
+      value; stored text never reaches them. The title is a double-quoted,
+      autoescaped attribute (static "configured, not proof" text).
+    * A marker (b.is_marker) renders as .marker with a glyph: "!" for marker-warn,
+      "i" otherwise. The glyph is chosen by equality on the fixed class, never
+      interpolated.
+#}
+{% macro badge(b) -%}
+  {%- if b -%}
+    {%- if b.is_marker -%}
+      <span class="marker {{ b.css_class }}"{% if b.title %} title="{{ b.title }}"{% endif %}><span aria-hidden="true">{{ '!' if b.css_class == 'marker-warn' else 'i' }}</span> {{ b.label }}</span>
+    {%- else -%}
+      <span class="pill {{ b.css_class }}"{% if b.title %} title="{{ b.title }}"{% endif %}>{{ b.label }}</span>
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+
+{#
+  Status chip plus the "WebSocket" suffix for a 101 (status_label "101 WebSocket").
+  `label` is the route's fixed status text; the chip carries the code.
+#}
+{% macro web_status(code, label) -%}
+  {{ status_chip(code) }}{% if code == 101 %} <span class="dim">WebSocket</span>{% endif %}
+{%- endmacro %}
+
+{#
+  "Configured web app TLS (from gwops)" block (WEBAPP_SPEC §8.5), shared by the system
+  page and the visit view. `cfg` is routes._web_config_block: {heading, lines, more,
+  more_text, max, footnote}. A line's `match` is exact / none / ambiguous / no_data.
+
+  Safety: app_label, gateway_id and gateway_label are stored gwops text, rendered only
+  through autoescape as plain text (never |safe, never in an href, class or id).
+  Badges and markers are fixed SystemBadge objects. Nothing here builds a URL.
+#}
+{% macro config_block(cfg) -%}
+  {%- if cfg and cfg.lines -%}
+    <section class="config-block" aria-labelledby="web-config-heading">
+      <h2 id="web-config-heading">{{ cfg.heading }}</h2>
+      <ul class="config-lines">
+        {% for line in cfg.lines %}
+          <li class="config-line">
+            <span class="config-main">
+              {{ badge(line.tls_badge) }}
+              {% if line.match == "exact" %}
+                {% if line.downstream_port is not none %}<span class="mono">:{{ line.downstream_port }}</span>{% endif %}
+                <span aria-hidden="true">→</span><span class="visually-hidden">to</span>
+                <span class="dim">upstream</span> <span class="mono">{{ line.upstream_mode }}</span>
+                {% if line.upstream_port is not none %}<span class="mono">:{{ line.upstream_port }}</span>{% endif %}
+                {{ badge(line.upstream_marker) }}
+                <span class="dim">app:</span>
+                <span class="app-name{{ ' is-unnamed' if line.app_unnamed else '' }}">{{ line.app_label }}</span>
+                {{ badge(line.managed_marker) }}
+                <bdi class="dim mono">{{ line.gateway_label }}</bdi>
+              {% else %}
+                <span><bdi>{{ line.text }}</bdi>{% if line.gateway_id %} <bdi class="mono">{{ line.gateway_id }}</bdi>{% endif %}{% if line.text_after %} <bdi>{{ line.text_after }}</bdi>{% endif %}</span>
+              {% endif %}
+            </span>
+            <span class="config-meta dim">
+              {{ line.connection_count }} connection{{ "" if line.connection_count == 1 else "s" }}
+              · <span class="mono">{{ line.first_at }}</span> → <span class="mono">{{ line.last_at }}</span>
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+      {% if cfg.more %}<p class="truncated-notice">{{ cfg.more_text }}</p>{% endif %}
+      <p class="config-note dim">{{ cfg.footnote }}</p>
+    </section>
   {%- endif -%}
 {%- endmacro %}

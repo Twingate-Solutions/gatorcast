@@ -6,6 +6,8 @@ Self-hosted, single-container service for **Twingate Identity Firewall Gateway s
 
 Gatorcast also stores the Gateway's per-request Kubernetes API audit lines as allowlisted **kubectl activity** metadata (method, sanitized URL, status, user, and three request headers), grouped per user and cluster and shown next to the recordings. No recording or request body is ever involved. See [kubectl Activity](#kubectl-activity).
 
+It does the same for **web apps** that users reach through the Gateway acting as a Layer 7 reverse proxy: each request's method, path, status and `User-Agent` is stored, grouped per connection, and shown with the app's **configured** TLS posture when gwops reports it. Web traffic has no recording and is not evaluated by detection rules. See [Web Apps](#web-apps).
+
 ![Session replay — full session metadata, in-browser playback, and detection findings with jump-to-timestamp links](images/session_replay.png)
 
 ---
@@ -24,7 +26,9 @@ Gatorcast also stores the Gateway's per-request Kubernetes API audit lines as al
 
 **kubectl activity** — the systems list also includes clusters that only have kubectl API activity, with type badges and separate "Last session" and "Last API request" columns. A system page adds a per-user kubectl activity table, and each row opens a page of that activity session's commands, with findings and links to any exec recordings. The dashboard has a kubectl API requests card. See [kubectl Activity](#kubectl-activity).
 
-**Search** — one timeline over SSH recordings, kubectl exec recordings, failed connections and kubectl commands. Filter by type, user, system, time, duration, status, finding severity/category or specific detection rules, plus full-content keyword/regex search over recordings. Recording results link straight to each finding's timestamp in the replay, kubectl commands expand to their requests, and any result set exports to CSV. See [Unified Search](#unified-search):
+**Web apps** — the systems list badges web apps `Web` with their configured TLS. A system page adds a **Configured web app TLS (from gwops)** block and a **Web activity** table of per-user visits, and each visit opens a page of its requests. The dashboard has a **Web requests** tile. See [Web Apps](#web-apps).
+
+**Search** — one timeline over SSH recordings, kubectl exec recordings, failed connections, kubectl commands and web connections. Filter by type, user, system, time, duration, status, finding severity/category or specific detection rules, plus full-content keyword/regex search over recordings. Recording results link straight to each finding's timestamp in the replay, kubectl commands expand to their requests, and any result set exports to CSV. See [Unified Search](#unified-search):
 
 ![Search with metadata filters, detection-rule filters, content search, and findings with jump links](images/search_results.png)
 
@@ -114,10 +118,10 @@ The shipped `docker-compose.yml` already sets nine variables in its `environment
 | `BACKFILL_ON_STARTUP` | `true` | On startup, index and scan completed recordings that lack a search sidecar. Has no effect when `DETECTION_ENABLED=false`. |
 | `SEARCH_PAGE_SIZE` | `50` | Default number of search results per page. A `page_size` query parameter (1 to 200) overrides it. |
 | `SEARCH_REGEX_MAX_CANDIDATES` | `2000` | Max sidecars read per page of a keyword/regex content search, and per CSV export (cost / ReDoS bound). When a page hits it, search offers **Continue scanning**. |
-| `KUBECTL_ACTIVITY_GAP_SECONDS` | `900` | Inactivity gap that splits one user's kubectl activity on a cluster into separate activity sessions. Must be greater than `0`. |
-| `KUBECTL_ACTIVITY_MAX_SECONDS` | `14400` | Hard cap on the span of one activity session. Bounds long-lived clients (`k9s`, `kubectl get -w`, CI polling) that never leave a gap. Must be greater than or equal to `KUBECTL_ACTIVITY_GAP_SECONDS`. |
+| `KUBECTL_ACTIVITY_GAP_SECONDS` | `900` | Inactivity gap that splits one user's kubectl activity on a cluster, or one user's web visits to a web app, into separate activity sessions or visits. Must be greater than `0`. |
+| `KUBECTL_ACTIVITY_MAX_SECONDS` | `14400` | Hard cap on the span of one activity session or web visit. Bounds long-lived clients (`k9s`, `kubectl get -w`, CI polling, a page that polls) that never leave a gap. Must be greater than or equal to `KUBECTL_ACTIVITY_GAP_SECONDS`. |
 
-`KUBECTL_ACTIVITY_GAP_SECONDS` and `KUBECTL_ACTIVITY_MAX_SECONDS` must satisfy `0 < gap <= max`. If they do not, the service refuses to start and the error names both values. Both are listed in `.env.example`.
+There are no web-specific settings. `KUBECTL_ACTIVITY_GAP_SECONDS` and `KUBECTL_ACTIVITY_MAX_SECONDS` also govern web visits, and the name is historical. They must satisfy `0 < gap <= max`. If they do not, the service refuses to start and the error names both values. Both are listed in `.env.example`.
 
 ---
 
@@ -130,11 +134,11 @@ Gatorcast is push-only: it exposes two front doors and waits. Both feed the same
 | HTTP | `POST /ingest` on `HTTP_PORT` | `Authorization: Bearer <INGEST_TOKEN>` |
 | Syslog TCP | `SYSLOG_TCP_PORT` (`6514`) | None. Bind it to an internal interface only. |
 
-**HTTP.** An `application/json` body is parsed as one document, either a single object or an array of objects. Any other content type (`application/x-ndjson`, `text/plain`) is read as newline-delimited, one JSON object per line. A line that cannot be parsed is dropped without failing the batch. The response is `204 No Content` even when some lines were dropped, and `401` when the token is missing or wrong. The app sets no body-size limit; set one at your proxy (see [Deployment Behind a Reverse Proxy](#deployment-behind-a-reverse-proxy)).
+**HTTP.** An `application/json` body is parsed as one document, either a single object or an array of objects. Any other content type (`application/x-ndjson`, `text/plain`) is read as newline-delimited, one JSON object per line. Lines are split on `\n` only (one trailing `\r` is dropped), so a Unicode line separator such as U+2028 inside a header value or terminal output cannot tear a line apart. A line that cannot be parsed, including a non-JSON line such as a Go `http: proxy error` message, is dropped without failing the batch or its other lines. The response is `204 No Content` even when some lines were dropped, and `401` when the token is missing or wrong. The app sets no body-size limit; set one at your proxy (see [Deployment Behind a Reverse Proxy](#deployment-behind-a-reverse-proxy)).
 
 **Syslog TCP.** TCP only; UDP is never accepted, because asciicast lines are multi-KB and must not be truncated. Octet-counted (RFC 6587) and newline-delimited framing are both accepted and detected per message. A frame over 16 MiB closes the connection, at most 128 connections are served at once, and a connection idle for 5 minutes is closed.
 
-**Both doors** strip a syslog `<PRI>` header and unwrap a Docker `{"log": "...", "stream": "..."}` envelope before parsing. After that, only three kinds of line are kept: recording chunks, `Authenticated connection` lines, and API request audits. Everything else is dropped by design.
+**Both doors** strip a syslog `<PRI>` header and unwrap a Docker `{"log": "...", "stream": "..."}` envelope before parsing. After that, only three kinds of line are kept: recording chunks, `Authenticated connection` lines, and API request audits (Kubernetes and web-app requests alike). Everything else is dropped by design.
 
 For a copy-paste test and shipper recipes (journald, rsyslog, Vector, Docker, Kubernetes), see [INGESTION_RECIPES.md](INGESTION_RECIPES.md); the curl test is in §8.
 
@@ -147,10 +151,11 @@ Every page and the `.cast` stream require HTTP Basic auth (`UI_AUTH_USERNAME` / 
 | Route | What it shows |
 | --- | --- |
 | `/` | Redirects to `/dashboard`. |
-| `/dashboard` | Totals, severity and category breakdowns, top users and systems, the kubectl API requests card, and a recent-activity feed. `?window=7`, `30` (default), `90` or `all` sets the time window; an invalid value falls back to 30. See [Dashboard](#dashboard). |
-| `/systems` | One row per target system, with SSH / Kubernetes type badges, session count and last session, kubectl request count and last API request, and a findings badge. Sessions with no target system appear as `(unknown)`. |
-| `/systems/{slug}` | The system's recordings (newest first) and its kubectl activity table, with links into search for the system. `{slug}` is the URL-encoded `resource_address`, or `_unknown`. |
+| `/dashboard` | Totals, severity and category breakdowns, top users and systems, the kubectl API requests card, the Web requests tile, and a recent-activity feed. `?window=7`, `30` (default), `90` or `all` sets the time window; an invalid value falls back to 30. See [Dashboard](#dashboard). |
+| `/systems` | One row per target system, with SSH / Kubernetes / Web type badges (and the configured TLS of a web app), session count and last session, a request count per kind and last request, and a findings badge. Sessions with no target system appear as `(unknown)`. |
+| `/systems/{slug}` | The system's recordings (newest first), its kubectl activity table, and for a web app the configured-TLS block and Web activity table, with links into search for the system. `{slug}` is the URL-encoded `resource_address` (which may contain `/`), or `_unknown`. |
 | `/systems/{slug}/activity` | One kubectl activity session. Takes `user`, `from` and `to`, plus optional `discovery=1`; the links on the system page fill these in. |
+| `/systems/{slug}/web` | One web visit: the requests of one user on one web app between `from` and `to`, with per-request configured TLS. Takes `user`, `from` and `to`; the links in the Web activity table fill these in. |
 | `/sessions/{conn_id}` | Session metadata, the asciinema player, and the findings list. `?t=<seconds>` opens the player at that offset. The user links to their activity in search; an exec recording links to its kubectl command. |
 | `/sessions/{conn_id}/cast` | The `.cast` bytes, consumed only by the player. Decrypted in memory for sealed recordings when encryption is on. |
 | `/search`, `/search/export.csv` | One search over every event kind; CSV export of the current result set. See [Unified Search](#unified-search). |
@@ -164,7 +169,7 @@ Recording content is never rendered as HTML. It is only ever loaded by the vendo
 
 ## Search and Detection
 
-**Detection.** 21 built-in rules (14 dangerous-command, 7 secret-exposure) scan each recording live on every append and again when it seals. A finding stores the rule, severity, label and replay offset only, never the matched text. Rules are fixed in code; there is no rule configuration. Disable detection with `DETECTION_ENABLED=false`.
+**Detection.** 21 built-in rules (14 dangerous-command, 7 secret-exposure) scan each recording live on every append and again when it seals. A finding stores the rule, severity, label and replay offset only, never the matched text. Rules are fixed in code; there is no rule configuration. Disable detection with `DETECTION_ENABLED=false`. The six kubectl API rules run on Kubernetes requests only. Web-app traffic is not evaluated by any rule.
 
 **Search.** `/search` is one search over every event kind. See [Unified Search](#unified-search) below.
 
@@ -174,7 +179,7 @@ The full rule list, filter reference and search internals are in [SEARCH_AND_DET
 
 ## Unified Search
 
-`/search` lists SSH recordings, kubectl exec recordings, failed connections and kubectl commands in one interleaved timeline. Each row carries a type badge. There is no result total, because a total would need every kubectl command grouped. Paging is forward-only: **Next ›** moves on, **First page** returns to the start, and the browser's Back button returns to earlier pages.
+`/search` lists SSH recordings, kubectl exec recordings, failed connections, kubectl commands and web connections in one interleaved timeline. Each row carries a type badge. There is no result total, because a total would need every kubectl command grouped. Paging is forward-only: **Next ›** moves on, **First page** returns to the start, and the browser's Back button returns to earlier pages.
 
 ### Types
 
@@ -188,10 +193,13 @@ The `type` parameter (the form's Type select) chooses which kinds are searched.
 | `exec` | kubectl exec/attach recordings |
 | `failed` | Failed connections: a connection that delivered neither recording chunks nor API audits before `SESSION_MAX_IDLE_SECONDS`. These have no recording, so the row shows **Details ›** (the session metadata page) instead of **Replay**. |
 | `kubectl` | kubectl commands |
+| `web` ("Web requests") | Web connections |
 
 A kubectl result is one **command**, grouped the same way as the activity page (by `Kubectl-Session`, else by connection, within one user and one cluster). Each row expands inline to its requests (the first 200, with a link to the activity view for the rest). A command appears in the window that contains its first request, and it always shows all of its requests.
 
 Under `any`, a kubectl exec recording appears twice by design: as its own `exec` row, and as the **Replay** link inside its kubectl command row.
+
+A web result is one **connection** (one `conn_id`), placed by its first request. The row shows the configured-TLS badge and upstream marker, the user, the system and, when gwops matched the app, its name with a `managed` or `unmanaged` marker (the gateway id is in the marker's tooltip). It also shows the primary request (the first `POST`, `PUT`, `PATCH` or `DELETE`, else the first request), the request count and span, a **Visit ›** link to the visit view, and a **Focus ›** link. It expands inline to its requests (the first 200). A browser can open several connections for one page load, so one visit can appear as several interleaved rows; the visit view shows them together. See [Web Apps](#web-apps).
 
 ### Filters
 
@@ -204,13 +212,17 @@ Under `any`, a kubectl exec recording appears twice by design: as its own `exec`
 | `severity`, `max_severity` | At-or-above, or exact highest severity. |
 | `has_findings`, `category`, `rule_ids` | Finding filters. They apply to recording findings and to kubectl API findings (`category=kube-api`, `kube-*` rule ids). |
 | `status`, `min_duration`, `max_duration` | Recordings only. |
-| `q`, `mode` | Text (default) or regex. Text matches recording content case-insensitively, and matches a kubectl command's URL paths (query strings excluded) and `Kubectl-Command` values. Regex runs over recordings only. |
+| `scheme` | Web connections only: the configured client-facing TLS. `https`, `http` or `unknown`. |
+| `upstream` | Web connections only: the configured app-facing TLS. `verified`, `ca_only`, `unverified`, `plaintext` or `unknown`. |
+| `q`, `mode` | Text (default) or regex. Text matches recording content case-insensitively, matches a kubectl command's URL paths (query strings excluded) and `Kubectl-Command` values, and matches a web connection's stored URLs (the unmasked path and the masked query) case-insensitively for ASCII letters. Regex runs over recordings only. |
 | `sort` | `newest` (default), `risk`, or `duration` (recordings only). |
-| `discovery` | `1` shows discovery-only kubectl commands, which are hidden by default. |
-| `cmd` | A request id. Shows the one kubectl command that request belongs to, expanded, and ignores the other filters (except `discovery`). An unknown id shows "Command not found". Linked from an exec recording's session page and from the dashboard feed. |
+| `discovery` | `1` shows discovery-only kubectl commands, which are hidden by default. Web connections ignore it. |
+| `cmd` | A request id. Shows the one kubectl command or web connection that request belongs to, expanded, and ignores the other filters (except `discovery`). An unknown id shows "Command or web connection not found. It may have been removed by retention." Linked from an exec recording's session page, a web row's **Focus ›** link and the dashboard feed. |
 | `page_size`, `cursor` | Page size (1 to 200) and the opaque position that **Next ›** carries. |
 
-**A filter a kind cannot evaluate excludes that kind.** The page shows a notice, for example "kubectl commands not searched: the Status filter applies to recordings only." `status`, `min_duration`, `max_duration`, `mode=regex` and `sort=duration` exclude kubectl commands; `cmd` excludes recordings. A kind that can evaluate the filter but has no match simply returns no rows.
+**A filter a kind cannot evaluate excludes that kind.** The page shows a notice, for example "kubectl commands not searched: the Status filter applies to recordings only." `status`, `min_duration`, `max_duration`, `mode=regex` and `sort=duration` exclude kubectl commands and web connections; `cmd` excludes recordings; `scheme` and `upstream` exclude every kind except web. A kind that can evaluate the filter but has no match simply returns no rows.
+
+**Findings filters and web connections.** Web connections carry no findings, because no detection rule evaluates them. `has_findings=true`, `severity`, `max_severity`, `category` and `rule_ids` return no web rows, and the page says "Web connections are not evaluated by detection rules." `has_findings=false` matches every web connection. The `scheme` and `upstream` values filter on configured TLS, which is not proof of what was negotiated (see [Web Apps](#configured-tls)). `unknown` matches every connection with no TLS data, whatever the reason.
 
 **Invalid input is a `400`.** An unknown `sort`, a non-numeric duration, a repeated parameter, `window` combined with `from`, `from` later than `to`, an uncompilable regex and a bad `cursor` are all rejected with a message that names the parameter. Search forms swap the message into the results area.
 
@@ -230,7 +242,7 @@ Three exceptions to that guarantee:
 
 Each page costs in proportion to its size, not its depth. Three limits bound the work for one page. The scan and flagged limits are fixed in code; the sidecar limit is the `SEARCH_REGEX_MAX_CANDIDATES` setting:
 
-- **kubectl commands:** at most 20,000 API request rows are examined per page. A search that matches rarely (for example a text search on a busy cluster) can stop early with a short page and the notice "Scanned 20,000 kubectl requests without filling the page."
+- **kubectl commands and web connections:** at most 20,000 request rows of each kind are examined per page. A search that matches rarely (for example a text search on a busy cluster or web app) can stop early with a short page and the notice "Scanned 20,000 kubectl requests without filling the page." (or "web requests", or both).
 - **Recording content search:** at most `SEARCH_REGEX_MAX_CANDIDATES` sidecars are read per page.
 - **Flagged commands:** at most 5,000 flagged commands are considered per query. Past that the page says so and asks you to narrow by system, user or time.
 
@@ -238,9 +250,23 @@ When a budget stops a page, **Continue scanning ›** replaces **Next ›** and 
 
 ### CSV export
 
-**Export CSV** (`/search/export.csv`) follows the page: the same filters and kinds, one row per recording or kubectl command, mixed. It ignores `cursor` and `page_size` and writes up to 10,000 rows. The response header `X-Gatorcast-Truncated: true` is set when the export stopped early (row cap, a scan budget, the sidecar limit, or the flagged-command cap).
+**Export CSV** (`/search/export.csv`) follows the page: the same filters and kinds, one row per recording, kubectl command or web connection, mixed. It ignores `cursor` and `page_size` and writes up to 10,000 rows. The response header `X-Gatorcast-Truncated: true` is set when the export stopped early (row cap, a scan budget, the sidecar limit, or the flagged-command cap).
 
-There are 15 columns. The first ten are unchanged for recordings: `conn_id`, `username`, `resource_address`, `status`, `started_at`, `ended_at`, `duration_seconds`, `finding_count`, `max_severity`, `findings`. The last five are new: `kind` (`ssh`, `exec`, `failed` or `kubectl`), `command`, `method`, `path` and `request_count`. kubectl rows fill the last five; `path` has no query string and `command` is the kubectl command label, never the full `User-Agent`. A text cell starting with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'` so a spreadsheet does not treat it as a formula. The export never contains recorded text.
+There are 22 columns. The first 15 are unchanged from 0.4.0.
+
+| # | Columns | Meaning |
+| --- | --- | --- |
+| 1–10 | `conn_id`, `username`, `resource_address`, `status`, `started_at`, `ended_at`, `duration_seconds`, `finding_count`, `max_severity`, `findings` | Unchanged for recordings. |
+| 11–15 | `kind`, `command`, `method`, `path`, `request_count` | `kind` is `ssh`, `exec`, `failed`, `kubectl` or `web`. kubectl rows fill the last four; `path` has no query string and `command` is the kubectl command label, never the full `User-Agent`. Web rows fill `method`, `path` and `request_count` and leave `command` empty. |
+| 16 | `resource_type` | `KUBERNETES` for kubectl rows, `WEB_APP` for web rows, and the session's stored type (or empty) for recordings and failed connections. |
+| 17 | `configured_scheme` | Web rows: `https`, `http` or `unknown`. Otherwise empty. |
+| 18 | `configured_upstream_tls` | Web rows: `verified`, `ca_only`, `unverified`, `plaintext` or `unknown`. Otherwise empty. |
+| 19 | `query` | Web rows: the stored query of the primary request, values masked, without the `?`. Otherwise empty. |
+| 20 | `gwops_gateway_id` | Web rows: the gateway id gwops reported, when it reported a `match` of any kind. Otherwise empty. |
+| 21 | `gwops_app` | Web rows: the app name, when gwops matched the app exactly. Otherwise empty. |
+| 22 | `gwops_managed` | Web rows: `true` or `false`, when gwops matched the app exactly. Otherwise empty. |
+
+Columns 17 and 18 carry the `configured_` prefix because a CSV has no tooltips: they are configured state, not proof of what was negotiated. A rejected `gwops` object exports exactly like an absent one (`unknown` and empty). A text cell starting with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'` so a spreadsheet does not treat it as a formula; this includes `gwops_app`, which is free text for apps gwops does not manage. The export never contains recorded text. For web rows it contains the primary request's path unmasked, so a token embedded in a path appears in the export (see [what is stored](#what-is-stored-and-what-is-never-stored-web)).
 
 ### Dashboard
 
@@ -251,12 +277,13 @@ The dashboard's figures link into search with an explicit `type` and the selecte
 | Total sessions | `type=recordings` |
 | Flagged sessions, session severity chips, category chips | `type=recordings` with `has_findings=true`, `max_severity=` or `category=` |
 | kubectl API requests | `type=kubectl` |
+| Web requests | `type=web` |
 | Flagged commands, API severity chips | `type=kubectl` with `has_findings=true` or `max_severity=` |
 | Top users | `user=<username>` |
 | Top systems | The system page |
 | Recent activity | The newest 15 items of every kind (discovery-only commands hidden, not windowed). Rows open the replay, the session page, or `cmd=`. |
 
-The kubectl card counts **commands** for its flagged figure and severity chips, and **requests** for its total (discovery included), so the total is the one figure that is not the length of its list. Two other figures differ from their lists by design: category chips count findings while the list shows sessions, and top users count sessions while the user link also lists kubectl commands. If more than 5,000 flagged commands match, the flagged figures are lower bounds and show as `5000+`.
+The kubectl card counts **commands** for its flagged figure and severity chips, and **requests** for its total (discovery included), so the total is the one figure that is not the length of its list. The kubectl card counts kubectl requests only; the Web requests tile counts web requests, and its list shows connections, so it is likewise not the length of its list. Two other figures differ from their lists by design: category chips count findings while the list shows sessions, and top users count sessions while the user link also lists kubectl commands. If more than 5,000 flagged commands match, the flagged figures are lower bounds and show as `5000+`.
 
 Session figures are windowed on the recording start (the Gateway start time, else the time Gatorcast first saw the session), the same rule search uses.
 
@@ -326,6 +353,105 @@ Activity data is purged on the same cutoff as sessions. See [Retention](#retenti
 
 ---
 
+## Web Apps
+
+When the Twingate Gateway acts as a Layer 7 reverse proxy for a web app (resource type `WEB_APP`, HTTP or HTTPS), it writes the same `gateway.audit` / `"API request completed"` line per HTTP request that it writes for Kubernetes. Those request lines carry no resource fields, so Gatorcast joins each one to its connection's `Authenticated connection` line by `conn_id` to tell web requests from kubectl requests. Web requests are stored and shown separately from kubectl activity. They use the same ingest paths (`POST /ingest`, syslog TCP) as everything else.
+
+There is no recording and no request or response body: the Gateway logs neither. Gatorcast never sees the end user's IP address, because the Gateway's `remote_addr` is the connector side. What a user did inside the app is visible only as method, path, query and status per request.
+
+### Requirements
+
+- The `Authenticated connection` line must reach Gatorcast. It is the only line that names the resource type and address. A shipper that filters lines must keep it (see [INGESTION_RECIPES.md](INGESTION_RECIPES.md) §1.4).
+- **Configured-TLS badges need gwops.** The Gateway puts no scheme, port or TLS mode on any log line. The badges come from an optional `gwops` object that gwops adds to the `WEB_APP` `Authenticated connection` line. That requires a gwops release that adds the object (backlog item B-20) with Gatorcast delivery configured on it. From any other shipper, or from a gwops without Gatorcast delivery, web traffic is stored and shown normally and every connection reads **TLS unknown**. Whether a given gwops build adds the object is for you to confirm: Gatorcast has been checked against fixtures and demo data only.
+
+### How web traffic is grouped
+
+- **Connections.** Each `conn_id` is one search row. One connection can carry many keep-alive requests, and a browser can open several connections for one page load.
+- **Visits.** The system page and the visit view group one user's requests to one web app into visits, split when the gap since the previous request exceeds `KUBECTL_ACTIVITY_GAP_SECONDS` or when a visit's span reaches `KUBECTL_ACTIVITY_MAX_SECONDS`. Grouping is computed when a page is viewed. Nothing is cached. Discovery hiding is a kubectl feature and does not apply to web.
+- **Empty connections.** A `WEB_APP` connection starts hidden. If it delivers no request within `SESSION_MAX_IDLE_SECONDS` (a browser pre-connect, a refused `CONNECT` tunnel, a client that gave up), it expires hidden and never becomes a visible `error` session. A later request on it still records normally.
+- **Requests before their start line.** gwops ships the start line first, but other shippers can deliver out of order. A request that arrives before its connection's start line is stored fail-closed: its URL gets the stricter of the web and Kubernetes policies (Kubernetes path cut at `proxy`, allowlisted query keys only, values masked). If the start line then says `WEB_APP`, the request becomes a web request but keeps that stricter URL. If it says `KUBERNETES`, it stays a kubectl request.
+- **First write wins.** A connection's resource type and its TLS snapshot are fixed when its start line is first processed. A repeated, redelivered or forged start line cannot change or fill them.
+- **WebSocket.** The Gateway logs one status 101 line when an upgrade completes and never logs frames. It shows as `101 WebSocket`.
+- **Not logged by the Gateway:** a refused `CONNECT` tunnel to another host, a downstream TLS handshake failure and a rejected token. None of them produce a request line, so they are not visible here.
+
+### Where web apps appear in the UI
+
+| Page | What it shows |
+| --- | --- |
+| `/systems` | A `Web` badge, plus the configured-TLS badge and upstream marker of the app's newest web request. The **Requests** column links each kind present (`N kubectl ›`, `N web ›`) to its own search. A web-only system never gets the Kubernetes badge. |
+| `/systems/{slug}` | The **Configured web app TLS (from gwops)** block and a **Web activity** table of per-user visits (start, end, duration, connections, requests, and a `4xx/5xx` count of statuses 400 to 599), over the same 7-day window as the kubectl table. The Web activity table appears only when the system has web requests. |
+| `/systems/{slug}/web` | One visit's requests (at most 2,000, with a notice beyond that): time, method, stored URL, status, configured TLS, and connection. The configuration block above the table covers that visit's connections. |
+| `/dashboard` | A **Web requests** tile (requests in the window) linking to `type=web`. The recent-activity feed includes web connections. |
+| `/search` | The `web` kind and the `scheme` and `upstream` filters. See [Unified Search](#unified-search). |
+
+### Configured TLS
+
+Each web connection gets a client-facing badge and, when the upstream leg is not fully verified, a marker. Every badge and marker carries a tooltip saying the value is configured, not proof.
+
+| Badge or marker | Means (as configured) |
+| --- | --- |
+| `HTTPS` | The client-facing leg uses TLS 1.3. |
+| `HTTP` | The client-facing leg is plaintext. This is neutral, not a warning: that hop runs inside the Twingate tunnel. |
+| `TLS unknown` | No TLS data for the connection (see below). |
+| `Plaintext upstream` | The Gateway-to-app leg is plain HTTP. |
+| `Unverified upstream` | The Gateway-to-app leg uses TLS with no certificate checks. |
+| `CA-only upstream` | The certificate chain is checked, the hostname is not. |
+| no marker | The upstream certificate chain and hostname are verified, or the connection is `TLS unknown`. |
+
+The system page's **Configured web app TLS (from gwops)** block lists each distinct configuration seen in the window, newest first (at most 10), with connection counts and first and last request times. A line reads, for example, `HTTPS :443 → upstream verify_full :443`, with the app name, `managed` or `unmanaged`, and the gateway id (or "gateway id not yet assigned" when gwops has not created or adopted the Gateway yet). Several lines appear when the configuration changed inside the window. Other lines say gwops matched no web app at that address (or had not yet read the tenant's web apps), found more than one, or sent no data.
+
+**The values are configured, not proof.** They are what gwops read as configured when it shipped the start line, not an observation of the handshake. TLS modes travel in each connection's token, so after a mode change a connection authenticated with an older token (up to about 55 minutes) can run the old mode while labelled with the new one. Do not treat `HTTPS` or `Verified` as evidence that a given connection was encrypted or verified.
+
+**A connection shows `TLS unknown` when:**
+
+- its start line had no `gwops` object (another shipper, gwops without Gatorcast delivery, a gwops that does not add the object yet, or a line gwops shipped without it after an enrichment failure);
+- the `gwops` object was invalid. Gatorcast ignores it, logs one `classify.gwops_rejected` warning with a reason code and the `conn_id` (never a value), and the UI shows it exactly as an absent object ("No gwops data");
+- gwops matched no web app at that address on its gateway, or had not yet read the tenant's web apps (`match: none`);
+- gwops found more than one web app at that address (`match: ambiguous`).
+
+The `scheme=unknown` and `upstream=unknown` filters match all four cases. The system page's block tells them apart, except that a rejected object reads as "No gwops data". There is no retroactive fill: connections that arrived without TLS data stay unknown, and a later start line cannot fill them.
+
+The app name, managed marker and gateway id are display and export detail only. The system stays the `resource_address`, which is always the resource's address and never an alias a client used.
+
+### What is stored, and what is never stored (web)
+
+Stored per web request: `request_id`, `conn_id`, the system (`resource_address`, joined from the connection), user id and username, `requested_at`, method, the stored URL, status code, outcome (`completed` or `failed`), and `User-Agent` (stored, never displayed). Per connection: the resource type and, when present and valid, the `gwops` snapshot (match, gateway id, app name, managed flag, both TLS modes and ports).
+
+**Never stored, and never logged:** `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, every other request header, all response headers, `remote_addr`, request and response bodies, and client-sent identity headers such as `X-Twingate-User`. Identity is the envelope `user.username`. `Kubectl-Command` and `Kubectl-Session` headers are discarded on web requests, so a web client cannot steer grouping. Raw audit lines are never logged, and no URL, masked or not, is logged.
+
+**The stored URL:**
+
+- The URL is normalized as for kubectl: fragment dropped, path percent-decoded once, repeated `/` collapsed, trailing `/` removed, and an encoded `?` or `#` cuts the path and drops the query.
+- **The path is stored as is.** There is no `proxy` truncation, no query allowlist and no path masking.
+- Query keys are kept in plaintext when they are at most 64 characters of letters, digits, `_`, `.`, `[`, `]` and `-`; other keys are masked.
+- **Every query value is masked.** At most a quarter of the characters (never more than four) are kept from the start and end, followed by the length: `token=ab…6(12)`. A value of 1 to 3 characters reveals only its length. A query item with no `=` (`/callback?<token>`) is masked whole, and so is a padded base64 token such as `?dGVzdA==`. Revealed characters outside letters, digits, `.`, `_`, `~` and `-` show as `*`.
+- The stored URL is capped at 4,096 characters, after masking.
+
+| Request URL | Stored |
+| --- | --- |
+| `/report?month=09` | `/report?month=…(2)` |
+| `/login?token=abc123def456` | `/login?token=ab…6(12)` |
+| `/search?q=quarterly+report&page=2` | `/search?q=qu…rt(16)&page=…(1)` |
+| `/items/42` | `/items/42` |
+| `/reset/<token>` | `/reset/<token>` (path not masked) |
+
+The HTTP method is recorded for any token that starts with a letter, continues with letters, digits, `_` or `-`, and is at most 24 characters, with its case preserved, so WebDAV and lowercase methods produce rows.
+
+### Accepted risks and limits
+
+- **Paths are not masked.** A token embedded in a path is stored in full in the plaintext database and shown to every UI user in search results, the visit view and CSV exports, and `q` search matches it. This includes password-reset and invite links (`/reset/<token>`), share and download capability URLs, magic-login JWTs, `;jsessionid=` values and UUID capability ids. The database stays plaintext even when `ENCRYPTION_ENABLED` is on, so anyone who can read the volume reads them. If that is not acceptable, keep tokens out of paths in the app, or shorten `RETENTION_DAYS`.
+- **Masking is not encryption.** Masked values reveal up to a quarter of each value plus its length. A single-padded base64 token (`?dGVzdDE=`) looks like a key with an empty value and is not masked, and a token that fits the key pattern in key position (`?<token>=x`) is kept as a key.
+- **Web traffic is not evaluated by detection rules.** No finding is ever produced for a web request. Searches that filter on findings return no web rows and say so.
+- **Web requests stored before 0.5.0 stay kubectl.** They keep their old URLs and any `kube-api` findings until retention removes them.
+
+### Securing the gwops hop
+
+- **Use TLS between gwops and Gatorcast.** gwops forwards the Gateway's request lines byte for byte and redacts nothing. Those lines hold the client's `Authorization`, `Cookie` and `X-Api-Key` values, the response's `Set-Cookie` values and the full URL including any query string (an OAuth `?code=`, for example), and gwops keeps them at rest in its spool. Gatorcast reads and stores none of them, but they cross the wire on the way to `/ingest`. The gwops demo compose network uses plain HTTP; do not copy that. Point gwops at an `https://` URL on your reverse proxy (see [Deployment Behind a Reverse Proxy](#deployment-behind-a-reverse-proxy)).
+- **Forged lines.** Anyone holding `INGEST_TOKEN`, or with network access to the syslog port, can forge a start line carrying a `gwops` object and mislabel a connection as `HTTPS` or `Verified`. Separately, the Gateway logs upstream TLS errors without escaping them, so an upstream certificate whose DNS name contains `\n{...}` produces a standalone line that gwops cannot tell from a Gateway line and ships if it matches. Anyone who controls an upstream app's certificate can therefore forge ingest lines. First-write-wins protects an existing connection from being retyped or relabelled; forged request or recording lines on other connection ids cannot be told apart from real ones. Fixing this needs a change in the Gateway or gwops.
+- **Keep `LOG_LEVEL` at `info` in production.** At `debug`, the SQLite driver's own log lines include bound parameters, which can include stored URLs and usernames.
+
+---
+
 ## Encryption at Rest
 
 Opt-in. When enabled, `.cast` recordings are encrypted on the volume with AES-256-GCM, using a key derived from `GATORCAST_MASTER_KEY`. The search sidecars (`<conn_id>.txt.enc`) are encrypted under an independent key derived from the same master key. Sealed recordings are decrypted in memory for playback.
@@ -354,7 +480,7 @@ Details: [ARCHITECTURE.md](ARCHITECTURE.md#encryption-at-rest).
 
 A purge runs every 24 hours with two independent policies:
 
-- **Age (`RETENTION_DAYS`, default 90).** Deletes sessions whose start time is older than the cutoff, along with their `.cast` file, search sidecar and findings. Sessions with no start time are not age-purged. The same cutoff deletes kubectl `api_requests` (with their findings) and `connections`. An API request is purged when either its Gateway timestamp or the time Gatorcast stored it is older than the cutoff, so a forged future timestamp cannot keep a row forever. Connections are purged on Gatorcast's own timestamps only. There is no separate setting for API activity.
+- **Age (`RETENTION_DAYS`, default 90).** Deletes sessions whose start time is older than the cutoff, along with their `.cast` file, search sidecar and findings. Sessions with no start time are not age-purged. The same cutoff deletes kubectl `api_requests` (with their findings) and `connections`. An API request is purged when either its Gateway timestamp or the time Gatorcast stored it is older than the cutoff, so a forged future timestamp cannot keep a row forever. Connections are purged on Gatorcast's own timestamps only, by last activity: a connection is removed only when its last start line or newly stored request is past the cutoff and no stored request still refers to it, so a long-lived keep-alive connection is not purged while it is active. Web requests are purged like kubectl requests, and their configured-TLS data goes with their rows. There is no separate setting for API or web activity.
 - **Size (`RETENTION_MAX_GB`, default off).** When total recording size is over the cap, deletes the oldest completed sessions until it is under. It counts recording bytes only and never deletes API rows or connections.
 
 `0` disables a policy. To keep everything, set `RETENTION_DAYS=0` and leave `RETENTION_MAX_GB=0`. See [ARCHITECTURE.md](ARCHITECTURE.md#retention).
@@ -411,10 +537,22 @@ There is no manual step and no `PRAGMA user_version` change. On first start the 
 
 Back up the `/data` volume first, as for any upgrade. Old `/search` links keep working; see [Old `/search` links](#old-search-links) for the exceptions.
 
+### Upgrading to 0.5.0 (web apps)
+
+There is no manual step and no `PRAGMA user_version` change. On first start the service adds the new columns in place and replaces five `api_requests` indexes with ones that lead with the request kind, so the first boot takes longer on a large `api_requests` table while they build. Back up the `/data` volume first, as for any upgrade.
+
+What to expect afterwards:
+
+- **Existing `api_requests` rows stay `kubectl`.** That includes any web traffic Gatorcast stored before the upgrade. Those rows keep their old URLs (the Kubernetes query allowlist, the `proxy` cut) and any `kube-api` findings, and they show as kubectl activity until retention removes them. New web traffic is stored as web.
+- **No TLS badges until gwops sends the `gwops` object.** Web connections read `TLS unknown` until a gwops that adds the object, with Gatorcast delivery configured, authenticates them. Earlier connections stay unknown.
+- **The CSV has 22 columns.** The first 15 are unchanged; a script that reads the export by position keeps working, and one that reads by header sees seven new columns on the right.
+- **The systems list columns changed.** "API requests" and "Last API request" are now **Requests** and **Last request**.
+- **Use TLS between gwops and Gatorcast** before you start shipping web traffic. See [Securing the gwops hop](#securing-the-gwops-hop).
+
 To pin to a specific version, change the image tag in `docker-compose.yml`:
 
 ```yaml
-image: ghcr.io/twingate-solutions/gatorcast:v0.4.0
+image: ghcr.io/twingate-solutions/gatorcast:v0.5.0
 ```
 
 ---
@@ -449,10 +587,13 @@ Quick fixes: raise `LineMax` (e.g. `LineMax=4M`) and relax rate limiting (`RateL
 ### Nothing showing up in the UI
 
 1. **Check `INGEST_TOKEN`:** Send a test `curl` request (see [INGESTION_RECIPES.md](INGESTION_RECIPES.md) §8). A 401 response means the token does not match.
-2. **Two-stage recording filter:** A line is a recording chunk only when `logger == "gateway.audit"` AND the `asciicast` field is non-null. `gateway.audit` lines without an `asciicast` field and with the message `API request completed` or `API request failed` are stored as kubectl activity metadata, not recordings. They appear under the system's kubectl activity table and as kubectl commands in search (`type=kubectl`), not in its session list. Other `gateway.audit` messages are dropped by design.
+2. **Two-stage recording filter:** A line is a recording chunk only when `logger == "gateway.audit"` AND the `asciicast` field is non-null. `gateway.audit` lines without an `asciicast` field and with the message `API request completed` or `API request failed` are stored as kubectl activity metadata, not recordings. They appear under the system's kubectl activity table and as kubectl commands in search (`type=kubectl`), or, for a web-app connection, in the Web activity table and as web connections in search (`type=web`). They never appear in the session list. Other `gateway.audit` messages are dropped by design.
 3. **Check the shipper connection:** For syslog TCP, confirm the shipper's IP/port settings match the binding. For HTTP, check that the shipper sends a valid `Authorization: Bearer` header and a body of one JSON object per line (any content type other than `application/json` is read that way), or a JSON object/array with `Content-Type: application/json`.
 4. **Session-start event:** The UI groups sessions by target system (`resource_address`). If the Gateway does not emit an `"Authenticated connection"` line for a session, the session will appear in an "unknown" bucket.
-5. **kubectl activity missing for a cluster:** API audit lines carry no `resource_address`. The cluster is joined from the `"Authenticated connection"` line by `conn_id`, so that line must reach Gatorcast too. Requests whose connection start was never seen appear under the "unknown" system.
+5. **kubectl or web activity missing for a cluster or app:** API audit lines carry no `resource_address`. The system is joined from the `"Authenticated connection"` line by `conn_id`, so that line must reach Gatorcast too. Requests whose connection start was never seen appear under the "unknown" system.
+6. **A web app shows no requests:** a `WEB_APP` connection with no requests expires hidden (it is a browser pre-connect or a refused tunnel), and the Gateway writes no line for a downstream TLS handshake failure or a rejected token. Check that real requests reach the Gateway and that its request lines reach Gatorcast.
+7. **A web app shows `TLS unknown`:** this is the normal state unless gwops adds its `gwops` object to the start line with Gatorcast delivery configured. Check the logs for `classify.gwops_rejected` (the object was malformed; the warning carries a reason code), and on gwops check `/status` `shipper.enrich_failed` and `shipper.enrichment`. See [Configured TLS](#configured-tls).
+8. **Web requests under the Kubernetes badge, or kubectl rows that look like web traffic:** requests stored before the 0.5.0 upgrade stay `kubectl` until retention removes them. See [Upgrading to 0.5.0](#upgrading-to-050-web-apps).
 
 ### Syslog framing issues
 
@@ -466,7 +607,7 @@ Gatorcast supports both RFC 6587 octet-counting (`<length> <msg>`) and newline-d
 
 All data lives in the `gatorcast-data` named Docker volume, mounted at `/data` inside the container:
 
-- SQLite database: `/data/gatorcast.db` (sessions, connections, findings, and kubectl API request metadata)
+- SQLite database: `/data/gatorcast.db` (sessions, connections, findings, and kubectl and web request metadata)
 - Recording files: `/data/casts/<conn_id>.cast`
 - Search sidecars: `/data/casts/<conn_id>.txt.enc`
 
@@ -502,7 +643,8 @@ Gatorcast makes zero external network requests at runtime. There are no CDN depe
 The following are explicitly out of scope for this release and will not be added without a design discussion:
 
 - Auto-following (live-tailing) replay of an in-progress session — in-progress recordings **are** playable, but the player shows a snapshot; reload to see output appended since. True streaming/auto-append is out of scope.
-- Per-request search rows for kubectl activity — search returns commands, and requests appear only inside their command
+- Per-request search rows for kubectl or web activity — search returns commands and web connections, and requests appear only inside them
+- Detection rules for web traffic, and an HTTP-status filter for web search
 - A stored command rollup, result totals, and a "previous page" link in search
 - Alert dispatch (email/webhook/Slack) for findings — detection runs live (on every append) and findings are surfaced immediately, but push/alert delivery is a later consumer
 - SSO or multi-user RBAC (the current auth is single-operator HTTP Basic)

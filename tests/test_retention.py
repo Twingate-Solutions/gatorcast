@@ -873,3 +873,143 @@ async def test_age_purge_removes_future_dated_api_row_by_created_at(
     assert await _table_count(db, "api_requests", "request_id", "future-req") == 0
     assert await _table_count(db, "api_findings", "request_id", "future-req") == 0
     assert await _table_count(db, "api_requests", "request_id", "future-fresh") == 1
+
+
+# ---------------------------------------------------------------------------
+# Session 11: web rows and their connections age out like every other activity row
+# (WEBAPP_SPEC 9). The gwops/TLS columns are written as raw values here: the snapshot
+# logic itself is covered elsewhere.
+# ---------------------------------------------------------------------------
+
+
+async def _insert_web_connection(db, conn_id: str, created_at: str, state: str = "api") -> None:
+    """A WEB_APP connection carrying a populated gwops/TLS snapshot."""
+    await db.execute(
+        """
+        INSERT INTO connections (
+            conn_id, username, resource_address, state, has_api, created_at, last_seen_at,
+            resource_type, gwops_match, gwops_gateway_id, gwops_app, gwops_managed,
+            downstream_tls, downstream_port, upstream_tls, upstream_port
+        )
+        VALUES (?, 'alice', 'wiki.corp.internal', ?, 1, ?, ?, 'WEB_APP', 'exact',
+                'R2F0ZXdheToxMjk0', 'Legacy Wiki', 0, 'none', 80, 'none', 8080)
+        """,
+        (conn_id, state, created_at, created_at),
+    )
+    await db.commit()
+
+
+async def _insert_web_request(db, request_id: str, conn_id: str, requested_at: str) -> None:
+    """A web ``api_requests`` row with its denormalized configured modes."""
+    await db.execute(
+        """
+        INSERT INTO api_requests (
+            request_id, conn_id, resource_address, user_key, username, requested_at,
+            method, url, status_code, outcome, api_kind, downstream_tls, upstream_tls
+        )
+        VALUES (?, ?, 'wiki.corp.internal', 'u1', 'alice', ?, 'GET', '/reports?month=…(2)',
+                200, 'completed', 'web', 'none', 'none')
+        """,
+        (request_id, conn_id, requested_at),
+    )
+    await db.commit()
+
+
+async def _seed_web_activity(db) -> None:
+    """One old (11 days) and one new (9 days) web connection with a request each."""
+    old, new = _days_ago(_RETENTION_DAYS + 1), _days_ago(_RETENTION_DAYS - 1)
+    await _insert_web_connection(db, "old-web-conn", _sqlite_now_format(old))
+    await _insert_web_connection(db, "new-web-conn", _sqlite_now_format(new))
+    await _insert_web_request(db, "old-web-req", "old-web-conn", _requested_at(old))
+    await _insert_web_request(db, "new-web-req", "new-web-conn", _requested_at(new))
+
+
+async def test_age_purge_removes_old_web_rows_and_their_connections(
+    repo: SessionRepository, cast_store: CastStore, activity_store: ActivityStore, db
+) -> None:
+    await _seed_web_activity(db)
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=_RETENTION_DAYS, retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    assert await _table_count(db, "api_requests", "request_id", "old-web-req") == 0
+    assert await _table_count(db, "connections", "conn_id", "old-web-conn") == 0
+    assert await _table_count(db, "api_requests", "request_id", "new-web-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "new-web-conn") == 1
+    # The surviving connection keeps its snapshot untouched.
+    cur = await db.execute(
+        "SELECT resource_type, gwops_match, gwops_app, downstream_tls, upstream_port "
+        "FROM connections WHERE conn_id = 'new-web-conn'"
+    )
+    assert tuple(await cur.fetchone()) == ("WEB_APP", "exact", "Legacy Wiki", "none", 8080)
+
+
+async def test_age_purge_removes_old_empty_web_connections(
+    repo: SessionRepository, cast_store: CastStore, activity_store: ActivityStore, db
+) -> None:
+    """A hidden `empty` WEB_APP connection has no requests and no session: age still purges it."""
+    old, new = _days_ago(_RETENTION_DAYS + 1), _days_ago(_RETENTION_DAYS - 1)
+    await _insert_web_connection(db, "old-empty", _sqlite_now_format(old), state="empty")
+    await _insert_web_connection(db, "new-empty", _sqlite_now_format(new), state="empty")
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=_RETENTION_DAYS, retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+    assert await _table_count(db, "connections", "conn_id", "old-empty") == 0
+    assert await _table_count(db, "connections", "conn_id", "new-empty") == 1
+
+
+async def test_age_purge_leaves_kubectl_and_web_rows_on_the_same_side_of_the_cutoff_alike(
+    repo: SessionRepository, cast_store: CastStore, activity_store: ActivityStore, db
+) -> None:
+    await _seed_activity(db)
+    await _seed_web_activity(db)
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=_RETENTION_DAYS, retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+
+    cur = await db.execute("SELECT request_id, api_kind FROM api_requests ORDER BY request_id")
+    assert [tuple(r) for r in await cur.fetchall()] == [("new-req", "kubectl"), ("new-web-req", "web")]
+    cur = await db.execute("SELECT conn_id FROM connections ORDER BY conn_id")
+    assert [r[0] for r in await cur.fetchall()] == ["new-conn", "new-web-conn"]
+    assert await _table_count(db, "api_findings", "request_id", "old-req") == 0
+    assert await _table_count(db, "api_findings", "request_id", "new-req") == 1
+
+
+async def test_age_purge_removes_a_future_dated_web_row_by_its_server_insert_time(
+    repo: SessionRepository, cast_store: CastStore, activity_store: ActivityStore, db
+) -> None:
+    """The created_at bound that stops a forged future requested_at pinning a kubectl row applies to web rows."""
+    old = _days_ago(_RETENTION_DAYS + 1)
+    await _insert_web_connection(db, "forged-conn", _sqlite_now_format(old))
+    await _insert_web_request(db, "forged-web-req", "forged-conn", "9999-01-01T00:00:00.000Z")
+    await db.execute(
+        "UPDATE api_requests SET created_at = ? WHERE request_id = 'forged-web-req'",
+        (_sqlite_now_format(old),),
+    )
+    await db.commit()
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=_RETENTION_DAYS, retention_max_gb=0,
+        activity=activity_store,
+    )
+    await purger.run()
+    assert await _table_count(db, "api_requests", "request_id", "forged-web-req") == 0
+
+
+async def test_size_purge_leaves_web_rows_and_connections(
+    repo: SessionRepository, cast_store: CastStore, activity_store: ActivityStore, db
+) -> None:
+    """Size-based purge only trims recordings: web rows and their connections stay."""
+    await _seed_web_activity(db)
+    purger = RetentionPurger(
+        repo=repo, casts=cast_store, retention_days=0, retention_max_gb=0.000001,
+        activity=activity_store,
+    )
+    await purger.run()
+    assert await _table_count(db, "api_requests", "request_id", "old-web-req") == 1
+    assert await _table_count(db, "connections", "conn_id", "old-web-conn") == 1

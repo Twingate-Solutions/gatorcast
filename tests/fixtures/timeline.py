@@ -132,12 +132,43 @@ async def add_connection(
     username: str | None,
     resource_address: str | None,
     state: str = "recording",
+    resource_type: str | None = None,
+    gwops_match: str | None = None,
+    gwops_gateway_id: str | None = None,
+    gwops_app: str | None = None,
+    gwops_managed: bool | None = None,
+    downstream_tls: str | None = None,
+    upstream_tls: str | None = None,
+    downstream_port: int | None = None,
+    upstream_port: int | None = None,
 ) -> None:
-    """Insert one ``connections`` row."""
+    """Insert one ``connections`` row.
+
+    The ``gwops_*``, TLS and port arguments fill the WEB_APP snapshot columns
+    (Session 11; ports added in Session 12); all default to ``None`` (no object / TLS
+    unknown).
+    """
     await db.execute(
-        "INSERT INTO connections (conn_id, user_id, username, resource_address, state) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (conn_id, user_id, username, resource_address, state),
+        "INSERT INTO connections (conn_id, user_id, username, resource_address, state, "
+        "resource_type, gwops_match, gwops_gateway_id, gwops_app, gwops_managed, "
+        "downstream_tls, upstream_tls, downstream_port, upstream_port) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            conn_id,
+            user_id,
+            username,
+            resource_address,
+            state,
+            resource_type,
+            gwops_match,
+            gwops_gateway_id,
+            gwops_app,
+            None if gwops_managed is None else int(gwops_managed),
+            downstream_tls,
+            upstream_tls,
+            downstream_port,
+            upstream_port,
+        ),
     )
     await db.commit()
 
@@ -153,20 +184,33 @@ async def add_request(
     username: str | None = None,
     method: str = "GET",
     url: str = "/api/v1/namespaces/default/pods",
-    status_code: int = 200,
+    status_code: int | None = 200,
     kubectl_command: str | None = None,
     kubectl_session: str | None = None,
     user_agent: str | None = "kubectl/v1.30.0 (linux/amd64) kubernetes/abc",
     findings: Sequence[ApiFindingSpec] = (),
     commit: bool = True,
+    api_kind: str = "kubectl",
+    downstream_tls: str | None = None,
+    upstream_tls: str | None = None,
+    outcome: str = "completed",
 ) -> None:
-    """Insert one ``api_requests`` row (``user_key`` = user id, else username)."""
+    """Insert one ``api_requests`` row (``user_key`` = user id, else username).
+
+    ``outcome`` is ``completed`` (default) or ``failed`` (the Gateway's "API request
+    failed" line, which carries no status: pass ``status_code=None`` with it).
+
+    ``api_kind`` is ``kubectl`` (default) or ``web`` (Session 11: web-app rows, which no
+    kubectl surface may list). ``downstream_tls`` / ``upstream_tls`` are the configured
+    TLS modes a web row copies from its connection (``None`` = unknown).
+    """
     await db.execute(
         """
         INSERT INTO api_requests (request_id, conn_id, resource_address, user_key,
             user_id, username, requested_at, method, url, status_code, outcome,
-            kubectl_command, kubectl_session, user_agent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)
+            kubectl_command, kubectl_session, user_agent, api_kind,
+            downstream_tls, upstream_tls)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             request_id,
@@ -179,9 +223,13 @@ async def add_request(
             method,
             url,
             status_code,
+            outcome,
             kubectl_command,
             kubectl_session,
             user_agent,
+            api_kind,
+            downstream_tls,
+            upstream_tls,
         ),
     )
     for rule_id, severity, label in findings:
@@ -458,3 +506,171 @@ async def build_scenario(db: aiosqlite.Connection) -> Scenario:
               resource_address=DEV, url="/api/v1/namespaces/kube-system/pods",
               kubectl_session="ks-dev-1", kubectl_command="kubectl get pods", **alice)
     return sc
+
+
+# --- web-app connections (Session 12, WEBAPP_SPEC 8.1) ----------------------------------------
+
+WIKI = "wiki.corp.internal"
+GRAFANA = "grafana.corp.internal"
+WEB_UA = "Mozilla/5.0 (X11; Linux x86_64)"
+
+# One tuple per request: (request_id, hms, method, url) or the same plus
+# (downstream_tls, upstream_tls) overriding the connection's modes on that row.
+WebRequestSpec = tuple[str, ...]
+
+# Each entry is one web connection (one ``c:<conn_id>`` item). ``user`` is
+# ``(user_id, username)``; ``gwops`` is ``(match, gateway_id, app, managed)`` or ``None``
+# for a start line with no object; ``row`` False skips the ``connections`` row.
+WEB_CONNECTIONS: tuple[dict[str, object], ...] = (
+    {  # starts before a 09:00 window and ends after it; plaintext client, unverified upstream
+        "conn_id": "wc-h", "system": WIKI, "user": (ALICE_ID, ALICE),
+        "down": "none", "up": "insecure", "gwops": ("exact", "gw-aaa", "Wiki Prod", True),
+        "requests": (
+            ("ww-h1", "08:59:59.000", "GET", "/early"),
+            ("ww-h2", "09:00:05.000", "GET", "/early/next"),
+        ),
+    },
+    {  # POST is the primary request; ww-j1 shares its start instant
+        "conn_id": "wc-a", "system": WIKI, "user": (ALICE_ID, ALICE),
+        "down": "tls13", "up": "verify_full", "gwops": ("exact", "gw-aaa", "Wiki Prod", True),
+        "requests": (
+            ("ww-a1", "10:00:30.000", "GET", "/home"),
+            ("ww-a2", "10:00:31.000", "POST", "/login"),
+            ("ww-a3", "10:00:32.000", "GET", "/static/app.js"),
+        ),
+    },
+    {  # lower-case mutating method is still mutating
+        "conn_id": "wc-j", "system": WIKI, "user": (ALICE_ID, ALICE),
+        "down": "tls13", "up": "insecure", "gwops": ("exact", "gw-aaa", "Wiki Prod", True),
+        "requests": (
+            ("ww-j1", "10:00:30.000", "GET", "/home"),
+            ("ww-j2", "10:00:40.000", "delete", "/items/7"),
+        ),
+    },
+    {  # masked query in the stored URL; DELETE after a GET start
+        "conn_id": "wc-b", "system": WIKI, "user": (BOB_ID, BOB),
+        "down": "tls13", "up": "verify_ca", "gwops": ("exact", "gw-bbb", "Docs (beta)", False),
+        "requests": (
+            ("ww-b1", "10:30:00.000", "GET", "/docs/search?term=se…(9)&page=…(1)"),
+            ("ww-b2", "10:30:05.000", "DELETE", "/items/42"),
+        ),
+    },
+    {  # GET /api: a kubectl discovery look-alike that web must still list
+        "conn_id": "wc-c", "system": GRAFANA, "user": (ALICE_ID, ALICE),
+        "down": "none", "up": "none", "gwops": ("exact", "gw-ccc", "Grafana", True),
+        "requests": (("ww-c1", "11:00:00.000", "GET", "/api"),),
+    },
+    {  # gwops match "none": TLS unknown, gateway id kept
+        "conn_id": "wc-d", "system": GRAFANA, "user": (BOB_ID, BOB),
+        "down": None, "up": None, "gwops": ("none", "gw-ddd", None, None),
+        "requests": (
+            ("ww-d1", "11:30:00.000", "GET", "/d/home"),
+            ("ww-d2", "11:30:10.000", "PUT", "/api/dashboards"),
+        ),
+    },
+    {  # gwops match "ambiguous"
+        "conn_id": "wc-e", "system": GRAFANA, "user": (CAROL_ID, CAROL),
+        "down": None, "up": None, "gwops": ("ambiguous", "gw-eee", None, None),
+        "requests": (("ww-e1", "12:30:00.000", "PATCH", "/settings"),),
+    },
+    {  # no gwops object at all; PROPFIND is not mutating; ties with kubectl r-xss/r-eq
+        "conn_id": "wc-f", "system": WIKI, "user": (ALICE_ID, ALICE),
+        "down": None, "up": None, "gwops": None,
+        "requests": (
+            ("ww-f1", "12:40:00.000", "GET", "/zebra-path"),
+            ("ww-f2", "12:40:02.000", "PROPFIND", "/zebra-path/files"),
+        ),
+    },
+    {  # kubectl-looking path on a web row; no connections row at all
+        "conn_id": "wc-i", "system": WIKI, "user": (BOB_ID, BOB),
+        "down": "tls13", "up": "verify_full", "gwops": None, "row": False,
+        "requests": (("ww-i1", "13:05:00.000", "GET", "/api/v1/namespaces/default/secrets/db"),),
+    },
+    {  # the start row's modes decide the filters; the second row differs
+        "conn_id": "wc-k", "system": WIKI, "user": (BOB_ID, BOB),
+        "down": "tls13", "up": "verify_full", "gwops": ("exact", "gw-bbb", "Docs (beta)", False),
+        "requests": (
+            ("ww-k1", "14:00:00.000", "GET", "/wiki/start"),
+            ("ww-k2", "14:00:01.000", "GET", "/wiki/next", "none", "none"),
+        ),
+    },
+    {  # unknown system, user.id only; gwops Mode B (no gateway id); POST then DELETE
+        "conn_id": "wc-g", "system": None, "user": (DAVE_ID, None),
+        "down": "tls13", "up": "none", "gwops": ("exact", None, "Legacy", True),
+        "requests": (
+            ("ww-g1", "23:59:00.000", "POST", "/late"),
+            ("ww-g2", "23:59:01.000", "DELETE", "/late/1"),
+        ),
+    },
+)
+
+WEB_START_IDS: dict[str, str] = {
+    str(c["conn_id"]): str(c["requests"][0][0])  # type: ignore[index]
+    for c in WEB_CONNECTIONS
+}
+"""Connection id → its start (first) request id, which is the web item's command id."""
+
+
+async def build_web_scenario(db: aiosqlite.Connection) -> dict[str, list[str]]:
+    """Insert :data:`WEB_CONNECTIONS` (``api_kind = 'web'``) and return the request ids.
+
+    Interleaves with :func:`build_scenario` (same users, overlapping times, ties at
+    ``11:00:00.000`` with ``s-same-at``/``r-c1-1`` and at ``12:40:00.000`` with
+    ``r-xss``/``r-eq``). No ``api_findings`` rows: web has no detection rules.
+
+    Configured TLS (down / up) by start row::
+
+        wc-h none / insecure   wc-a tls13 / verify_full   wc-j tls13 / insecure
+        wc-b tls13 / verify_ca wc-c none / none           wc-d, wc-e, wc-f NULL / NULL
+        wc-i tls13 / verify_full (no connections row)     wc-k tls13 / verify_full
+        wc-g tls13 / none
+
+    Returns:
+        ``conn_id`` → its request ids in time order.
+    """
+    out: dict[str, list[str]] = {}
+    for conn in WEB_CONNECTIONS:
+        conn_id = str(conn["conn_id"])
+        user_id, username = conn["user"]  # type: ignore[misc]
+        system = conn["system"]
+        if conn.get("row", True):
+            match = conn["gwops"]
+            await add_connection(
+                db,
+                conn_id,
+                user_id=user_id,
+                username=username,
+                resource_address=system,  # type: ignore[arg-type]
+                state="api",
+                resource_type="WEB_APP",
+                gwops_match=match[0] if match else None,  # type: ignore[index]
+                gwops_gateway_id=match[1] if match else None,  # type: ignore[index]
+                gwops_app=match[2] if match else None,  # type: ignore[index]
+                gwops_managed=match[3] if match else None,  # type: ignore[index]
+                downstream_tls=conn["down"],  # type: ignore[arg-type]
+                upstream_tls=conn["up"],  # type: ignore[arg-type]
+            )
+        ids: list[str] = []
+        for spec in conn["requests"]:  # type: ignore[attr-defined]
+            rid, hms, method, url, *tls = spec
+            down, up = (tls[0], tls[1]) if tls else (conn["down"], conn["up"])
+            await add_request(
+                db,
+                rid,
+                conn_id=conn_id,
+                requested_at=at(hms),
+                resource_address=system,  # type: ignore[arg-type]
+                user_id=user_id,
+                username=username,
+                method=method,
+                url=url,
+                kubectl_session=None,
+                kubectl_command=None,
+                user_agent=WEB_UA,
+                api_kind="web",
+                downstream_tls=down,  # type: ignore[arg-type]
+                upstream_tls=up,  # type: ignore[arg-type]
+            )
+            ids.append(rid)
+        out[conn_id] = ids
+    return out

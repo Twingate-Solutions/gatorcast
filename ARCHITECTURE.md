@@ -30,19 +30,21 @@ see the [README](README.md); for forwarding Gateway logs in, see
 │    • logger=="gateway.audit" AND asciicast!=null → recording chunk                       │
 │      (message=="session finished" → final chunk / end signal)                            │
 │    • gateway.audit, no asciicast, "API request completed"/"failed"                       │
-│      → API request (allowlisted metadata; URL via pipeline/urlnorm.py)                   │
-│    • logger=="gateway" "Authenticated connection" → pending connection + target          │
+│      → API request (allowlisted metadata; kubectl or web URL form per connection)        │
+│    • logger=="gateway" "Authenticated connection" → pending connection + target,         │
+│        resource_type, and the optional gwops TLS object on WEB_APP lines                 │
 │    • (close event if present) → finalize signal                                          │
 │    • envelope-format records ("type", no "logger") → same events (legacy, kept)          │
 │        ▼                                                                                 │
 │  Per-conn_id assembler (pipeline/assembler.py, file-first) + connection lifecycle        │
 │    • pending → recording on first chunk; pending → api on first audit;                   │
-│        pending → visible error after SESSION_MAX_IDLE_SECONDS with neither               │
+│        pending → visible error after SESSION_MAX_IDLE_SECONDS with neither;              │
+│        a WEB_APP connection with neither expires hidden (empty), never an error          │
 │    • each chunk → reassemble (header once, events in seq order) →                        │
 │        write PLAINTEXT .cast to disk + scan live (durable per append)                    │
 │    • seal (sidecar + final scan, encrypt if enabled → complete): on                      │
 │        "session finished"/close (terminal) OR idle backstop (reopenable)                 │
-│    • API request → dedup by request_id → row + API findings, one transaction             │
+│    • API request → dedup by request_id → kubectl row + findings, or web row (no rules)   │
 │        ▼                                                                                 │
 │  Storage (store/)                                                                        │
 │    • SQLite (WAL) /data/gatorcast.db: sessions, findings, connections,                   │
@@ -57,6 +59,7 @@ see the [README](README.md); for forwarding Gateway logs in, see
 │    /search: one keyset-paged timeline (store/timeline.py, web/params.py, web/kinds.py)   │
 │    /systems → /systems/{addr} → /sessions/{id} → /sessions/{id}/cast                     │
 │                              └→ /systems/{addr}/activity (kubectl, no player)            │
+│                              └→ /systems/{addr}/web (web visit, no player)               │
 │    (activity grouping computed per page view by pipeline/activity.py)                    │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -68,26 +71,27 @@ see the [README](README.md); for forwarding Gateway logs in, see
 - APScheduler drives two background jobs: the idle backstop sweep (seals data-bearing sessions reopenably; expires pending connections that delivered neither chunks nor API audits to a visible `error` session) and the retention purge, which runs every 24 hours. See [Background Jobs](#background-jobs).
 - Two wire formats are classified. The stock Gateway's log lines (`logger` field) are the supported path. Envelope-format records from the retired Gateway fork (a `type` field and no `logger`) are still mapped onto the same events for compatibility; that code is kept but not extended.
 - kubectl activity: the Gateway's API-request audits are stored as allowlisted metadata (`store/activity.py`), their URLs normalized and sanitized by `pipeline/urlnorm.py` and `pipeline/classify.py`, and grouped per user and cluster into activity sessions and commands on each page view by `pipeline/activity.py`. Nothing is cached. See the [README](README.md#kubectl-activity).
-- Search: `/search` is one query engine over every event kind (`store/timeline.py`), not a recordings-only filter. Recordings, failed connections and kubectl commands are merged into one keyset-paged timeline. See [Unified search engine](#unified-search-engine).
+- Web apps: requests to a `WEB_APP` resource arrive as the same `API request completed` lines as kubectl requests. The assembler tells them apart by the connection's `resource_type` (joined by `conn_id`), stores them with a different, stricter-on-queries policy, and the UI shows them as a separate `web` kind with the app's configured TLS posture. See [Web-app flow](#web-app-flow).
+- Search: `/search` is one query engine over every event kind (`store/timeline.py`), not a recordings-only filter. Recordings, failed connections, kubectl commands and web connections are merged into one keyset-paged timeline. See [Unified search engine](#unified-search-engine).
 - Push-based: Gatorcast exposes endpoints and waits. It never reaches back into the Gateway, Docker, or Kubernetes.
 - All frontend assets (HTMX, Alpine.js, asciinema player, CSS) are vendored under `web/static/`. No CDN or external JS at runtime.
 
 ### Data flow
 
-1. **Front door.** `POST /ingest` takes a bearer token. An `application/json` body is parsed as one object or an array; any other content type is split into lines. The syslog TCP listener accepts RFC 6587 octet-counted frames and newline-delimited lines, auto-detected per message. Both paths hand each raw line to `normalize`.
-2. **Normalize** (`ingest/normalize.py`). A syslog `<PRI>` header is stripped by parsing from the first `{`. A collector wrapper such as Docker's `{"log": "...", "stream": "stdout"}` is unwrapped. A line that does not reduce to a JSON object is dropped with a `normalize.drop` warning that logs the length only. A length near 49152 means journald's `LineMax` split a large chunk; see the [README troubleshooting](README.md#troubleshooting).
+1. **Front door.** `POST /ingest` takes a bearer token. An `application/json` body is parsed as one object or an array; any other content type is split into lines on `\n` only (one trailing `\r` is dropped), so a Unicode line separator such as U+2028 inside a JSON string cannot tear a line apart. The syslog TCP listener accepts RFC 6587 octet-counted frames and newline-delimited lines, auto-detected per message. Both paths hand each raw line to `normalize`.
+2. **Normalize** (`ingest/normalize.py`). A syslog `<PRI>` header is stripped by parsing from the first `{`. A collector wrapper such as Docker's `{"log": "...", "stream": "stdout"}` is unwrapped. A line that does not reduce to a JSON object is dropped with a `normalize.drop` warning that logs the length only; the rest of its batch is unaffected. This is how non-JSON lines in a batch (a Go `http: proxy error: …` message, for example) are tolerated. A length near 49152 means journald's `LineMax` split a large chunk; see the [README troubleshooting](README.md#troubleshooting).
 3. **Queue.** Accepted objects go onto one in-memory, unbounded `asyncio.Queue`. `/ingest` returns `204` whether or not lines were dropped. Objects still queued when the process dies are lost.
 4. **Classify** (`pipeline/classify.py`). One consumer task drains the queue and turns each object into an event or drops it:
 
    | Input | Event |
    | --- | --- |
    | `gateway.audit` with a string `asciicast` and an integer `asciicast_sequence_num` | `RecordingChunk` (`is_final` when `message == "session finished"`; carries `request_id` on k8s exec/attach lines) |
-   | `gateway.audit`, no `asciicast`, `message` of `API request completed` or `API request failed` | `ApiRequest` (allowlisted fields only) |
-   | `gateway`, `Authenticated connection` | `SessionStart` (user, target `resource_address`) |
+   | `gateway.audit`, no `asciicast`, `message` of `API request completed` or `API request failed` | `ApiRequest` (allowlisted fields only; carries both the Kubernetes and the web URL form) |
+   | `gateway`, `Authenticated connection` | `SessionStart` (user, target `resource_address`, normalized `resource_type`, and for `WEB_APP` the validated `gwops` object) |
    | `gateway`, `Connection closed` or `Closed connection` | `SessionEnd` |
    | Anything else | Dropped |
 
-   `conn_id` names the `.cast` file, so it must `fullmatch` `[A-Za-z0-9_.-]{1,128}`; anything else is dropped here. An exception in the consumer is logged by type only and never stops it.
+   `conn_id` names the `.cast` file, so it must `fullmatch` `[A-Za-z0-9_.-]{1,128}`; anything else is dropped here. Lone surrogate code points in any free-text string are replaced with U+FFFD, since SQLite and the `.cast` files cannot encode them. An exception in the consumer is logged by type only and never stops it.
 5. **Assemble** (`pipeline/assembler.py`). The assembler demuxes by `conn_id` under one lock, so every state transition is serialized with chunk handling. See the lifecycle below.
 6. **Store.** Metadata goes to SQLite through `SessionRepository`, `ActivityStore` and `SearchStore`; the UI reads it back through those and the `store/timeline.py` query engine. Recording bytes go to the volume through `CastStore`. Recording content is never written to SQLite or to application logs.
 
@@ -112,10 +116,11 @@ Two tables track a connection. `connections.state` is the hidden lifecycle. `ses
 
 | `connections.state` | Meaning | Moves to |
 | --- | --- | --- |
-| `pending` | `Authenticated connection` seen. No session row. | `recording` on the first chunk; `api` on the first API audit; `error` when `last_seen_at` is older than `SESSION_MAX_IDLE_SECONDS` |
+| `pending` | `Authenticated connection` seen. No session row. | `recording` on the first chunk; `api` on the first API audit; `error` when `last_seen_at` is older than `SESSION_MAX_IDLE_SECONDS` (`empty` instead, for a `WEB_APP` connection) |
 | `recording` | A chunk arrived and a `sessions` row exists. `has_api` is also set if audits arrive on the same connection. | Stays |
-| `api` | API audits only. No session row, ever. Never expired. | `recording` if a chunk arrives later |
+| `api` | API audits only (kubectl or web). No session row, ever. Never expired. | `recording` if a chunk arrives later |
 | `error` | Expired while pending. A visible `error` session row was created. | `recording` on a late chunk (the row reverts to `provisional`); `api` on a late API audit (the phantom row is deleted) |
+| `empty` | A `WEB_APP` connection expired while pending, with no request and no chunk. Hidden: no session row is created and nothing in the UI shows it. | `api` on a late request (there is no row to delete) |
 
 | `sessions.status` | UI label | Meaning |
 | --- | --- | --- |
@@ -123,7 +128,7 @@ Two tables track a connection. `connections.state` is the hidden lifecycle. `ses
 | `complete` | complete | Sealed. The `.cast` is encrypted when encryption is enabled. |
 | `error` | error | Either a connection that never delivered a chunk or audit (backstop), or a sealed document with no valid asciicast v2 header (the raw `.cast` is kept for inspection). |
 
-A chunk that arrives before its start line creates a minimal `recording` connection, and a start line arriving later never leaves it `pending`. The expiry of pending connections uses SQLite wall-clock time (`last_seen_at`), so it holds across restarts. The silence timer for in-progress recordings uses a monotonic clock in memory.
+A chunk that arrives before its start line creates a minimal `recording` connection, and a start line arriving later never leaves it `pending`. A request that arrives before its start line creates a minimal `api` connection with no identity and no type; see [Web-app flow](#web-app-flow) for how such requests are stored. The expiry of pending connections uses SQLite wall-clock time (`last_seen_at`), so it holds across restarts. The silence timer for in-progress recordings uses a monotonic clock in memory.
 
 #### Sealed sessions and late chunks
 
@@ -156,6 +161,40 @@ Chunks are held per `conn_id` in a map keyed by `asciicast_sequence_num` and rea
 
 After each reassembly the session row is refreshed from the document: dimensions from the header, the header `user` as `shell_user` (secondary detail, never identity), `started_at` from the header timestamp only when the row has none, `duration_seconds` as the largest event offset, `ended_at` from the latest chunk timestamp, `chunk_count` and `size_bytes`. Identity is the envelope `user.username`; the system is the start line's `resource_address`. The `request_id` of the first k8s exec/attach chunk is stored on the session and is the only link to its API audit line.
 
+### Web-app flow
+
+A web app is a `WEB_APP` resource that the Gateway proxies at Layer 7. Its connection produces an `Authenticated connection` line and then one `API request completed` line per HTTP request, on the same `conn_id`. There are no recording chunks and no bodies. The request line has no resource fields, so everything depends on the join to the start line.
+
+```text
+Authenticated connection (resource_type WEB_APP, optional gwops object)
+   │  classify: normalize resource_type; read gwops only here, only listed keys
+   ▼
+connections row: state pending, resource_type, gwops snapshot (written once)
+   │  first request                                  │  nothing within SESSION_MAX_IDLE_SECONDS
+   ▼                                                 ▼
+state api  ──►  api_requests rows, api_kind 'web'    state empty (hidden; a later request → api)
+                 (URL: unmasked path + masked query, User-Agent only,
+                  TLS modes copied from the connection, no detection rules)
+```
+
+1. **Classify.** The start line yields a `SessionStart` with the normalized `resource_type` (upper-cased and validated; a present but unusable value becomes the internal `invalid` marker, which is routed as a non-Kubernetes type) and, for `WEB_APP` only, a `gwops` model validated key by key. A bad `gwops` object never changes the rest of the event; the connection is stored with TLS unknown and one warning carrying a reason code and the `conn_id`. Each request line yields an `ApiRequest` that carries both URL forms, the Kubernetes form and the web form, computed in `classify` so the raw URL never leaves it.
+2. **Choose the policy by connection.** The assembler reads the connection row first, then stores the request by the first matching row:
+
+   | Connection row when the request is processed | Stored as | URL | Headers kept | Kubernetes rules |
+   | --- | --- | --- | --- | --- |
+   | `resource_type` `KUBERNETES` | `kubectl` | Kubernetes form | `User-Agent`, `Kubectl-Command`, `Kubectl-Session` | yes |
+   | Start line processed, `resource_type` absent (including a pre-upgrade connection) | `kubectl` | Kubernetes form | same | yes |
+   | `WEB_APP`, or any other non-null type, including `invalid` | `web` | Web form | `User-Agent` only | no |
+   | No row, or only the minimal row an earlier request created (the request beat its start line) | `kubectl` (provisional) | Provisional form, the stricter of both | all four | yes |
+
+3. **Web form.** The path is normalized (fragment dropped, percent-decoded once, `//` collapsed, trailing `/` removed, an encoded `?` or `#` cuts the path and drops the query) and kept as is. There is no `proxy` truncation, no query allowlist and no path masking. Query keys that match `[A-Za-z0-9_.\[\]-]{1,64}` stay in plaintext; every value, every bare item and every other key is masked to at most a quarter of its characters (never more than four) plus its length, for example `token=ab…6(12)`. The result is capped at 4,096 characters. This stored form is what is displayed, searched with `q`, and exported. `pipeline/webmask.py` holds the masking and the provisional form.
+4. **Fail closed before the start line.** A request that arrives before its start line is stored in the **provisional form**: the Kubernetes path cut and key allowlist (`command=` is never stored) with the remaining values masked as above. When the start line then arrives, and only on its first processing, a non-`KUBERNETES` type converts that connection's earlier rows to `web`: the kubectl headers are cleared, the TLS modes are copied from the connection and the rows' `kube-api` findings are deleted. The URL is not re-derived (the raw URL is not kept), so a converted row keeps the provisional form. A `KUBERNETES` start line leaves the rows as stored. Under gwops the start line always comes first, so this path is for other shippers and for a lost start line.
+5. **First write wins.** `resource_type` and the `gwops` snapshot are written only on the first processing of a connection's start line, meaning no row exists or only the minimal row does. A repeated, redelivered or forged start line can neither change a stored type, fill a missing one or rewrite the snapshot, so it cannot turn a `KUBERNETES` connection into a `WEB_APP` one. At-least-once delivery from gwops replays identical bytes, so the rule changes nothing there.
+6. **Snapshot and TLS columns.** The validated `gwops` values (match, gateway id, app, managed flag, both TLS modes and ports) are stored on the `connections` row. The two modes are copied onto each of the connection's `api_requests` rows so the `scheme` and `upstream` filters need no join. `none`, `ambiguous`, an absent object and a rejected object all leave the modes NULL, which the UI shows as TLS unknown. The values are configured state at authentication, not proof of the negotiated mode.
+7. **Empty connections.** The idle sweep expires a `pending` connection with `resource_type = 'WEB_APP'` to `empty` instead of `error`, so a browser pre-connect or a refused `CONNECT` tunnel never becomes a visible failed connection. It logs `assembler.web_pending_hidden` (a count, debug level). SSH and Kubernetes behaviour is unchanged.
+8. **Detection scope.** `ApiRule.resource_types` defaults to `KUBERNETES`, and the assembler runs the API rules only on the Kubernetes-policy rows above. Web requests produce no findings. Kubectl discovery (`gc_is_discovery`) appears only in kubectl-source SQL, and the web visit grouping passes a predicate that is never true.
+9. **Views.** A web connection is one search row (`web_conns` source), keyed like a kubectl command by `c:<conn_id>` and placed by its first request. A **visit** (one user and one system, split by `KUBECTL_ACTIVITY_GAP_SECONDS` and `KUBECTL_ACTIVITY_MAX_SECONDS`) is computed on page view, as for kubectl activity, and nothing is cached. The visit view reads the request rows between its bounds and the connection snapshots of the connections involved.
+
 ---
 
 ## Data Model
@@ -176,22 +215,25 @@ Files are written atomically (temp file, then replace), as raw bytes so a Window
 
 | Table | Key | Holds |
 | --- | --- | --- |
-| `sessions` | `conn_id` | One row per recording, visible in the UI: `username` (envelope identity), `resource_address` (the system), `shell_user`, `started_at`, `ended_at`, `duration_seconds`, `width`, `height`, `chunk_count`, `size_bytes`, `cast_path`, `status` (`provisional`, `complete`, `error`), `finding_count` and `max_severity` (denormalized from `findings`), `request_id` (k8s exec/attach only), `sealed_terminal` (seal mode, see [Sealed sessions and late chunks](#sealed-sessions-and-late-chunks)), `created_at`, `updated_at` |
+| `sessions` | `conn_id` | One row per recording, visible in the UI: `username` (envelope identity), `resource_address` (the system), `shell_user`, `started_at`, `ended_at`, `duration_seconds`, `width`, `height`, `chunk_count`, `size_bytes`, `cast_path`, `status` (`provisional`, `complete`, `error`), `finding_count` and `max_severity` (denormalized from `findings`), `request_id` (k8s exec/attach only), `resource_type` (copied from the connection when the session is created), `sealed_terminal` (seal mode, see [Sealed sessions and late chunks](#sealed-sessions-and-late-chunks)), `created_at`, `updated_at` |
 | `findings` | `id` | Recording findings: `conn_id`, `rule_id`, `category`, `severity`, `label`, `offset_seconds`, `created_at`. No matched text. Deleted explicitly with the session; there is no foreign key. |
-| `connections` | `conn_id` | Hidden per-connection state: `user_id`, `username`, `resource_address`, `started_at`, `state` (`pending`, `recording`, `api`, `error`), `has_api`, `created_at`, `last_seen_at` |
-| `api_requests` | `request_id` | Allowlisted kubectl API metadata, deduplicated by `request_id`: `conn_id`, `resource_address` (joined from the connection), `user_key` (user id, else username), `user_id`, `username`, `requested_at`, `method`, `url` (sanitized), `status_code`, `outcome` (`completed` or `failed`), `kubectl_command`, `kubectl_session`, `user_agent`, `created_at` |
+| `connections` | `conn_id` | Hidden per-connection state: `user_id`, `username`, `resource_address`, `started_at`, `state` (`pending`, `recording`, `api`, `error`, `empty`), `has_api`, `created_at`, `last_seen_at`, `resource_type` (`KUBERNETES`, `SSH`, `WEB_APP`, and so on, normalized; first write wins). For `WEB_APP` connections, the `gwops` snapshot, written once: `gwops_match` (`exact`, `none` or `ambiguous`), `gwops_gateway_id`, `gwops_app`, `gwops_managed`, `downstream_tls` (`tls13` or `none`), `downstream_port`, `upstream_tls` (`verify_full`, `verify_ca`, `insecure` or `none`) and `upstream_port`. NULL means no object, a rejected one, `none` or `ambiguous`: TLS unknown. |
+| `api_requests` | `request_id` | Allowlisted request metadata for kubectl and web requests, deduplicated by `request_id`: `conn_id`, `resource_address` (joined from the connection), `user_key` (user id, else username), `user_id`, `username`, `requested_at`, `method`, `url` (sanitized: the Kubernetes form for kubectl rows, the web form for web rows), `status_code`, `outcome` (`completed` or `failed`), `kubectl_command` and `kubectl_session` (NULL on web rows), `user_agent`, `created_at`, `api_kind` (`kubectl` or `web`; defaults to `kubectl`), and, for web rows, the connection's `downstream_tls` and `upstream_tls` copied at insert so filters need no join |
 | `api_findings` | `id` | API rule findings: `request_id` (foreign key, `ON DELETE CASCADE`), `rule_id`, `category` (`kube-api`), `severity`, `label`, `created_at` |
 
-Indexes cover the lookups the UI and retention use (20 in total): `sessions` on `resource_address`, `started_at`, `status`, `request_id`, and the recording start expression (`idx_sessions_at`); `findings` on `conn_id`, `category` and `severity`; `connections` on `(state, last_seen_at)` and `created_at`; `api_requests` on system and time, system and user and time, `conn_id`, `kubectl_session` and `requested_at`, plus three added for search; `api_findings` on `request_id` and `severity`. The four search indexes are:
+Indexes cover the lookups the UI and retention use (20 in total): `sessions` on `resource_address`, `started_at`, `status`, `request_id`, and the recording start expression (`idx_sessions_at`); `findings` on `conn_id`, `category` and `severity`; `connections` on `(state, last_seen_at)` and `created_at`; `api_requests` on the request kind with time, user and system (all five lead with `api_kind`, or a system address then `api_kind`), plus `conn_id`, `kubectl_session` and the command key; `api_findings` on `request_id` and `severity`. The indexes that serve search are:
 
 | Index | On | Serves |
 | --- | --- | --- |
 | `idx_api_req_cmd` | the command key expression, `requested_at`, `request_id` | Grouping requests into a command: start-row probes, aggregates and the expanded request list |
-| `idx_api_req_user_time` | `username`, `requested_at`, `request_id` | The `username` arm of the `user` filter, in time order |
-| `idx_api_req_userid_time` | `user_id`, `requested_at`, `request_id` | The `user_id` arm of the `user` filter, in time order |
+| `idx_api_req_kind_time` | `api_kind`, `requested_at`, `request_id` | Newest-first scans and dashboard counts, per kind |
+| `idx_api_req_kind_user_time` | `api_kind`, `username`, `requested_at`, `request_id` | The `username` arm of the `user` filter, in time order |
+| `idx_api_req_kind_userid_time` | `api_kind`, `user_id`, `requested_at`, `request_id` | The `user_id` arm of the `user` filter, in time order |
+| `idx_api_req_sys_kind_time` | `resource_address`, `api_kind`, `requested_at`, `request_id` | The systems list, and scans that name a `system` |
+| `idx_api_req_sys_kind_user_time` | `resource_address`, `api_kind`, `user_key`, `requested_at`, `request_id` | Activity and visit reads |
 | `idx_sessions_at` | the recording start expression, `conn_id` | Newest-first keyset paging over `sessions` |
 
-The two expression indexes reproduce the SQL fragments in `db.py` exactly (`CMD_KEY_SQL`, `SESSION_AT_SQL`), which the query engine imports, so SQLite can match them. The command key is `s:<Kubectl-Session>` when the header is non-empty, else `c:<conn_id>`. The recording start is `strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(started_at, created_at))`. `idx_api_req_session` and `idx_api_req_conn` are probably redundant now; they are kept.
+The two expression indexes reproduce the SQL fragments in `db.py` exactly (`CMD_KEY_SQL`, `SESSION_AT_SQL`), which the query engine imports, so SQLite can match them. The command key is `s:<Kubectl-Session>` when the header is non-empty, else `c:<conn_id>`. The recording start is `strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(started_at, created_at))`. The five `api_kind`-led indexes replace the earlier time, user-time, user-id-time, system-time and system-user-time indexes on `api_requests`; the old ones are dropped on every boot (`RETIRED_INDEXES`, `DROP INDEX IF EXISTS`), which is idempotent, and the total stays at 20. Kind leads each index because a browser issues many requests per page, so web rows outnumber kubectl rows and an unprefixed scan would spend its budget walking the other kind's rows. `idx_api_req_session` is probably redundant now; it is kept. `idx_api_req_conn` is used by the web conversion, the cluster backfill and retention.
 
 Timestamps use three stored formats. `created_at`, `updated_at` and `last_seen_at` are SQLite UTC (`YYYY-MM-DD HH:MM:SS`). `sessions.started_at` is the Gateway's start timestamp or the asciicast header time, in ISO 8601. `api_requests.requested_at` is always `YYYY-MM-DDTHH:MM:SS.mmmZ`, and every bound compared against it is normalized to that format first. Search compares recordings and commands in one format by rendering the recording start through `SESSION_AT_SQL` into the `requested_at` shape.
 
@@ -199,7 +241,7 @@ A SQL function, `gc_is_discovery(method, url)`, is registered on every connectio
 
 ### Schema evolution
 
-The schema is created with `CREATE TABLE IF NOT EXISTS` on every boot. Columns added to `sessions` after its first release (`finding_count`, `max_severity`, `request_id`, `sealed_terminal`) are added with a guarded `ALTER`. The `sessions` indexes are created afterward, and only for columns that exist (`idx_sessions_at` needs `started_at`). The search indexes are plain `CREATE INDEX IF NOT EXISTS` and need no data migration, so `PRAGMA user_version` stays at 1; the first boot after an upgrade builds them in one pass per table. `PRAGMA user_version` gates one-time data migrations. Version 1 moves start-only `sessions` rows (no chunks, no `.cast` path, no size, status `provisional` or `error`) into `connections` as `error`, in one transaction. It skips any row whose `.cast` or `.txt.enc` is on disk, so a crash between a file write and its metadata update never orphans a recording.
+The schema is created with `CREATE TABLE IF NOT EXISTS` on every boot. Columns added after a table's first release (on `sessions`: `finding_count`, `max_severity`, `request_id`, `sealed_terminal`, `resource_type`; on `connections`: `resource_type` and the eight `gwops`/TLS columns; on `api_requests`: `api_kind`, `downstream_tls`, `upstream_tls`) are added with a guarded `ALTER`, from one per-table column list. The `sessions` indexes are created afterward, and only for columns that exist (`idx_sessions_at` needs `started_at`). The search indexes are plain `CREATE INDEX IF NOT EXISTS` and need no data migration, so `PRAGMA user_version` stays at 1; the first boot after an upgrade builds them in one pass per table. `api_kind` is `NOT NULL DEFAULT 'kubectl'`, so every row stored before 0.5.0 becomes a kubectl row without a data migration, and web traffic stored by an older release stays kubectl (see the [README upgrade note](README.md#upgrading-to-050-web-apps)). `PRAGMA user_version` gates one-time data migrations. Version 1 moves start-only `sessions` rows (no chunks, no `.cast` path, no size, status `provisional` or `error`) into `connections` as `error`, in one transaction. It skips any row whose `.cast` or `.txt.enc` is on disk, so a crash between a file write and its metadata update never orphans a recording.
 
 ---
 
@@ -213,7 +255,7 @@ The schema is created with `CREATE TABLE IF NOT EXISTS` on every boot. Columns a
 | --- | --- |
 | `store/timeline.py` | The engine. Holds `UnifiedQuery` (validated parameters), `Cursor`, the kind, source and sort constants, `session_kind(row)`, the two sources, `build_sources`, `run_timeline` and `TimelinePage`. It reads no request. |
 | `web/params.py` | `parse_unified_query(request)` returns a `ParsedSearch` (the `UnifiedQuery`, its resolved kinds and exclusions, the decoded cursor and the page size). It also holds the legacy-name aliases, `encode_cursor` / `decode_cursor`, and `search_url(**params)`, the only way the UI builds a `/search` link. |
-| `web/kinds.py` | The event-kind registry: `EventKind`, `KINDS` (`ssh`, `exec`, `failed`, `kubectl`), the six `TYPE_GROUPS` (`any`, `recordings`, `ssh`, `exec`, `failed`, `kubectl`), `TYPE_LABELS`, and `resolve_kinds(query)`. |
+| `web/kinds.py` | The event-kind registry: `EventKind`, `KINDS` (`ssh`, `exec`, `failed`, `kubectl`, `web`), the seven `TYPE_GROUPS` (`any`, `recordings`, `ssh`, `exec`, `failed`, `kubectl`, `web`), `TYPE_LABELS`, and `resolve_kinds(query)`. |
 
 The dependency runs one way: `web/params.py` and `web/kinds.py` import from `store/timeline.py`. The store never imports `gatorcast.web`, and a test enforces it. The route calls `resolve_kinds`, then passes the kinds and exclusions into `run_timeline`.
 
@@ -229,7 +271,7 @@ A `sessions` row's kind is derived when it is queried, never stored, and the SQL
 | `exec` | `request_id` is set, and not `failed` |
 | `ssh` | `request_id` is NULL, and not `failed` |
 
-`kubectl` comes from the second source, not from `sessions`.
+`kubectl` and `web` come from the API-commands source, not from `sessions`.
 
 `resolve_kinds` turns a `UnifiedQuery` into the kinds to query plus an exclusion map. A kind that cannot evaluate an active filter (or the chosen sort) is excluded, and the page shows a notice naming the filter. If every selected kind is excluded the result is empty and the response is still `200`.
 
@@ -238,7 +280,7 @@ A `sessions` row's kind is derived when it is queried, never stored, and the SQL
 Each source implements `page(query, kinds, after, limit)` and returns up to `limit + 1` items in its own order, whether it is exhausted, and a frontier when its work budget ran out.
 
 - **Sessions source** serves `ssh`, `exec` and `failed`. Without content search it is one indexed query. With `q` it reads the page's candidates in batches of 100, reads and matches their sidecars off the event loop, and stops at `SEARCH_REGEX_MAX_CANDIDATES` sidecars per page.
-- **API commands source** serves `kubectl`. A command is the set of `api_requests` rows that share a resource address, a user key and the command key, and its id is the `request_id` of its earliest row (its *start row*). Two modes find start rows. *Scan mode* walks `api_requests` newest first by keyset, examining at most 20,000 rows per page, and keeps the rows that are their command's start row and pass the command-level filters. *Flagged mode* starts from `api_findings` (small, since only rule hits are stored), so cost scales with the number of flagged commands rather than traffic, capped at 5,000 commands. `sort=risk` without a finding filter runs flagged commands first, then scan mode for unflagged ones; the cursor records the phase. A command belongs to the window that contains its first request, so it is never split across a page or a window edge.
+- **API commands source** serves `kubectl` and `web`. It is one class instantiated twice, once per `api_kind` (`api_commands` for kubectl with discovery logic on, `web_conns` for web with discovery off), and every query it runs is restricted to its own `api_kind`. A kubectl command is the set of `api_requests` rows that share a resource address, a user key and the command key, and its id is the `request_id` of its earliest row (its *start row*). A web row is the same grouping keyed by `c:<conn_id>`, because web rows never carry a `Kubectl-Session`, so it is one row per connection. Two modes find start rows. *Scan mode* walks `api_requests` newest first by keyset, examining at most 20,000 rows per page, and keeps the rows that are their command's start row and pass the command-level filters. *Flagged mode* starts from `api_findings` (small, since only rule hits are stored), so cost scales with the number of flagged commands rather than traffic, capped at 5,000 commands. `sort=risk` without a finding filter runs flagged commands first, then scan mode for unflagged ones; the cursor records the phase. A command or web connection belongs to the window that contains its first request, so it is never split across a page or a window edge. The web instance skips flagged mode (no rule can attach a finding to a web request), so a findings filter returns no web rows and the page says so. Its primary request is the first `POST`, `PUT`, `PATCH` or `DELETE`, else the first request. The `scheme` and `upstream` filters test the connection's copied TLS modes on its start row. Web text search is a case-insensitive substring over the stored URL, folding ASCII case only. `cmd` focus runs against both instances, so it finds whichever kind holds the request.
 
 `run_timeline` merges the sources:
 
@@ -248,7 +290,7 @@ Each source implements `page(query, kinds, after, limit)` and returns up to `lim
 4. Set each source's next position. If everything it returned was emitted and it is exhausted, the position is `done`. If everything was emitted but its budget ran out, the position is its frontier, so the scanned stretch is not scanned again. Otherwise the position is its last emitted item, or unchanged when none of its items were reached.
 5. Hydrate the page: findings for the page's recordings in one query, and for each command its aggregates, findings, linked recordings and first 200 requests. Aggregates cover all of a command's rows, so the count, end time and severity are right even when only 200 requests are listed.
 
-No item is emitted while another source could still produce one that sorts before it, and none is skipped or repeated across pages. When a source hits its budget the page can be short or empty, and the next link reads **Continue scanning ›**. Ties break by a fixed source rank (`sessions` 0, `api_commands` 1), then by id.
+No item is emitted while another source could still produce one that sorts before it, and none is skipped or repeated across pages. When a source hits its budget the page can be short or empty, and the next link reads **Continue scanning ›**. Ties break by a fixed source rank (`sessions` 0, `api_commands` 1, `web_conns` 2), then by id.
 
 ### Cursor
 
@@ -261,7 +303,7 @@ All are module constants except the sidecar count, which is a setting.
 | Limit | Value | Bounds |
 | --- | --- | --- |
 | Page size | 50 default (`SEARCH_PAGE_SIZE`), 200 maximum | Items per page |
-| `_API_SCAN_BUDGET` | 20,000 | API request rows examined per page in scan mode |
+| `_API_SCAN_BUDGET` | 20,000 | API request rows examined per page in scan mode, per source (kubectl and web each get the budget) |
 | `SEARCH_REGEX_MAX_CANDIDATES` | 2,000 | Sidecars read per page of a content search, and per CSV export |
 | `_FLAGGED_CMD_CAP` | 5,000 | Flagged commands considered per query, and per dashboard figure |
 | `_CMD_MAX_REQUESTS` | 200 | Requests listed per expanded command |
@@ -272,9 +314,9 @@ The index choice for each hot query is steered in SQL, and `tests/test_query_pla
 
 ### Dashboard and systems list
 
-`SearchStore.dashboard_stats` windows session figures on the recording start (the same expression search uses) and counts flagged kubectl commands, not requests: `api_flagged_commands`, `api_commands_by_severity` and `api_flagged_truncated`. `api_requests_total` counts requests and is the one figure that is not the length of its linked list. Over the 5,000-command cap the flagged figures are lower bounds.
+`SearchStore.dashboard_stats` windows session figures on the recording start (the same expression search uses) and counts flagged kubectl commands, not requests: `api_flagged_commands`, `api_commands_by_severity` and `api_flagged_truncated`. `api_requests_total` counts kubectl requests only and `web_requests_total` counts web requests, each windowed on `requested_at`; the flagged-command figures cover kubectl only, because web has no findings. Both totals count requests while their linked lists show commands and connections, so they are the figures that are not the length of their lists. Over the 5,000-command cap the flagged figures are lower bounds.
 
-`SessionRepository.list_systems` returns a `SystemSummary` per `resource_address` with `session_count`, `ssh_count`, `exec_count`, `api_request_count`, `last_session_at` and `last_api_at` (both in the `requested_at` format), and the findings summary. `last_seen` is the newer of the two timestamps and drives the sort. The SSH badge needs `ssh_count > 0`, and the Kubernetes badge needs `exec_count > 0` or API requests, so a start-only `error` row earns neither.
+`SessionRepository.list_systems` returns a `SystemSummary` per `resource_address` with `session_count`, `ssh_count`, `exec_count`, `kubectl_request_count`, `web_request_count`, `last_session_at` and `last_api_at` (both in the `requested_at` format), the TLS modes of the system's newest web request, and the findings summary. `last_seen` is the newer of the two timestamps and drives the sort. The SSH badge needs `ssh_count > 0`, the Kubernetes badge needs `exec_count > 0` or kubectl requests, and the Web badge needs web requests, so a start-only `error` row earns none and a web-only system never gets the Kubernetes badge.
 
 ---
 
@@ -352,9 +394,13 @@ Details:
 | Recording payloads | Never written to application logs, and neither are search sidecars or extracted text. Session recordings may contain on-screen secrets (terminals, typed tokens). Treat all stored `.cast` and `.txt.enc` files as secret-grade. |
 | Findings | Carry the rule label, category, severity and replay offset only, never the matched text. |
 | kubectl API metadata | Only `User-Agent`, `Kubectl-Command` and `Kubectl-Session` request headers are stored (first value, 256 characters at most). `Authorization`, cookies, other headers, response headers, `remote_addr` and panic content are never stored or logged. URLs are normalized and keep only allowlisted query keys with validated values; `command=` is always dropped, proxy URLs keep only their path up to `proxy`, and exec/attach URLs keep the path plus `container`, `stdin`, `stdout`, `stderr` and `tty`. See the [README](README.md#what-is-stored-and-what-is-never-stored). |
+| Web request metadata | Web requests store `User-Agent` as their only request header. `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, every other request header, all response headers, `remote_addr` and bodies are never read, stored or logged, whether or not the shipper strips them first. Client-sent identity headers such as `X-Twingate-User` are never read; identity is the envelope `user.username`. `Kubectl-*` headers are discarded on web rows. Every query value is masked, and query keys that fail the key pattern are masked too. **Paths are stored unmasked (accepted risk):** a token embedded in a path is kept in the plaintext database and shown in full in the UI, search, the visit view and CSV exports. The database is plaintext even with encryption enabled. See the [README](README.md#accepted-risks-and-limits). |
+| `gwops` object | Read only on `WEB_APP` start lines, and only the documented keys, each checked against a fixed type and value set. Every other key, and the object on any other line or type, is never read, stored or logged. A rejected object never changes how the connection is handled: it is stored with TLS unknown and one warning carrying a reason code and the `conn_id`. Pydantic validation errors are never logged because they embed input values. `gwops_app` is length- and character-checked and rendered only through autoescape. The TLS values are configured state, not proof of the negotiated mode. |
+| Web rendering | Stored URLs and app names are attacker-influenced text. They render only through autoescape, never with `\|safe`, never as a link target and never as a class name. Control, format and line-separator characters in displayed URLs are percent-encoded and stored text is bidi-isolated, so they cannot disguise an audit row. Scheme badges, upstream markers and the managed marker come from fixed maps keyed by the stored value. A stored mode outside the known vocabulary renders a fixed "Unrecognised TLS mode" marker. |
+| gwops hop and forged lines | gwops forwards request lines unredacted (credential header values, `Set-Cookie` values and full URLs with query strings) and spools them at rest. Gatorcast stores none of them, but they cross the wire on the way to `/ingest`, so use TLS between gwops and Gatorcast (terminate it at the reverse proxy). TLS labels are as trustworthy as the ingest channel: a holder of `INGEST_TOKEN`, or anyone who can reach the syslog port, can forge a start line with a `gwops` object. The Gateway also logs upstream TLS errors unescaped, so anyone who controls an upstream app's certificate can inject a standalone line that gwops may ship. First-write-wins `resource_type` and snapshot stop a repeated start line from retyping or relabelling an existing connection; forged request or recording lines for other `conn_id`s cannot be distinguished. The fix belongs in the Gateway or gwops. |
 | Activity page parameters | `user`, `from`, `to`, `activity_before` and `discovery` are validated strictly (400 on bad or repeated input) and used only as bound SQL parameters. |
-| Search parameters | All search SQL is parameterized; the only dynamic SQL text is fixed fragments and placeholder lists sized by validated counts. Parameters are validated strictly (`400` on an invalid, repeated or conflicting value), and a `4xx` never echoes the submitted value or logs it. The cursor is unsigned, length-capped and strictly decoded, and reaches SQL only as bound parameters. Content search decrypts only the sidecars of a metadata-narrowed candidate set, capped at `SEARCH_REGEX_MAX_CANDIDATES` per page. The regex filter never runs over API rows. |
-| Search output | Kind badges come from the registry, severity classes from fixed keys, and status classes from integers; no stored value becomes a class name. Stored URLs, `Kubectl-Command` values, usernames and system addresses render through autoescape. CSV cells starting with `=`, `+`, `-`, `@`, tab or carriage return get a leading `'`. Rows carry metadata and finding labels only, never recording text, and `User-Agent` appears only as the command-label product token. |
+| Search parameters | All search SQL is parameterized; the only dynamic SQL text is fixed fragments and placeholder lists sized by validated counts. Parameters are validated strictly (`400` on an invalid, repeated or conflicting value, including the enum-checked `scheme` and `upstream`), and a `4xx` never echoes the submitted value or logs it. The cursor is unsigned, length-capped and strictly decoded, and reaches SQL only as bound parameters. Content search decrypts only the sidecars of a metadata-narrowed candidate set, capped at `SEARCH_REGEX_MAX_CANDIDATES` per page. The regex filter never runs over API rows. |
+| Search output | Kind badges come from the registry, severity classes from fixed keys, and status classes from integers; no stored value becomes a class name. Stored URLs, `Kubectl-Command` values, usernames and system addresses render through autoescape. CSV cells starting with `=`, `+`, `-`, `@`, tab or carriage return get a leading `'`, including the free-text `gwops_app` and the `gwops_gateway_id`. Rows carry metadata and finding labels only, never recording text, and `User-Agent` appears only as the command-label product token. |
 | Syslog TCP | No per-message auth. The container listens on all interfaces, and the shipped `docker-compose.yml` publishes the port on `127.0.0.1` only. Caps: 128 concurrent connections (extras are closed at once), a 5-minute idle read timeout, a 16 MiB frame limit and a 10-digit length-prefix limit; a frame that breaks a limit closes its connection. TCP only; UDP is never accepted. `SYSLOG_TCP_PORT=0` disables the listener. |
 | Insecure defaults | At startup, Gatorcast logs a warning for each secret still equal to a placeholder default (`INGEST_TOKEN`, `UI_AUTH_PASSWORD`) and when `UI_AUTH_USERNAME` is still `admin`. The service still boots, but the warning is prominent. The value itself is never logged. |
 | Encryption config | If `ENCRYPTION_ENABLED=true` and the master key is missing or invalid, the app refuses to start (fail-closed). See [Encryption at Rest](#encryption-at-rest). |
@@ -385,7 +431,7 @@ Two independent policies run every 24 hours (the `retention_purge` job):
 
 Both policies are no-ops when disabled (`0`). Deleting a row and its `.cast` file is one logical operation; a missing file is tolerated and does not cause an error. A purged session's plaintext search sidecar and findings are removed alongside it.
 
-The age-based purge also deletes kubectl activity on the same `RETENTION_DAYS` cutoff, with no separate setting: `api_requests` (with their `api_findings`) and `connections`. An API request is purged when either its Gateway `requested_at` or the time Gatorcast stored it is past the cutoff; connections are purged on Gatorcast's own timestamps. The size cap counts `.cast` bytes only and never deletes API rows or connections.
+The age-based purge also deletes kubectl activity on the same `RETENTION_DAYS` cutoff, with no separate setting: `api_requests` (with their `api_findings`) and `connections`. An API request is purged when either its Gateway `requested_at` or the time Gatorcast stored it is past the cutoff; connections are purged on Gatorcast's own timestamps, by last activity: a connection is removed only when its last start line or newly stored request is past the cutoff and no stored request still refers to it, so a long-lived keep-alive connection survives while it is active. Web requests are purged like kubectl requests, and the `gwops` and TLS columns go with their rows. The size cap counts `.cast` bytes only and never deletes API rows or connections.
 
 To keep recordings indefinitely, set `RETENTION_DAYS=0` and `RETENTION_MAX_GB=0` (the default for size is already `0`). Both are listed under `environment:` in `docker-compose.yml`, so edit them there; a value in `.env` has no effect.
 
@@ -406,23 +452,24 @@ All code is under `src/gatorcast/`.
 | `ingest/http.py` | `POST /ingest` (bearer auth, JSON or line-delimited bodies) |
 | `ingest/syslog_tcp.py` | Syslog TCP listener: octet-counted and newline framing, connection and frame limits |
 | `ingest/normalize.py` | Raw line to JSON object: syslog header strip, collector unwrap |
-| `pipeline/classify.py` | Line to event; `conn_id` validation; allowlisted headers; stored-URL sanitizing |
-| `pipeline/urlnorm.py` | Shared URL normalization used by `classify` and `detect` |
+| `pipeline/classify.py` | Line to event; `conn_id` validation; allowlisted headers; both stored-URL forms; `resource_type` normalization; validation of the `gwops` object |
+| `pipeline/urlnorm.py` | Shared URL normalization used by `classify` and `detect`; replaces lone surrogates |
+| `pipeline/webmask.py` | Web URL storage form (unmasked path, masked query), the `mask_value` function, and the provisional form for requests that beat their start line |
 | `pipeline/assembler.py` | Per-`conn_id` buffers, connection lifecycle, reassembly, sealing, idle sweep, startup sweep |
 | `pipeline/extract.py` | ANSI-stripped plaintext and character-to-time offset index |
-| `pipeline/detect.py` | Built-in cast rules and kubectl API rules |
-| `pipeline/activity.py` | Pure kubectl grouping: discovery, activity sessions, commands |
+| `pipeline/detect.py` | Built-in cast rules and kubectl API rules (`ApiRule.resource_types` scopes the API rules to `KUBERNETES`) |
+| `pipeline/activity.py` | Pure grouping: discovery, activity sessions, commands, and (with discovery off) web visits |
 | `pipeline/backfill.py` | Startup pass that builds sidecars and findings for older sessions |
 | `pipeline/retention.py` | Age and size purge, including API rows and connections |
 | `store/sessions.py` | `sessions` repository (including the persisted seal mode), systems index query, retention queries |
 | `store/casts.py` | `.cast` and `.txt.enc` read, write, reopen, delete; encryption at the file layer |
 | `store/search.py` | `findings` store, dashboard stats. `SearchStore.search` and `SearchFilters` are deprecated and unused by the routes. |
-| `store/timeline.py` | The unified search engine: `UnifiedQuery`, `Cursor`, the sessions and API-command sources, `run_timeline`, keyset paging |
-| `store/activity.py` | `connections`, `api_requests`, `api_findings` |
-| `web/routes.py` | Dashboard, search, CSV export, systems, sessions, activity, cast stream |
+| `store/timeline.py` | The unified search engine: `UnifiedQuery`, `Cursor`, the sessions source and the API-command source (kubectl and web instances), `run_timeline`, keyset paging |
+| `store/activity.py` | `connections` (including the `gwops` snapshot), `api_requests`, `api_findings` |
+| `web/routes.py` | Dashboard, search, CSV export, systems, sessions, kubectl activity, web visits, cast stream |
 | `web/params.py` | Strict search parameter parsing (canonical and legacy names), cursor encoding, `search_url` |
 | `web/kinds.py` | Event-kind registry, type groups, filter and sort applicability (`resolve_kinds`) |
 | `web/auth.py` | HTTP Basic auth dependency for the UI routes |
-| `web/templates/`, `web/static/` | Jinja2 templates (shared `_macros.html` and `_rows.html` for search and dashboard rows, `_search_error.html` for HTMX `400`s); vendored asciinema player, HTMX, Alpine.js and CSS |
+| `web/templates/`, `web/static/` | Jinja2 templates (shared `_macros.html` and `_rows.html` for search and dashboard rows, `_search_error.html` for HTMX `400`s, `web_activity.html` for the visit view); vendored asciinema player, HTMX, Alpine.js and CSS |
 
-`scripts/seed_demo.py` is a throwaway helper that posts synthetic sessions for UI and detection testing. It is not part of the app.
+`scripts/seed_demo.py` is a throwaway helper that posts synthetic recordings and web-app traffic for UI and detection testing. It is not part of the app.

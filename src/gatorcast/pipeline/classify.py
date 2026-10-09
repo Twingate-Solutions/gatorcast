@@ -20,10 +20,14 @@ recognized. Both map onto the recording events (``RecordingChunk``,
     request header, response headers, ``remote_addr`` and ``panic`` are never
     read. Every stored URL is normalized and passes a query-key allowlist with
     validated values (``command`` and every other non-allowlisted key is dropped);
-    proxy URLs keep only their path up to ``proxy`` (see ``_store_url``). Other
-    ``gateway.audit`` messages are dropped.
+    proxy URLs keep only their path up to ``proxy`` (see ``_store_url``). The same
+    raw URL also yields ``url_web`` (web-app policy: normalized path, masked query
+    values; ``webmask.store_web_url``); the assembler picks the form by resource
+    type. Other ``gateway.audit`` messages are dropped.
   * **SessionStart** — ``logger == "gateway"`` with ``message == "Authenticated
-    connection"``. Carries the target ``resource_address`` and the user identity.
+    connection"``. Carries the target ``resource_address`` and the user identity;
+    on a ``WEB_APP`` start also the validated ``gwops`` object (``_classify_gwops``;
+    a rejected object leaves the rest of the event unchanged).
   * **SessionEnd** — a connection-close signal (Open Validation Item 2: shape not
     yet confirmed; idle timeout is the authoritative finalize path).
 
@@ -47,12 +51,21 @@ import base64
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl, urlencode
 
 from gatorcast.logging import get_logger
-from gatorcast.models import ApiRequest, RecordingChunk, SessionEnd, SessionStart
-from gatorcast.pipeline.urlnorm import normalize_url
+from gatorcast.models import (
+    RESOURCE_TYPE_INVALID,
+    ApiRequest,
+    GwopsWebApp,
+    RecordingChunk,
+    SessionEnd,
+    SessionStart,
+)
+from gatorcast.pipeline.urlnorm import normalize_url, replace_lone_surrogates
+from gatorcast.pipeline.webmask import store_web_url
 
 log = get_logger(__name__)
 
@@ -88,7 +101,24 @@ _API_COMPLETED_MESSAGE = "API request completed"
 _API_FAILED_MESSAGE = "API request failed"
 _API_MESSAGES = frozenset({_API_COMPLETED_MESSAGE, _API_FAILED_MESSAGE})
 
-_HTTP_METHOD = re.compile(r"[A-Z]{3,10}")
+# Accepts lowercase and WebDAV-style methods (WEBAPP_SPEC 5.6). The method is stored
+# as received; downstream comparisons (detection, discovery, mutating) upper-case it.
+_HTTP_METHOD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,23}")
+
+# Gateway ``resource_type`` after strip + upper-case (WEBAPP_SPEC 4.1).
+_RESOURCE_TYPE = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
+
+# --- gwops object on WEB_APP start lines (WEBAPP_SPEC 3.3) ---
+_GWOPS_SCHEMA = 1
+_GWOPS_MATCHES = frozenset({"exact", "none", "ambiguous"})
+_GWOPS_GATEWAY_ID = re.compile(r"[A-Za-z0-9+/=_-]{1,128}")
+_GWOPS_DOWNSTREAM_TLS = frozenset({"tls13", "none"})
+_GWOPS_UPSTREAM_TLS = frozenset({"verify_full", "verify_ca", "insecure", "none"})
+_GWOPS_MAX_APP = 200
+# Unicode categories refused in ``app``: controls, format (bidi etc.), line and
+# paragraph separators, surrogates (a lone one cannot be encoded for SQLite),
+# private use, and unassigned code points.
+_GWOPS_APP_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
 # Request headers that may be stored, keyed by lowercase wire name. Everything
 # else — Authorization above all, which is on every real request — is never read.
@@ -146,6 +176,30 @@ _NODE_PROXY_HEAD = re.compile(r".*/nodes/[^/]+/proxy", re.IGNORECASE)
 _NODE_PROXY_EXEC_SEGMENTS = frozenset({"exec", "run", "attach"})
 
 
+def _clean(value: str) -> str:
+    """Make a string safe to store: lone surrogates become U+FFFD.
+
+    Every free-text string ``classify`` passes on (identity, address, header values,
+    timestamps as received, recording text) goes through this, because a JSON
+    ``\\ud800`` escape decodes to a lone surrogate that SQLite and the cast files
+    cannot encode, which would drop the whole line. ``conn_id``, ``request_id``,
+    ``method``, ``resource_type``, normalized timestamps, ``gwops`` fields and URLs
+    are already constrained by a pattern or by ``normalize_url``.
+    """
+    return replace_lone_surrogates(value)
+
+
+def _clean_opt(value: object) -> str | None:
+    """``_clean`` for a field that must be a string: anything else becomes ``None``."""
+    return _clean(value) if isinstance(value, str) else None
+
+
+def _ts_field(obj: dict) -> object:
+    """Return ``obj['ts']`` as received (cleaned when it is a string)."""
+    value = obj.get("ts")
+    return _clean(value) if isinstance(value, str) else value
+
+
 def _safe_conn_id(obj: dict) -> str | None:
     """Return ``obj['conn_id']`` if present and safe to use as a filename, else None."""
     conn_id = obj.get("conn_id")
@@ -168,7 +222,7 @@ def _user_id(obj: dict) -> str | None:
     if isinstance(user, dict):
         user_id = user.get("id")
         if isinstance(user_id, str):
-            return user_id
+            return _clean(user_id)
     return None
 
 
@@ -217,7 +271,7 @@ def _allowlisted_headers(headers: object) -> dict[str, str]:
         if isinstance(value, list):
             value = value[0] if value else None
         if isinstance(value, str) and value:
-            picked[name] = value[:_MAX_HEADER_VALUE]
+            picked[name] = _clean(value[:_MAX_HEADER_VALUE])
     return picked
 
 
@@ -336,6 +390,7 @@ def _classify_api_request(obj: dict) -> ApiRequest | None:
         log.debug("classify.drop", reason="api_bad_url")
         return None
     url = _store_url(raw_url)[:_MAX_URL]
+    url_web = store_web_url(raw_url)
     requested_at = _norm_ts(obj.get("requested_at") or obj.get("ts"))
     if requested_at is None:
         log.debug("classify.drop", reason="api_bad_time")
@@ -362,11 +417,153 @@ def _classify_api_request(obj: dict) -> ApiRequest | None:
         username=_username(obj),
         method=method,
         url=url,
+        url_web=url_web,
         status_code=status_code,
         outcome="failed" if failed else "completed",
         kubectl_command=headers.get("kubectl-command"),
         kubectl_session=headers.get("kubectl-session"),
         user_agent=headers.get("user-agent"),
+    )
+
+
+def _resource_type(obj: dict, conn_id: str) -> str | None:
+    """Normalize ``obj['resource_type']``: strip, upper-case, validate.
+
+    Absent and present-but-invalid are different (CLAUDE.md rule 2):
+
+      * key missing, or JSON ``null`` (no information): ``None``, treated downstream
+        as a pre-upgrade Kubernetes connection;
+      * a string that fullmatches ``[A-Z][A-Z0-9_]{0,31}`` after strip and
+        upper-casing (``kubernetes`` becomes ``KUBERNETES``): that value;
+      * anything else (non-string, empty, wrong characters, too long):
+        :data:`~gatorcast.models.RESOURCE_TYPE_INVALID`, so the connection is
+        fail-closed (web URL form, no rules) rather than silently Kubernetes.
+        One ``classify.resource_type_rejected`` warning is logged with the reason
+        and ``conn_id`` only, never the value.
+
+    Never raises and never drops the line.
+    """
+    value = obj.get("resource_type")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        log.warning("classify.resource_type_rejected", reason="not_a_string", conn_id=conn_id)
+        return RESOURCE_TYPE_INVALID
+    normalized = value.strip().upper()
+    if _RESOURCE_TYPE.fullmatch(normalized) is None:
+        log.warning("classify.resource_type_rejected", reason="bad_value", conn_id=conn_id)
+        return RESOURCE_TYPE_INVALID
+    return normalized
+
+
+def _is_int(value: object) -> bool:
+    """True for a real int (``bool`` is excluded; JSON ``true`` must not pass as 1)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _gwops_app_ok(app: object) -> bool:
+    """Check 10: a non-empty string of at most 200 code points with no Cc/Cf/Zl/Zp/Cs/Co/Cn."""
+    if not isinstance(app, str) or not app or len(app) > _GWOPS_MAX_APP:
+        return False
+    return not any(
+        unicodedata.category(ch) in _GWOPS_APP_BAD_CATEGORIES for ch in app
+    )
+
+
+def _gwops_rejected(conn_id: str, reason: str) -> None:
+    """Log the one ``classify.gwops_rejected`` warning (reason and conn_id only)."""
+    log.warning("classify.gwops_rejected", reason=reason, conn_id=conn_id)
+
+
+def _classify_gwops(obj: dict, conn_id: str) -> GwopsWebApp | None:
+    """Parse the ``gwops`` object of a ``WEB_APP`` start line (WEBAPP_SPEC 3.3).
+
+    Call only for a start line whose normalized ``resource_type`` is ``WEB_APP``;
+    on every other type the key must not be read. The object is validated by hand
+    in the spec's order, and the frozen model is built from the validated
+    primitives: the raw object is never passed to Pydantic, so no validation error
+    (which would embed input values) can exist to be logged. Unknown keys are never
+    read. Nothing but a reason code and ``conn_id`` is ever logged.
+
+    Returns:
+        ``None`` when the key is absent (no log) or the object is rejected (one
+        ``classify.gwops_rejected`` warning). A bad ``app`` on an ``exact`` object
+        is not a rejection: the model is returned with ``app=None`` and one
+        ``classify.gwops_field_ignored`` warning.
+    """
+    if "gwops" not in obj:
+        return None
+    raw = obj["gwops"]
+    if not isinstance(raw, dict):
+        _gwops_rejected(conn_id, "gwops_not_object")
+        return None
+
+    schema = raw.get("schema")
+    if not _is_int(schema) or schema != _GWOPS_SCHEMA:
+        _gwops_rejected(conn_id, "gwops_bad_schema")
+        return None
+
+    match = raw.get("match")
+    if not isinstance(match, str) or match not in _GWOPS_MATCHES:
+        _gwops_rejected(conn_id, "gwops_bad_match")
+        return None
+
+    # A missing key and an explicit null differ: ``gateway_id`` must be present.
+    if "gateway_id" not in raw:
+        _gwops_rejected(conn_id, "gwops_bad_gateway_id")
+        return None
+    gateway_id = raw["gateway_id"]
+    if gateway_id is not None and not (
+        isinstance(gateway_id, str) and _GWOPS_GATEWAY_ID.fullmatch(gateway_id)
+    ):
+        _gwops_rejected(conn_id, "gwops_bad_gateway_id")
+        return None
+
+    if match != "exact":
+        # none / ambiguous: only match and gateway_id are read.
+        return GwopsWebApp(match=match, gateway_id=gateway_id)  # type: ignore[arg-type]
+
+    managed = raw.get("managed")
+    if not isinstance(managed, bool):
+        _gwops_rejected(conn_id, "gwops_bad_managed")
+        return None
+
+    downstream_tls = raw.get("downstream_tls")
+    upstream_tls = raw.get("upstream_tls")
+    if (
+        not isinstance(downstream_tls, str)
+        or downstream_tls not in _GWOPS_DOWNSTREAM_TLS
+        or not isinstance(upstream_tls, str)
+        or upstream_tls not in _GWOPS_UPSTREAM_TLS
+    ):
+        _gwops_rejected(conn_id, "gwops_bad_mode")
+        return None
+
+    downstream_port = raw.get("downstream_port")
+    upstream_port = raw.get("upstream_port")
+    if not (
+        _is_int(downstream_port)
+        and 1 <= downstream_port <= 65535
+        and _is_int(upstream_port)
+        and 1 <= upstream_port <= 65535
+    ):
+        _gwops_rejected(conn_id, "gwops_bad_port")
+        return None
+
+    app = raw.get("app")
+    if not _gwops_app_ok(app):
+        log.warning("classify.gwops_field_ignored", reason="gwops_bad_app", conn_id=conn_id)
+        app = None
+
+    return GwopsWebApp(
+        match="exact",
+        gateway_id=gateway_id,
+        app=app,
+        managed=managed,
+        downstream_tls=downstream_tls,  # type: ignore[arg-type]
+        downstream_port=downstream_port,
+        upstream_tls=upstream_tls,  # type: ignore[arg-type]
+        upstream_port=upstream_port,
     )
 
 
@@ -376,7 +573,7 @@ def _username(obj: dict) -> str | None:
     if isinstance(user, dict):
         username = user.get("username")
         if isinstance(username, str):
-            return username
+            return _clean(username)
     return None
 
 
@@ -412,8 +609,8 @@ def _envelope_chunk_text(obj: dict) -> str | None:
         log.debug("classify.envelope", reason="unknown_encoding")
     header = obj.get("header")
     if isinstance(header, dict):
-        return json.dumps(header, separators=(",", ":")) + "\n" + events
-    return events
+        return _clean(json.dumps(header, separators=(",", ":")) + "\n" + events)
+    return _clean(events)
 
 
 def _classify_envelope(obj: dict, etype: str) -> Event | None:
@@ -438,10 +635,10 @@ def _classify_envelope(obj: dict, etype: str) -> Event | None:
         started_at = obj.get("started_at")
         return SessionStart(
             conn_id=conn_id,
-            resource_address=address if isinstance(address, str) else None,
-            username=sso_user if isinstance(sso_user, str) else None,
-            shell_user=shell_user if isinstance(shell_user, str) else None,
-            ts=started_at if isinstance(started_at, str) else None,
+            resource_address=_clean_opt(address),
+            username=_clean_opt(sso_user),
+            shell_user=_clean_opt(shell_user),
+            ts=_clean_opt(started_at),
         )
 
     if etype == "recording_chunk":
@@ -509,9 +706,9 @@ def classify(obj: dict) -> Event | None:
         return RecordingChunk(
             conn_id=conn_id,
             seq=seq,
-            asciicast=asciicast,
+            asciicast=_clean(asciicast),
             username=_username(obj),
-            ts=obj.get("ts"),
+            ts=_ts_field(obj),
             is_final=obj.get("message") == _FINAL_RECORDING_MESSAGE,
             request_id=_safe_request_id(obj),
         )
@@ -532,21 +729,25 @@ def classify(obj: dict) -> Event | None:
             log.debug("classify.drop", reason="start_bad_conn_id")
             return None
         resource_address = obj.get("resource_address")
+        resource_type = _resource_type(obj, conn_id)
+        # The gwops key is read only on web-app starts; on any other type it is
+        # ignored entirely and nothing is logged about it.
+        gwops = _classify_gwops(obj, conn_id) if resource_type == "WEB_APP" else None
         return SessionStart(
             conn_id=conn_id,
-            resource_address=(
-                resource_address if isinstance(resource_address, str) else None
-            ),
+            resource_address=_clean_opt(resource_address),
             username=_username(obj),
             user_id=_user_id(obj),
-            ts=obj.get("ts"),
+            ts=_ts_field(obj),
+            resource_type=resource_type,
+            gwops=gwops,
         )
 
     # 3. Session end (close-event hook — see _CLOSE_MESSAGES note).
     if logger == "gateway" and obj.get("message") in _CLOSE_MESSAGES:
         conn_id = _safe_conn_id(obj)
         if conn_id is not None:
-            return SessionEnd(conn_id=conn_id, ts=obj.get("ts"))
+            return SessionEnd(conn_id=conn_id, ts=_ts_field(obj))
 
     # Everything else is operational noise (including other gateway.audit
     # messages) → drop.

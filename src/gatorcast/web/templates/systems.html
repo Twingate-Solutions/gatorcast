@@ -1,17 +1,23 @@
 {% extends "base.html" %}
 {#
-  Systems index (unified search spec §8.4): one row per distinct resource_address
-  (the target system) with Type badges, the session count and "Last session", the
-  kubectl API-request count and "Last API request", and the recording findings
-  summary. Clusters with only kubectl API activity (no recordings) are listed too.
-  Rows arrive sorted by the newer of the two timestamps.
+  Systems index (unified search spec §8.4; WEBAPP_SPEC §8.5): one row per distinct
+  resource_address (the target system) with Type badges, the session count and "Last
+  session", one Requests link per API kind present (kubectl, web) and "Last request",
+  and the recording findings summary. Clusters with only kubectl API activity and
+  web apps with only web requests (no recordings) are listed too. Rows arrive sorted
+  by the newer of the two timestamps.
+
+  Type badges come in display order from the route: SSH, Kubernetes, Web, then for a
+  web system the configured client-TLS badge and the upstream marker of its newest
+  web request. Each carries a fixed, static tooltip ("configured, not proof"). Labels,
+  classes and tooltips are fixed strings from maps in routes.py, never stored text.
 
   The NULL/unknown resource_address bucket is labelled "(unknown)" and linked
-  through a sentinel path segment so it remains browsable. The counts and "Last API
+  through a sentinel path segment so it remains browsable. The counts and "Last
   request" link into Search through route-built URLs (templates never build /search
-  URLs). Badge labels and classes are fixed strings from the route, never stored
-  text. All values are autoescaped by Jinja.
+  URLs). All values are autoescaped by Jinja.
 #}
+{% from "_macros.html" import badge, sev_cls %}
 {% block title %}Systems · Gatorcast{% endblock %}
 
 {% block content %}
@@ -26,8 +32,8 @@
             <th>Type</th>
             <th class="num">Sessions</th>
             <th>Last session</th>
-            <th class="num">API requests</th>
-            <th>Last API request</th>
+            <th class="num">{{ requests_heading }}</th>
+            <th>{{ last_request_heading }}</th>
             <th>Findings</th>
           </tr>
         </thead>
@@ -40,9 +46,9 @@
                 </a>
               </td>
               <td>
-                {% for badge in system.badges %}
-                  <span class="pill {{ badge.css_class }}">{{ badge.label }}</span>
-                {% endfor %}
+                <div class="badge-cluster">
+                  {% for b in system.badges %}{{ badge(b) }}{% endfor %}
+                </div>
               </td>
               <td class="num">
                 {% if system.summary.session_count %}
@@ -53,22 +59,26 @@
               </td>
               <td class="dim mono">{{ system.summary.last_session_at or "—" }}</td>
               <td class="num api-count">
-                {% if system.summary.api_request_count %}
-                  <a href="{{ system.api_url }}" aria-label="Search kubectl commands on {{ system.label }}">{{ system.summary.api_request_count }} <span aria-hidden="true">›</span></a>
+                {% for link in system.request_links %}
+                  <div><a href="{{ link.url }}" aria-label="Search {{ link.text }} requests on {{ system.label }}">{{ link.text }} <span aria-hidden="true">›</span></a></div>
                 {% else %}
                   <span class="dim">—</span>
-                {% endif %}
+                {% endfor %}
               </td>
               <td class="dim mono">
                 {% if system.summary.last_api_at %}
-                  <a href="{{ system.api_url }}">{{ system.summary.last_api_at }}</a>
+                  {% if system.last_request_url %}
+                    <a href="{{ system.last_request_url }}">{{ system.summary.last_api_at }}</a>
+                  {% else %}
+                    {{ system.summary.last_api_at }}
+                  {% endif %}
                 {% else %}
                   —
                 {% endif %}
               </td>
               <td>
                 {% if system.summary.finding_count and system.summary.max_severity %}
-                  <span class="sev sev-{{ system.summary.max_severity }}">{{ system.summary.max_severity }}</span>
+                  <span class="sev {{ sev_cls(system.summary.max_severity) }}">{{ system.summary.max_severity }}</span>
                   <span class="badge-count">{{ system.summary.finding_count }}</span>
                 {% else %}
                   <span class="dim">—</span>
@@ -80,6 +90,6 @@
       </table>
     </div>
   {% else %}
-    <p class="empty">No recordings or kubectl activity yet.</p>
+    <p class="empty">No recordings, kubectl activity, or web activity yet.</p>
   {% endif %}
 {% endblock %}

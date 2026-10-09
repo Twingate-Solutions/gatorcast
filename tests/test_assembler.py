@@ -155,6 +155,7 @@ def _api(
         username="user@example.com",
         method=method,
         url=url,
+        url_web=url,
         status_code=200,
         kubectl_command="kubectl get",
         kubectl_session="5e55e55e-0000-4000-8000-000000000001",
@@ -1301,7 +1302,7 @@ async def test_api_detection_error_still_stores_request(
     connection still advances; the failure is logged by exception type only."""
     import gatorcast.pipeline.assembler as assembler_module
 
-    def broken_detect(method: str, url: str):
+    def broken_detect(method: str, url: str, rules=None, *, resource_type=None):
         raise ValueError("rule engine failure")
 
     warnings: list[tuple[str, dict]] = []
@@ -1733,4 +1734,1879 @@ async def test_t11_seal_persists_mode(tmp_path: Path) -> None:
     await asm.finalize_idle()
     assert (await _row(db, "term"))["sealed_terminal"] == 1
     assert (await _row(db, "idle"))["sealed_terminal"] == 0
+    await db.close()
+
+
+# --- Session 11 (web apps): WEBAPP_SPEC 4.4 policy table, backfill, redelivery, empty lifecycle ---
+#
+# gwops/TLS snapshot behaviour is covered by T12; these tests only compare connection rows
+# wholesale where "unchanged state" is required.
+
+from tests.samples import (  # noqa: E402
+    WEBAPP_CONNS,
+    WEBAPP_EMPTY_CONN_KEYS,
+    WEBAPP_GWOPS_SENTINELS,
+    WEBAPP_NEVER_STORED_SENTINELS,
+    WEBAPP_SPOOF_SENTINELS,
+    webapp_batch,
+    webapp_lines,
+    webapp_lines_for,
+    webapp_redelivery,
+)
+from gatorcast.pipeline.classify import classify  # noqa: E402
+
+WEB_ADDR = "wiki.corp.internal"
+WEB_QUERY_SENTINEL = "SENTINEL_QUERY_UNIT_0123456789abcdef"
+WEB_USER = "PLACEHOLDER-KEY-ID-1"
+
+
+def _typed_start(conn_id: str, resource_type: str | None, address: str = WEB_ADDR) -> SessionStart:
+    """A start line with an explicit normalized ``resource_type``."""
+    return SessionStart(
+        conn_id=conn_id,
+        resource_address=address,
+        username="user@example.com",
+        user_id="VXNlcjox",
+        ts="2026-10-01T10:00:00.100Z",
+        resource_type=resource_type,
+    )
+
+
+def _web_api(
+    conn_id: str,
+    request_id: str,
+    *,
+    method: str = "GET",
+    path: str = "/report",
+    raw_query: str = f"month={WEB_QUERY_SENTINEL}",
+    masked_query: str = "month=SE…ef(36)",
+    at: str = "2026-10-01T10:00:01.200Z",
+    k8s_query: str = "",
+) -> ApiRequest:
+    """An ApiRequest as classify would emit it for a web-looking URL.
+
+    ``url`` is the Kubernetes form (query keys outside the allowlist dropped; ``k8s_query`` is
+    what survived, if anything), ``url_web`` the web form (query value masked). The raw sentinel
+    never appears in either.
+    """
+    return ApiRequest(
+        conn_id=conn_id,
+        request_id=request_id,
+        requested_at=at,
+        user_id="VXNlcjox",
+        username="user@example.com",
+        method=method,
+        url=f"{path}?{k8s_query}" if k8s_query else path,
+        url_web=f"{path}?{masked_query}" if masked_query else path,
+        status_code=200,
+        kubectl_command="kubectl get",
+        kubectl_session="5e55e55e-0000-4000-8000-000000000001",
+        user_agent="Mozilla/5.0 (test)",
+    )
+
+
+async def _feed(asm: Assembler, lines: list[str]) -> None:
+    """Classify NDJSON fixture lines and hand each resulting event to the assembler, in order."""
+    for line in lines:
+        event = classify(json.loads(line))
+        if event is not None:
+            await asm.handle(event)
+
+
+async def _req_rows(db: aiosqlite.Connection, where: str = "1=1", params: tuple = ()) -> list[aiosqlite.Row]:
+    cur = await db.execute(f"SELECT * FROM api_requests WHERE {where} ORDER BY requested_at, request_id", params)  # noqa: S608
+    rows = await cur.fetchall()
+    await cur.close()
+    return list(rows)
+
+
+async def _kinds(db: aiosqlite.Connection, conn_id: str) -> dict[str, str]:
+    """request_id -> api_kind for one connection."""
+    return {r["request_id"]: r["api_kind"] for r in await _req_rows(db, "conn_id = ?", (conn_id,))}
+
+
+async def _finding_rules(db: aiosqlite.Connection, request_id: str) -> list[str]:
+    cur = await db.execute("SELECT rule_id FROM api_findings WHERE request_id = ? ORDER BY id", (request_id,))
+    rules = [r[0] for r in await cur.fetchall()]
+    await cur.close()
+    return rules
+
+
+async def _db_text(db: aiosqlite.Connection) -> str:
+    """Every value of every table as one string (for sentinel greps)."""
+    cur = await db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    tables = [r[0] for r in await cur.fetchall()]
+    await cur.close()
+    parts: list[str] = []
+    for table in tables:
+        cur = await db.execute(f"SELECT * FROM {table}")  # noqa: S608 - names come from sqlite_master
+        parts.extend(" ".join(str(v) for v in row) for row in await cur.fetchall())
+        await cur.close()
+    return "\n".join(parts)
+
+
+async def _conn_state(db: aiosqlite.Connection, conn_id: str) -> dict:
+    """A connection row as a dict without the bump-on-every-touch ``last_seen_at``."""
+    row = dict(await _conn(db, conn_id))
+    row.pop("last_seen_at")
+    return row
+
+
+# --- policy table, one test per row ---
+
+
+@pytest.mark.asyncio
+async def test_policy_kubernetes_connection_stores_kubectl_form_and_runs_rules(tmp_path: Path) -> None:
+    """Row 1: KUBERNETES -> kubectl, Kubernetes URL, three headers, rules, TLS NULL."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-k8s"
+    await asm.handle(_typed_start(cid, "KUBERNETES", K8S_ADDR))
+    await asm.handle(
+        _web_api(cid, "r1", method="DELETE", path="/api/v1/namespaces/default/pods/x",
+                 raw_query="x=1", masked_query="x=…(1)")
+    )
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "kubectl"
+    assert row["url"] == "/api/v1/namespaces/default/pods/x"  # Kubernetes form, not url_web
+    assert row["kubectl_command"] == "kubectl get"
+    assert row["kubectl_session"] == "5e55e55e-0000-4000-8000-000000000001"
+    assert row["user_agent"] == "Mozilla/5.0 (test)"
+    assert row["downstream_tls"] is None and row["upstream_tls"] is None
+    assert row["resource_address"] == K8S_ADDR
+    assert await _finding_rules(db, "r1") == ["kube-delete"]
+    assert (await _conn(db, cid))["state"] == "api"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_processed_start_without_resource_type_is_kubectl(tmp_path: Path) -> None:
+    """Row 2: a start line that was processed (started_at set) but carries no type stays kubectl."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-untyped"
+    await asm.handle(_typed_start(cid, None, K8S_ADDR))
+    await asm.handle(_api(cid, "r1", method="DELETE", url="/api/v1/namespaces/default/pods/x"))
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "kubectl"
+    assert row["kubectl_command"] == "kubectl get"
+    assert await _finding_rules(db, "r1") == ["kube-delete"]  # None is treated as Kubernetes
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_web_app_connection_stores_web_form_without_rules_or_kubectl_headers(
+    tmp_path: Path,
+) -> None:
+    """Row 3: WEB_APP -> web, url_web, User-Agent only, no findings, even for kube-looking requests."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-web"
+    await asm.handle(_typed_start(cid, "WEB_APP"))
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path="/api/v1/namespaces/default/pods/x"))
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "web"
+    assert row["url"] == "/api/v1/namespaces/default/pods/x?month=SE…ef(36)"
+    assert row["kubectl_command"] is None and row["kubectl_session"] is None
+    assert row["user_agent"] == "Mozilla/5.0 (test)"
+    assert row["resource_address"] == WEB_ADDR
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    conn = await _conn(db, cid)
+    assert (conn["state"], conn["has_api"]) == ("api", 1)
+    assert await _row(db, cid) is None  # a web connection never gets a sessions row
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_type", ["SSH", "DATABASE"])
+async def test_policy_any_other_non_null_type_is_stored_as_web(tmp_path: Path, resource_type: str) -> None:
+    """Row 3 covers every non-null type that is not KUBERNETES."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-other"
+    await asm.handle(_typed_start(cid, resource_type))
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path="/items/42"))
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "web"
+    assert row["kubectl_command"] is None
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_request_with_no_connection_row_fails_closed(tmp_path: Path) -> None:
+    """Row 4 (none): provisional kubectl, Kubernetes URL form with masked values, three headers, rules.
+
+    The stored URL is ``store_provisional_url(event.url)``: the Kubernetes form (``url_web`` is not
+    used) with the web value masking on what survived the key allowlist.
+    """
+    asm, db = await _make(tmp_path)
+    cid = "pol-none"
+    await asm.handle(
+        _web_api(cid, "r1", method="DELETE", path="/api/v1/namespaces/default/pods/x", k8s_query="limit=500")
+    )
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "kubectl"
+    assert row["url"] == "/api/v1/namespaces/default/pods/x?limit=…(3)"  # allowlisted key, masked value
+    assert "month=" not in row["url"]  # the web-form query (url_web) is not used
+    assert WEB_QUERY_SENTINEL not in row["url"]
+    assert row["kubectl_command"] == "kubectl get"
+    assert row["kubectl_session"] == "5e55e55e-0000-4000-8000-000000000001"
+    assert row["resource_address"] is None
+    assert row["downstream_tls"] is None and row["upstream_tls"] is None
+    assert await _finding_rules(db, "r1") == ["kube-delete"]
+    conn = await _conn(db, cid)
+    assert (conn["state"], conn["has_api"]) == ("api", 1)
+    assert conn["started_at"] is None and conn["resource_type"] is None  # the minimal row
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_every_request_before_the_start_line_fails_closed_not_just_the_first(
+    tmp_path: Path,
+) -> None:
+    """Row 4 (minimal row): the second and later early requests meet the minimal row set_state
+    inserted for the first, and are stored under the same fail-closed policy."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-multi"
+    for i in range(4):
+        await asm.handle(
+            _web_api(cid, f"r{i}", path=f"/page/{i}", at=f"2026-10-01T10:00:0{i}.000Z")
+        )
+    rows = await _req_rows(db)
+    assert [r["api_kind"] for r in rows] == ["kubectl"] * 4
+    for i, row in enumerate(rows):
+        assert row["url"] == f"/page/{i}"  # Kubernetes form: the non-allowlisted query is dropped
+        assert row["kubectl_command"] == "kubectl get"  # provisional rows keep the kubectl headers
+    assert WEB_QUERY_SENTINEL not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_second_early_request_still_runs_rules_on_the_event_path(tmp_path: Path) -> None:
+    """The fail-closed branch keeps the Kubernetes rules for the minimal row too."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-multi-rules"
+    await asm.handle(_web_api(cid, "r1", path="/api/v1/namespaces"))
+    await asm.handle(_web_api(cid, "r2", method="DELETE", path="/api/v1/namespaces/default/pods/x"))
+    assert await _finding_rules(db, "r1") == []
+    assert await _finding_rules(db, "r2") == ["kube-delete"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_early_requests_then_web_start_convert_all_of_them_and_remove_findings(
+    tmp_path: Path,
+) -> None:
+    """A later WEB_APP start line converts every early request to web, drops their kube-api
+    findings and clears the kubectl headers; later requests are web from the start.
+
+    The provisional URL form is final: the early rows keep it (no query), while a request stored
+    after the start line gets the web form with its masked query.
+    """
+    asm, db = await _make(tmp_path)
+    cid = "pol-convert"
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path="/items/42", at="2026-10-01T10:00:01.000Z"))
+    await asm.handle(_web_api(cid, "r2", method="DELETE", path="/items/43", at="2026-10-01T10:00:02.000Z"))
+    await asm.handle(_web_api(cid, "r3", path="/home", at="2026-10-01T10:00:03.000Z"))
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 2  # provisional kube-delete x2
+    assert set((await _kinds(db, cid)).values()) == {"kubectl"}
+
+    await asm.handle(_typed_start(cid, "WEB_APP"))
+    await asm.handle(_web_api(cid, "r4", path="/later", at="2026-10-01T10:00:04.000Z"))
+
+    assert await _kinds(db, cid) == {"r1": "web", "r2": "web", "r3": "web", "r4": "web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    urls = {r["request_id"]: r["url"] for r in await _req_rows(db)}
+    assert urls == {
+        "r1": "/items/42",  # provisional form is final: not re-derived from url_web
+        "r2": "/items/43",
+        "r3": "/home",
+        "r4": "/later?month=SE…ef(36)",  # after the start line: the web form
+    }
+    for row in await _req_rows(db):
+        assert row["kubectl_command"] is None and row["kubectl_session"] is None
+        assert row["resource_address"] == WEB_ADDR
+    assert WEB_QUERY_SENTINEL not in await _db_text(db)
+    assert await _row(db, cid) is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_early_requests_then_kubernetes_start_stay_kubectl_with_masked_query(tmp_path: Path) -> None:
+    """A KUBERNETES start line after early requests leaves them kubectl, findings kept; their
+    URLs keep the provisional form (allowlisted keys, masked values): the recorded fidelity loss."""
+    asm, db = await _make(tmp_path)
+    cid = "pol-late-k8s"
+    await asm.handle(
+        _web_api(cid, "r1", method="DELETE", path="/api/v1/namespaces/default/pods/x", k8s_query="limit=500")
+    )
+    await asm.handle(_web_api(cid, "r2", path="/api/v1/namespaces"))
+    await asm.handle(_typed_start(cid, "KUBERNETES", K8S_ADDR))
+    assert await _kinds(db, cid) == {"r1": "kubectl", "r2": "kubectl"}
+    assert await _finding_rules(db, "r1") == ["kube-delete"]
+    urls = {r["request_id"]: r["url"] for r in await _req_rows(db)}
+    assert urls == {"r1": "/api/v1/namespaces/default/pods/x?limit=…(3)", "r2": "/api/v1/namespaces"}
+    for row in await _req_rows(db):
+        assert "month=" not in row["url"]
+        assert row["kubectl_command"] == "kubectl get"
+        assert row["resource_address"] == K8S_ADDR
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_start_line_leaves_a_provisional_kubectl_row_with_the_kubernetes_form_url(
+    tmp_path: Path,
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("no_start"))
+    row = (await _req_rows(db))[0]
+    assert row["api_kind"] == "kubectl"
+    assert row["url"] == "/orphan"  # ``q`` is not on the Kubernetes allowlist: dropped, not masked
+    assert "SENTINEL_QUERY_ORPHAN_1b15bb3e" not in row["url"]
+    assert "SENTINEL_QUERY_ORPHAN_1b15bb3e" not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fixture_late_web_start_converts_both_early_requests(tmp_path: Path) -> None:
+    """Fixture late_start_web: GET and DELETE arrive before the WEB_APP start line."""
+    asm, db = await _make(tmp_path)
+    lines = webapp_lines_for("late_start_web")
+    assert json.loads(lines[-1])["message"] == "Authenticated connection"  # the start line is last
+    await _feed(asm, lines[:-1])
+    assert set((await _kinds(db, "c0ffee00-0000-4000-8000-000000000077")).values()) == {"kubectl"}
+    assert await _finding_rules(db, "5eed0000-0000-4000-8000-000000000128") == ["kube-delete"]
+    assert "SENTINEL_QUERY_LATEWEB_9108c263" not in await _db_text(db)  # masked before the start line
+
+    await _feed(asm, lines[-1:])
+    assert set((await _kinds(db, "c0ffee00-0000-4000-8000-000000000077")).values()) == {"web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert "SENTINEL_QUERY_LATEWEB_9108c263" not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fixture_late_kubernetes_start_keeps_the_request_kubectl(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("late_start_k8s"))
+    kinds = await _kinds(db, "c0ffee00-0000-4000-8000-000000000078")
+    assert set(kinds.values()) == {"kubectl"}
+    text = await _db_text(db)
+    assert "SENTINEL_QUERY_LATEK8S_16f36460" not in text
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fixture_kubernetes_connection_keeps_kubectl_policy_and_findings(tmp_path: Path) -> None:
+    """Uppercase KUBERNETES (as the real gateway emits): kubectl rows, rules, non-allowlisted keys dropped."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("k8s_upper"))
+    cid = "c0ffee00-0000-4000-8000-000000000011"
+    assert set((await _kinds(db, cid)).values()) == {"kubectl"}
+    assert await _finding_rules(db, "5eed0000-0000-4000-8000-000000000062") == ["kube-delete"]
+    assert "kube-secrets" in await _finding_rules(db, "5eed0000-0000-4000-8000-000000000063")
+    assert "SENTINEL_QUERY_K8SDROP_216629bb" not in await _db_text(db)
+    assert (await _conn(db, cid))["resource_type"] == "KUBERNETES"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fixture_web_connection_with_kubernetes_look_alike_requests_gets_no_findings(
+    tmp_path: Path,
+) -> None:
+    """Nothing in web_rule_lookalikes (DELETE, /secrets, eviction, node PATCH, exec, proxy exec)
+    fires a Kubernetes rule once the connection is a WEB_APP."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("web_rule_lookalikes"))
+    kinds = await _kinds(db, "c0ffee00-0000-4000-8000-000000000004")
+    assert len(kinds) == 10 and set(kinds.values()) == {"web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert "SENTINEL_QUERY_EXECCMD_4e5706eb" not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_detection_disabled_is_irrelevant_for_web_rows_and_still_stores_them(tmp_path: Path) -> None:
+    asm, repo, casts, search, db = await _make_with_search(tmp_path, detection_enabled=False)
+    await asm.handle(_typed_start("web", "WEB_APP"))
+    await asm.handle(_web_api("web", "r1", method="DELETE", path="/items/42"))
+    assert await _kinds(db, "web") == {"r1": "web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+# --- identity ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["cap_spoofed_identity", "spoof_variants"])
+async def test_spoofed_identity_headers_never_change_the_stored_identity(tmp_path: Path, key: str) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(key))
+    rows = await _req_rows(db)
+    assert rows, key
+    for row in rows:
+        assert row["username"] == WEB_USER
+        assert row["user_id"] == WEB_USER
+        assert row["user_key"] == WEB_USER
+    conn = await _conn(db, WEBAPP_CONNS[key].conn_id)
+    assert conn["username"] == WEB_USER
+    text = await _db_text(db)
+    for sentinel in WEBAPP_SPOOF_SENTINELS:
+        assert sentinel not in text
+    await db.close()
+
+
+# --- redelivery (at-least-once) ---
+
+
+@pytest.mark.asyncio
+async def test_redelivered_web_batch_leaves_one_row_per_request_and_unchanged_state(tmp_path: Path) -> None:
+    """A byte-identical replay of start + requests changes no row, no finding and no connection state."""
+    asm, db = await _make(tmp_path)
+    redelivery = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, redelivery.originals)
+    before_conn = await _conn_state(db, cid)
+    before_rows = [tuple(r) for r in await _req_rows(db)]
+    assert len(before_rows) == 2 and before_conn["state"] == "api"
+
+    for _ in range(2):
+        await _feed(asm, redelivery.replay)
+
+    assert [tuple(r) for r in await _req_rows(db)] == before_rows
+    assert await _conn_state(db, cid) == before_conn
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests WHERE conn_id = ?", (cid,)) == 2
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert await _row(db, cid) is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_start_lines_with_different_or_no_objects_leave_the_connection_unchanged(
+    tmp_path: Path,
+) -> None:
+    """A later start line for the same conn_id (a different gwops object, then none) changes no
+    connection column other than last_seen_at, and converts nothing again."""
+    asm, db = await _make(tmp_path)
+    redelivery = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, redelivery.originals)
+    before_conn = await _conn_state(db, cid)
+    before_rows = [tuple(r) for r in await _req_rows(db)]
+
+    await _feed(asm, [redelivery.conflicting_start])
+    assert await _conn_state(db, cid) == before_conn
+    await _feed(asm, [redelivery.no_object_start])
+    assert await _conn_state(db, cid) == before_conn
+    assert [tuple(r) for r in await _req_rows(db)] == before_rows
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_start_with_an_object_does_not_change_a_connection_first_seen_without_one(
+    tmp_path: Path,
+) -> None:
+    asm, db = await _make(tmp_path)
+    first_start, request, repeated_start = webapp_redelivery().noobj_then_obj
+    cid = WEBAPP_CONNS["redeliver_noobj_then_obj"].conn_id
+    await _feed(asm, [first_start, request])
+    before_conn = await _conn_state(db, cid)
+    before_rows = [tuple(r) for r in await _req_rows(db)]
+
+    await _feed(asm, [repeated_start])
+
+    assert await _conn_state(db, cid) == before_conn
+    assert [tuple(r) for r in await _req_rows(db)] == before_rows
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_kubernetes_batch_duplicates_neither_requests_nor_findings(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    lines = webapp_lines_for("k8s_upper")
+    await _feed(asm, lines)
+    requests = await _count(db, "SELECT COUNT(*) FROM api_requests")
+    findings = await _count(db, "SELECT COUNT(*) FROM api_findings")
+    cid = WEBAPP_CONNS["k8s_upper"].conn_id
+    before_conn = await _conn_state(db, cid)
+    assert requests == 4 and findings >= 2
+
+    await _feed(asm, lines)
+    await _feed(asm, lines)
+
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == requests
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == findings
+    assert await _conn_state(db, cid) == before_conn
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_early_requests_after_conversion_do_not_resurrect_findings(tmp_path: Path) -> None:
+    """Early requests, the WEB_APP start line, then the early requests redelivered: still web,
+    still no findings, still one row each."""
+    asm, db = await _make(tmp_path)
+    early = [_web_api("rd", "r1", method="DELETE", path="/items/1"), _web_api("rd", "r2", path="/home")]
+    for event in early:
+        await asm.handle(event)
+    await asm.handle(_typed_start("rd", "WEB_APP"))
+    assert await _kinds(db, "rd") == {"r1": "web", "r2": "web"}
+
+    for event in early:
+        await asm.handle(event)
+
+    assert await _kinds(db, "rd") == {"r1": "web", "r2": "web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+# --- lifecycle: empty WEB_APP connections ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", WEBAPP_EMPTY_CONN_KEYS["WEB_APP"])
+async def test_idle_web_app_connection_expires_to_empty_with_no_session_row(tmp_path: Path, key: str) -> None:
+    """A WEB_APP connection that delivers nothing (or whose every request was dropped by the
+    method gate) becomes the hidden `empty` state, never an error session."""
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = WEBAPP_CONNS[key].conn_id
+    await _feed(asm, webapp_lines_for(key))
+    assert (await _conn(db, cid))["state"] == "pending"
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests") == 0
+
+    await asm.finalize_idle()  # not yet idle
+    assert (await _conn(db, cid))["state"] == "pending"
+
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _conn(db, cid))["state"] == "empty"
+    assert await _row(db, cid) is None
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+
+    await asm.finalize_idle()  # idempotent
+    assert (await _conn(db, cid))["state"] == "empty"
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "resource_type"),
+    [(k, t) for t in ("SSH", "KUBERNETES") for k in WEBAPP_EMPTY_CONN_KEYS[t]],
+)
+async def test_idle_ssh_and_kubernetes_connections_still_become_visible_errors(
+    tmp_path: Path, key: str, resource_type: str
+) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = WEBAPP_CONNS[key].conn_id
+    await _feed(asm, webapp_lines_for(key))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row is not None and row["status"] == "error"
+    assert row["resource_type"] == resource_type
+    assert (await _conn(db, cid))["state"] == "error"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_one_sweep_hides_web_and_surfaces_ssh_and_kubernetes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    keys = ("cap_empty_a", "cap_empty_b", "ssh_upper", "k8s_empty")
+    await _feed(asm, webapp_batch(*keys))
+    for key in keys:
+        await _age_connection(db, WEBAPP_CONNS[key].conn_id)
+    await asm.finalize_idle()
+    states = {k: (await _conn(db, WEBAPP_CONNS[k].conn_id))["state"] for k in keys}
+    assert states == {"cap_empty_a": "empty", "cap_empty_b": "empty", "ssh_upper": "error", "k8s_empty": "error"}
+    cur = await db.execute("SELECT conn_id FROM sessions ORDER BY conn_id")
+    assert [r[0] for r in await cur.fetchall()] == sorted(
+        WEBAPP_CONNS[k].conn_id for k in ("ssh_upper", "k8s_empty")
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_request_after_empty_moves_the_connection_to_api_without_a_session(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = WEBAPP_CONNS["cap_empty_a"].conn_id
+    await _feed(asm, webapp_lines_for("cap_empty_a"))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _conn(db, cid))["state"] == "empty"
+
+    await asm.handle(_web_api(cid, "late-1", path="/long-idle-keepalive"))
+
+    conn = await _conn(db, cid)
+    assert (conn["state"], conn["has_api"]) == ("api", 1)
+    assert await _kinds(db, cid) == {"late-1": "web"}
+    assert await _row(db, cid) is None
+    await _age_connection(db, cid)
+    await asm.finalize_idle()  # api connections are never expired
+    assert (await _conn(db, cid))["state"] == "api"
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_web_app_connection_with_requests_never_expires_and_never_gets_a_session(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    await _feed(asm, webapp_lines_for("hygiene_requests"))
+    cid = WEBAPP_CONNS["hygiene_requests"].conn_id
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _conn(db, cid))["state"] == "api"
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_restart_still_expires_a_pending_web_app_connection_to_empty(tmp_path: Path) -> None:
+    """Pending state lives in SQLite: a fresh Assembler over the same DB still hides an idle web app."""
+    asm, db = await _make(tmp_path)
+    cid = WEBAPP_CONNS["cap_empty_b"].conn_id
+    await _feed(asm, webapp_lines_for("cap_empty_b"))
+    asm2 = Assembler(
+        repo=SessionRepository(db),
+        casts=CastStore(tmp_path / "casts"),
+        idle_timeout_seconds=120,
+        clock=lambda: 0.0,
+        activity=ActivityStore(db),
+    )
+    await asm2.sweep_startup()
+    await _age_connection(db, cid)
+    await asm2.finalize_idle()
+    assert (await _conn(db, cid))["state"] == "empty"
+    assert await _row(db, cid) is None
+    await db.close()
+
+
+# --- resource_type reaches the session row ---
+
+
+@pytest.mark.asyncio
+async def test_promoted_recording_session_carries_the_connection_resource_type(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "ssh-rec"
+    await asm.handle(_typed_start(cid, "SSH", "10.0.0.5"))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, username="user@example.com"))
+    row = await _row(db, cid)
+    assert row is not None and row["resource_type"] == "SSH"
+    assert (await _conn(db, cid))["state"] == "recording"
+    await db.close()
+
+
+# --- whole-fixture ingestion ---
+
+
+@pytest.mark.asyncio
+async def test_whole_web_fixture_never_creates_a_session_or_leaks_a_never_stored_sentinel(
+    tmp_path: Path,
+) -> None:
+    """Every fixture line through classify + assembler in file order: web traffic stays out of
+    `sessions`, and no credential, spoof, query-value or panic sentinel reaches any table."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines())
+
+    assert await _count(db, "SELECT COUNT(*) FROM sessions") == 0
+    assert await _count(db, "SELECT COUNT(*) FROM api_requests WHERE api_kind = 'web'") > 100
+    # Only the deliberately provisional connections remain kubectl among the non-Kubernetes ones.
+    text = await _db_text(db)
+    for sentinel in WEBAPP_NEVER_STORED_SENTINELS:
+        if sentinel in WEBAPP_GWOPS_SENTINELS:
+            continue  # accepted gwops apps are stored by design; covered by the T12 tests
+        assert sentinel not in text, sentinel
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_each_request_id_in_the_whole_fixture_is_stored_at_most_once(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines())
+    cur = await db.execute("SELECT request_id, COUNT(*) FROM api_requests GROUP BY request_id HAVING COUNT(*) > 1")
+    assert await cur.fetchall() == []
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fixture_methods_the_gate_accepts_are_stored_as_received(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("hygiene_requests"))
+    methods = {r["method"] for r in await _req_rows(db)}
+    assert {"delete", "MKWORKSPACE", "Propfind", "GET", "POST"} <= methods
+    await db.close()
+
+
+# --- stored forms: worked examples and header variants (WEBAPP_SPEC 5.5, 5.7) ---
+
+
+@pytest.mark.asyncio
+async def test_every_worked_example_is_stored_exactly_as_listed(tmp_path: Path) -> None:
+    """The WEBAPP_SPEC 5.7 table, end to end through classify, the assembler and SQLite."""
+    from tests.samples import WEBAPP_REQUESTS, WEBAPP_WORKED_EXAMPLES
+
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("worked_examples"))
+    stored = {r["request_id"]: r["url"] for r in await _req_rows(db)}
+    for key, _raw, expected in WEBAPP_WORKED_EXAMPLES:
+        assert stored[WEBAPP_REQUESTS[key].request_id] == expected, key
+    assert len(stored) == len(WEBAPP_WORKED_EXAMPLES)
+    assert set((await _kinds(db, WEBAPP_CONNS["worked_examples"].conn_id)).values()) == {"web"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group", ["login", "orders"])
+async def test_credential_header_variants_store_identical_rows(tmp_path: Path, group: str) -> None:
+    """Values present, placeholdered and names removed give the same stored row (ids and time aside),
+    and no credential sentinel is stored for any of them."""
+    from tests.samples import WEBAPP_HEADER_VARIANTS, WEBAPP_HEADER_SENTINELS, WEBAPP_REQUESTS
+
+    asm, db = await _make(tmp_path)
+    variants = WEBAPP_HEADER_VARIANTS[group]
+    for form in ("present", "placeholder", "removed"):
+        await _feed(asm, webapp_lines_for(WEBAPP_REQUESTS[variants[form]].conn))
+
+    rows = []
+    for form in ("present", "placeholder", "removed"):
+        row = dict((await _req_rows(db, "request_id = ?", (WEBAPP_REQUESTS[variants[form]].request_id,)))[0])
+        for volatile in ("request_id", "conn_id", "requested_at", "created_at"):
+            row.pop(volatile)
+        rows.append(row)
+    assert rows[0] == rows[1] == rows[2]
+    assert rows[0]["api_kind"] == "web" and rows[0]["user_agent"]
+    text = await _db_text(db)
+    for sentinel in WEBAPP_HEADER_SENTINELS:
+        assert sentinel not in text
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unusable_allowlisted_headers_never_drop_a_row_or_fail_the_batch(tmp_path: Path) -> None:
+    from tests.samples import WEBAPP_REQUESTS
+
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("hdr_tolerance"))
+    rows = {r["request_id"]: r for r in await _req_rows(db)}
+    for key in (
+        "ht_ua_missing", "ht_ua_empty_list", "ht_ua_int_first", "ht_ua_int_value",
+        "ht_ua_empty_string", "ht_no_request_key", "ht_headers_not_dict",
+    ):
+        assert rows[WEBAPP_REQUESTS[key].request_id]["user_agent"] is None, key
+    for key in ("ht_ua_placeholder", "ht_ua_plain_string"):
+        assert rows[WEBAPP_REQUESTS[key].request_id]["user_agent"], key
+    assert len(rows) == 9
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_requests_without_kubectl_headers_are_stored_with_null_columns(
+    tmp_path: Path,
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("k8s_hdr_tolerance"))
+    rows = await _req_rows(db)
+    assert len(rows) == 2
+    assert all(r["api_kind"] == "kubectl" for r in rows)
+    assert all(r["kubectl_command"] is None and r["kubectl_session"] is None for r in rows)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_web_request_stores_only_the_user_agent_header(tmp_path: Path) -> None:
+    """Credential and extra headers on a web line are never read, so nothing but the
+    User-Agent (and no kubectl header) can be stored."""
+    from tests.samples import WEBAPP_REQUESTS
+
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("hygiene_requests"))
+    row = (await _req_rows(db, "request_id = ?", (WEBAPP_REQUESTS["hy_credential_headers"].request_id,)))[0]
+    assert row["api_kind"] == "web"
+    assert row["kubectl_command"] is None and row["kubectl_session"] is None
+    assert row["user_agent"] is None or len(row["user_agent"]) <= 256
+    await db.close()
+
+
+# --- Session 11 T12: gwops/TLS snapshot through classify + assembler (WEBAPP_SPEC 3.3, 4.4, 4.5) ---
+
+from gatorcast.models import GwopsWebApp  # noqa: E402
+from tests.samples import WEBAPP_GWOPS_CASES, WEBAPP_REQUESTS  # noqa: E402
+
+SNAP_COLS = (
+    "gwops_match", "gwops_gateway_id", "gwops_app", "gwops_managed",
+    "downstream_tls", "downstream_port", "upstream_tls", "upstream_port",
+)
+NO_SNAPSHOT = dict.fromkeys(SNAP_COLS)
+GW_ID = "R2F0ZXdheToxMjk0"
+
+_GW_EXACT = [c for c in WEBAPP_GWOPS_CASES if c.outcome == "accepted" and c.expected["match"] == "exact"]
+_GW_NO_APP_MATCH = [
+    c for c in WEBAPP_GWOPS_CASES if c.outcome == "accepted" and c.expected["match"] != "exact"
+]
+_GW_APP_IGNORED = [c for c in WEBAPP_GWOPS_CASES if c.outcome == "accepted_app_ignored"]
+_GW_NO_SNAPSHOT = [c for c in WEBAPP_GWOPS_CASES if c.outcome in ("rejected", "absent")]
+_GW_NOT_READ = [c for c in WEBAPP_GWOPS_CASES if c.outcome == "not_read"]
+
+
+def _columns_for(expected: dict | None) -> dict:
+    """The eight stored column values for a parsed object (WEBAPP_SPEC 3.3 "What is stored")."""
+    if expected is None:
+        return dict(NO_SNAPSHOT)
+    cols = {**NO_SNAPSHOT, "gwops_match": expected["match"], "gwops_gateway_id": expected["gateway_id"]}
+    if expected["match"] == "exact":
+        cols.update(
+            gwops_app=expected["app"],
+            gwops_managed=int(expected["managed"]),
+            downstream_tls=expected["downstream_tls"],
+            downstream_port=expected["downstream_port"],
+            upstream_tls=expected["upstream_tls"],
+            upstream_port=expected["upstream_port"],
+        )
+    return cols
+
+
+def _modes_for(expected: dict | None) -> tuple[str | None, str | None]:
+    """The (downstream, upstream) modes a request on that connection must carry."""
+    if expected is None or expected["match"] != "exact":
+        return (None, None)
+    return (expected["downstream_tls"], expected["upstream_tls"])
+
+
+async def _snapshot(db: aiosqlite.Connection, conn_id: str) -> dict:
+    """The eight raw snapshot columns of one connection."""
+    row = await _conn(db, conn_id)
+    assert row is not None, conn_id
+    return {col: row[col] for col in SNAP_COLS}
+
+
+async def _request_tls(db: aiosqlite.Connection, conn_id: str) -> dict[str, tuple[str | None, str | None]]:
+    """request_id -> (downstream_tls, upstream_tls) for every request of one connection."""
+    return {
+        r["request_id"]: (r["downstream_tls"], r["upstream_tls"])
+        for r in await _req_rows(db, "conn_id = ?", (conn_id,))
+    }
+
+
+def _gw_start(conn_id: str, gwops: GwopsWebApp | None, resource_type: str | None = "WEB_APP") -> SessionStart:
+    """A start line event carrying an already-validated ``gwops`` object."""
+    return _typed_start(conn_id, resource_type).model_copy(update={"gwops": gwops})
+
+
+def _gw_exact(**overrides: object) -> GwopsWebApp:
+    """A valid exact object: tls13 downstream, verify_full upstream."""
+    fields: dict = {
+        "match": "exact", "gateway_id": GW_ID, "app": "unit-app", "managed": True,
+        "downstream_tls": "tls13", "downstream_port": 443,
+        "upstream_tls": "verify_full", "upstream_port": 8443,
+    }
+    fields.update(overrides)
+    return GwopsWebApp(**fields)
+
+
+_GW_EXACT_COLUMNS = {
+    "gwops_match": "exact", "gwops_gateway_id": GW_ID, "gwops_app": "unit-app", "gwops_managed": 1,
+    "downstream_tls": "tls13", "downstream_port": 443, "upstream_tls": "verify_full", "upstream_port": 8443,
+}
+
+
+# --- valid exact object: all eight columns, both modes on every request ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _GW_EXACT, ids=lambda c: c.key)
+async def test_exact_gwops_stores_all_eight_columns_and_the_request_carries_both_modes(
+    tmp_path: Path, case
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(case.key))
+    cid = WEBAPP_CONNS[case.key].conn_id
+
+    assert await _snapshot(db, cid) == _columns_for(case.expected)
+    assert (await _conn(db, cid))["resource_type"] == "WEB_APP"
+    tls = await _request_tls(db, cid)
+    assert len(tls) == 1
+    assert list(tls.values()) == [(case.expected["downstream_tls"], case.expected["upstream_tls"])]
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _GW_APP_IGNORED, ids=lambda c: c.key)
+async def test_bad_app_is_stored_null_with_the_other_seven_columns_and_both_modes(
+    tmp_path: Path, case
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(case.key))
+    cid = WEBAPP_CONNS[case.key].conn_id
+
+    snapshot = await _snapshot(db, cid)
+    assert snapshot["gwops_app"] is None
+    assert snapshot == _columns_for(case.expected)
+    assert all(snapshot[c] is not None for c in SNAP_COLS if c != "gwops_app")
+    assert list((await _request_tls(db, cid)).values()) == [("tls13", "verify_full")]
+    text = await _db_text(db)
+    assert not any(s in text for s in WEBAPP_GWOPS_SENTINELS)  # no gwops sentinel was stored
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_gwops_with_gateway_id_null_stores_the_rest(tmp_path: Path) -> None:
+    """gwops Mode B before its first reconcile: gateway id NULL, everything else stored."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("gw_gateway_id_null"))
+    cid = WEBAPP_CONNS["gw_gateway_id_null"].conn_id
+    snapshot = await _snapshot(db, cid)
+    assert snapshot["gwops_gateway_id"] is None
+    assert snapshot["gwops_match"] == "exact" and snapshot["gwops_app"] == "mode-b-app"
+    assert list((await _request_tls(db, cid)).values()) == [("tls13", "verify_full")]
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "modes"),
+    [
+        ("gw_exact_upstream_none", ("none", "none")),
+        ("gw_exact_upstream_verify_ca", ("tls13", "verify_ca")),
+        ("gw_exact_upstream_verify_full", ("tls13", "verify_full")),
+        ("gw_exact_upstream_insecure", ("tls13", "insecure")),
+        ("gw_exact_downstream_tls13", ("tls13", "verify_full")),
+        ("gw_exact_downstream_none", ("none", "none")),
+    ],
+)
+async def test_each_mode_combination_reaches_the_connection_and_its_request(
+    tmp_path: Path, key: str, modes: tuple[str, str]
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(key))
+    cid = WEBAPP_CONNS[key].conn_id
+    conn = await _conn(db, cid)
+    assert (conn["downstream_tls"], conn["upstream_tls"]) == modes
+    assert list((await _request_tls(db, cid)).values()) == [modes]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_every_request_on_a_connection_carries_the_same_two_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "multi"
+    await asm.handle(_gw_start(cid, _gw_exact(downstream_tls="none", upstream_tls="verify_ca")))
+    for i in range(4):
+        await asm.handle(_web_api(cid, f"r{i}", path=f"/p/{i}", at=f"2026-10-01T10:00:0{i}.000Z"))
+    assert await _request_tls(db, cid) == {f"r{i}": ("none", "verify_ca") for i in range(4)}
+    assert await _snapshot(db, cid) == {
+        **_GW_EXACT_COLUMNS, "downstream_tls": "none", "upstream_tls": "verify_ca",
+    }
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_detection_disabled_still_stores_the_snapshot_and_request_modes(tmp_path: Path) -> None:
+    asm, _repo, _casts, _search, db = await _make_with_search(tmp_path, detection_enabled=False)
+    await asm.handle(_gw_start("c1", _gw_exact()))
+    await asm.handle(_web_api("c1", "r1"))
+    assert await _snapshot(db, "c1") == _GW_EXACT_COLUMNS
+    assert await _request_tls(db, "c1") == {"r1": ("tls13", "verify_full")}
+    await db.close()
+
+
+# --- none / ambiguous: only match and gateway id, TLS unknown ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _GW_NO_APP_MATCH, ids=lambda c: c.key)
+async def test_none_and_ambiguous_store_only_match_and_gateway_id_and_requests_have_no_modes(
+    tmp_path: Path, case
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(case.key))
+    cid = WEBAPP_CONNS[case.key].conn_id
+
+    snapshot = await _snapshot(db, cid)
+    assert snapshot == _columns_for(case.expected)
+    assert snapshot["gwops_match"] in ("none", "ambiguous")
+    assert snapshot["gwops_gateway_id"] == GW_ID
+    assert all(snapshot[c] is None for c in SNAP_COLS if c not in ("gwops_match", "gwops_gateway_id"))
+    assert list((await _request_tls(db, cid)).values()) == [(None, None)]
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    text = await _db_text(db)
+    assert "SENTINEL_GWOPS_NONE_APP_20846bf9" not in text  # app fields on a none object are never read
+    assert "SENTINEL_GWOPS_UNKNOWN_SCALAR_d3df20d3" not in text
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("match", ["none", "ambiguous"])
+async def test_hand_built_none_object_with_stray_fields_still_stores_only_two_columns(
+    tmp_path: Path, match: str
+) -> None:
+    """Belt and braces below the classifier: the store maps by match, not by what the model holds."""
+    asm, db = await _make(tmp_path)
+    stray = GwopsWebApp(**{**_gw_exact().model_dump(), "match": match})
+    await asm.handle(_gw_start("c1", stray))
+    await asm.handle(_web_api("c1", "r1"))
+    assert await _snapshot(db, "c1") == {**NO_SNAPSHOT, "gwops_match": match, "gwops_gateway_id": GW_ID}
+    assert await _request_tls(db, "c1") == {"r1": (None, None)}
+    await db.close()
+
+
+# --- no valid object: rejected or absent leaves TLS unknown, the connection otherwise normal ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _GW_NO_SNAPSHOT, ids=lambda c: c.key)
+async def test_absent_or_rejected_object_stores_a_null_snapshot_and_a_normal_web_connection(
+    tmp_path: Path, case
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(case.key))
+    cid = WEBAPP_CONNS[case.key].conn_id
+
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    conn = await _conn(db, cid)
+    assert conn["resource_type"] == "WEB_APP" and conn["state"] == "api" and conn["has_api"] == 1
+    assert conn["username"] == WEB_USER and conn["resource_address"]
+    assert list((await _request_tls(db, cid)).values()) == [(None, None)]
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [c for c in _GW_NO_SNAPSHOT if c.outcome == "rejected"], ids=lambda c: c.key)
+async def test_a_rejected_object_leaves_the_connection_exactly_as_the_line_without_it(
+    tmp_path: Path, case
+) -> None:
+    """Stored connection and request equal those of the same line with the key removed."""
+    import copy
+
+    lines = webapp_lines_for(case.key)
+    stripped = copy.deepcopy(json.loads(lines[0]))
+    stripped.pop("gwops")
+    stripped["conn_id"] = "c0ffee00-0000-4000-8000-0000000000ff"
+    request = json.loads(lines[1])
+    request["conn_id"] = stripped["conn_id"]
+    request["request_id"] = "5eed0000-0000-4000-8000-0000000000ff"
+
+    asm, db = await _make(tmp_path)
+    await _feed(asm, lines)
+    await _feed(asm, [json.dumps(stripped), json.dumps(request)])
+
+    cid = WEBAPP_CONNS[case.key].conn_id
+    a, b = dict(await _conn(db, cid)), dict(await _conn(db, stripped["conn_id"]))
+    for volatile in ("conn_id", "created_at", "last_seen_at"):
+        a.pop(volatile), b.pop(volatile)
+    assert a == b
+    ra = dict((await _req_rows(db, "conn_id = ?", (cid,)))[0])
+    rb = dict((await _req_rows(db, "conn_id = ?", (stripped["conn_id"],)))[0])
+    for volatile in ("conn_id", "request_id", "created_at"):
+        ra.pop(volatile), rb.pop(volatile)
+    assert ra == rb
+    await db.close()
+
+
+# --- an object on a start line that is not WEB_APP is ignored ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _GW_NOT_READ, ids=lambda c: c.key)
+async def test_gwops_on_a_non_web_app_start_line_stores_nothing_and_requests_have_no_modes(
+    tmp_path: Path, case
+) -> None:
+    asm, db = await _make(tmp_path)
+    lines = webapp_lines_for(case.key)
+    assert "gwops" in json.loads(lines[0])
+    await _feed(asm, lines)
+    cid = WEBAPP_CONNS[case.key].conn_id
+
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert (await _conn(db, cid))["resource_type"] == case.resource_type
+    for tls in (await _request_tls(db, cid)).values():
+        assert tls == (None, None)
+    text = await _db_text(db)
+    assert not any(s in text for s in WEBAPP_GWOPS_SENTINELS)  # no gwops sentinel was stored
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["gw_on_kubernetes_upper", "gw_on_kubernetes_lower"])
+async def test_gwops_on_a_kubernetes_line_leaves_its_request_kubectl_with_null_modes(
+    tmp_path: Path, key: str
+) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for(key))
+    cid = WEBAPP_CONNS[key].conn_id
+    conn = await _conn(db, cid)
+    assert conn["resource_type"] == "KUBERNETES"
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    rows = await _req_rows(db, "conn_id = ?", (cid,))
+    assert len(rows) == 1
+    assert rows[0]["api_kind"] == "kubectl"
+    assert (rows[0]["downstream_tls"], rows[0]["upstream_tls"]) == (None, None)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_gwops_on_an_ssh_line_is_ignored_and_a_later_request_has_no_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines_for("gw_on_ssh_upper"))
+    cid = WEBAPP_CONNS["gw_on_ssh_upper"].conn_id
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert (await _conn(db, cid))["resource_type"] == "SSH"
+
+    await asm.handle(_web_api(cid, "ssh-r1"))
+
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert await _request_tls(db, cid) == {"ssh-r1": (None, None)}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_an_object_cannot_be_smuggled_onto_a_kubernetes_connection_by_a_later_web_start(
+    tmp_path: Path,
+) -> None:
+    """Processed KUBERNETES start with no object, then a WEB_APP start with one: the snapshot stays NULL."""
+    asm, db = await _make(tmp_path)
+    await asm.handle(_gw_start("c1", None, "KUBERNETES"))
+    await asm.handle(_gw_start("c1", _gw_exact(), "WEB_APP"))
+    assert await _snapshot(db, "c1") == NO_SNAPSHOT
+    await db.close()
+
+
+# --- requests that beat their start line (WEBAPP_SPEC 4.4 backfill) ---
+
+
+@pytest.mark.asyncio
+async def test_fixture_early_requests_get_both_modes_when_the_exact_start_line_arrives(tmp_path: Path) -> None:
+    """late_start_web: GET and DELETE arrive first (kubectl, no modes); the start converts both."""
+    asm, db = await _make(tmp_path)
+    lines = webapp_lines_for("late_start_web")
+    cid = WEBAPP_CONNS["late_start_web"].conn_id
+
+    await _feed(asm, lines[:-1])
+    assert set((await _kinds(db, cid)).values()) == {"kubectl"}
+    assert set((await _request_tls(db, cid)).values()) == {(None, None)}
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+
+    await _feed(asm, lines[-1:])
+
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    assert len(await _request_tls(db, cid)) == 2
+    assert set((await _request_tls(db, cid)).values()) == {("tls13", "verify_full")}
+    assert await _snapshot(db, cid) == {
+        **_GW_EXACT_COLUMNS, "gwops_app": "verifier-a", "upstream_port": 443,
+    }
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_request_after_the_backfill_carries_the_same_modes_as_the_converted_ones(
+    tmp_path: Path,
+) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "late"
+    await asm.handle(_web_api(cid, "early-1", at="2026-10-01T10:00:01.000Z"))
+    await asm.handle(_web_api(cid, "early-2", at="2026-10-01T10:00:02.000Z"))
+    await asm.handle(_gw_start(cid, _gw_exact(upstream_tls="insecure")))
+    await asm.handle(_web_api(cid, "after", at="2026-10-01T10:00:03.000Z"))
+    assert await _request_tls(db, cid) == {
+        "early-1": ("tls13", "insecure"), "early-2": ("tls13", "insecure"), "after": ("tls13", "insecure"),
+    }
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gwops",
+    [None, GwopsWebApp(match="none", gateway_id=GW_ID), GwopsWebApp(match="ambiguous", gateway_id=None)],
+    ids=["no-object", "none", "ambiguous"],
+)
+async def test_backfilled_requests_have_no_modes_when_the_start_has_no_exact_object(
+    tmp_path: Path, gwops: GwopsWebApp | None
+) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "late"
+    await asm.handle(_web_api(cid, "early-1", at="2026-10-01T10:00:01.000Z"))
+    await asm.handle(_web_api(cid, "early-2", at="2026-10-01T10:00:02.000Z"))
+    await asm.handle(_gw_start(cid, gwops))
+    assert await _request_tls(db, cid) == {"early-1": (None, None), "early-2": (None, None)}
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_early_requests_then_a_kubernetes_start_keep_null_modes_and_stay_kubectl(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "late-k8s"
+    await asm.handle(_web_api(cid, "early-1"))
+    await asm.handle(_gw_start(cid, None, "KUBERNETES"))
+    assert await _request_tls(db, cid) == {"early-1": (None, None)}
+    assert set((await _kinds(db, cid)).values()) == {"kubectl"}
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    await db.close()
+
+
+# --- redelivery: first processing fixes the snapshot, request TLS never moves ---
+
+
+_REDELIVER_COLUMNS = {
+    "gwops_match": "exact", "gwops_gateway_id": GW_ID, "gwops_app": "redeliver-app", "gwops_managed": 1,
+    "downstream_tls": "tls13", "downstream_port": 443, "upstream_tls": "verify_full", "upstream_port": 443,
+}
+_REDELIVER_TLS = {
+    "5eed0000-0000-4000-8000-000000000131": ("tls13", "verify_full"),
+    "5eed0000-0000-4000-8000-000000000132": ("tls13", "verify_full"),
+}
+
+
+@pytest.mark.asyncio
+async def test_redelivered_batch_keeps_the_first_snapshot_and_the_request_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    redelivery = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+
+    await _feed(asm, redelivery.originals)
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+
+    for _ in range(3):
+        await _feed(asm, redelivery.replay)
+
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_conflicting_object_on_a_repeated_start_changes_neither_snapshot_nor_request_modes(
+    tmp_path: Path,
+) -> None:
+    asm, db = await _make(tmp_path)
+    redelivery = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, redelivery.originals)
+
+    await _feed(asm, [redelivery.conflicting_start])
+
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+    assert "SENTINEL_GWOPS_CONFLICT_APP_59ec7daf" not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_start_without_an_object_does_not_clear_the_snapshot(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    redelivery = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, redelivery.originals)
+
+    await _feed(asm, [redelivery.no_object_start])
+
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_the_whole_redelivery_sequence_in_fixture_order_ends_with_the_first_snapshot(
+    tmp_path: Path,
+) -> None:
+    """originals, replay, conflicting start, no-object start; then the replay once more."""
+    asm, db = await _make(tmp_path)
+    r = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, r.originals + r.replay + [r.conflicting_start, r.no_object_start] + r.replay)
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+    assert len(await _req_rows(db, "conn_id = ?", (cid,))) == 2
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_new_request_after_a_conflicting_start_carries_the_first_snapshots_modes(
+    tmp_path: Path,
+) -> None:
+    """The conflicting object says none/insecure; a request first seen afterwards still gets tls13/verify_full."""
+    asm, db = await _make(tmp_path)
+    r = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, r.originals)
+    await _feed(asm, [r.conflicting_start])
+
+    await asm.handle(_web_api(cid, "after-conflict"))
+
+    assert (await _request_tls(db, cid))["after-conflict"] == ("tls13", "verify_full")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_survives_a_restart_and_a_redelivered_conflicting_start(tmp_path: Path) -> None:
+    """State is in SQLite: a fresh Assembler over the same database still treats the start as a repeat."""
+    asm, db = await _make(tmp_path)
+    r = webapp_redelivery()
+    cid = WEBAPP_CONNS["redeliver"].conn_id
+    await _feed(asm, r.originals)
+
+    asm2 = Assembler(
+        repo=SessionRepository(db),
+        casts=CastStore(tmp_path / "casts"),
+        idle_timeout_seconds=120,
+        clock=lambda: 0.0,
+        activity=ActivityStore(db),
+    )
+    await asm2.sweep_startup()
+    await _feed(asm2, [r.conflicting_start, r.no_object_start])
+    await _feed(asm2, r.replay)
+
+    assert await _snapshot(db, cid) == _REDELIVER_COLUMNS
+    assert await _request_tls(db, cid) == _REDELIVER_TLS
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_connection_first_seen_without_an_object_stays_null_when_a_repeat_has_one(
+    tmp_path: Path,
+) -> None:
+    """redeliver_noobj_then_obj: [start without object, request, start with object] -> TLS unknown."""
+    asm, db = await _make(tmp_path)
+    first_start, request, repeated_start = webapp_redelivery().noobj_then_obj
+    cid = WEBAPP_CONNS["redeliver_noobj_then_obj"].conn_id
+
+    await _feed(asm, [first_start, request])
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert list((await _request_tls(db, cid)).values()) == [(None, None)]
+
+    await _feed(asm, [repeated_start])
+    await _feed(asm, [first_start, request, repeated_start])
+
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert list((await _request_tls(db, cid)).values()) == [(None, None)]
+    assert "SENTINEL_GWOPS_RETROFILL_APP_8982deb0" not in await _db_text(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_new_request_after_the_repeated_start_still_has_null_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    first_start, request, repeated_start = webapp_redelivery().noobj_then_obj
+    cid = WEBAPP_CONNS["redeliver_noobj_then_obj"].conn_id
+    await _feed(asm, [first_start, request, repeated_start])
+
+    await asm.handle(_web_api(cid, "later"))
+
+    assert (await _request_tls(db, cid))["later"] == (None, None)
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_null_snapshot_created_by_a_rejected_first_object_is_not_filled_by_a_valid_repeat(
+    tmp_path: Path,
+) -> None:
+    """The first processing logged a rejection and stored NULL; a valid copy later changes nothing."""
+    asm, db = await _make(tmp_path)
+    cid = WEBAPP_CONNS["gw_rej_schema_2"].conn_id
+    rejected_start, request = webapp_lines_for("gw_rej_schema_2")
+    valid = json.loads(rejected_start)
+    valid["gwops"] = json.loads(webapp_lines_for("gw_exact_upstream_verify_ca")[0])["gwops"]
+
+    await _feed(asm, [rejected_start, request])
+    await _feed(asm, [json.dumps(valid)])
+
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert list((await _request_tls(db, cid)).values()) == [(None, None)]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_early_requests_after_conversion_keep_their_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    cid = "rd-early"
+    early = [_web_api(cid, "r1", method="DELETE", path="/items/1"), _web_api(cid, "r2", path="/home")]
+    for event in early:
+        await asm.handle(event)
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    expected = {"r1": ("tls13", "verify_full"), "r2": ("tls13", "verify_full")}
+    assert await _request_tls(db, cid) == expected
+
+    for event in early:  # redelivered after conversion: deduplicated, not re-stored as kubectl
+        await asm.handle(event)
+    await asm.handle(_gw_start(cid, _gw_exact(upstream_tls="none")))  # repeat with a different object
+
+    assert await _request_tls(db, cid) == expected
+    assert set((await _kinds(db, cid)).values()) == {"web"}
+    assert await _snapshot(db, cid) == _GW_EXACT_COLUMNS
+    await db.close()
+
+
+# --- lifecycle is unaffected by the snapshot ---
+
+
+@pytest.mark.asyncio
+async def test_a_web_connection_with_a_snapshot_still_expires_to_empty_without_requests(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = "idle-web"
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    conn = await _conn(db, cid)
+    assert conn["state"] == "empty"
+    assert await _row(db, cid) is None
+    assert await _snapshot(db, cid) == _GW_EXACT_COLUMNS
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_request_after_empty_still_carries_the_snapshot_modes(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = "idle-then-active"
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    assert (await _conn(db, cid))["state"] == "empty"
+
+    await asm.handle(_web_api(cid, "late-1"))
+
+    assert (await _conn(db, cid))["state"] == "api"
+    assert await _request_tls(db, cid) == {"late-1": ("tls13", "verify_full")}
+    await db.close()
+
+
+# --- whole-fixture invariants ---
+
+
+@pytest.mark.asyncio
+async def test_whole_fixture_snapshots_are_all_or_nothing_and_requests_mirror_their_connection(
+    tmp_path: Path,
+) -> None:
+    """Across every fixture line: each connection's snapshot is a valid unit, kubectl rows have no
+    modes, and every web request's modes equal its connection's stored modes."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines())
+
+    cur = await db.execute("SELECT * FROM connections")
+    conns = {r["conn_id"]: r for r in await cur.fetchall()}
+    await cur.close()
+    seen = {"exact": 0, "none": 0, "ambiguous": 0, "null": 0}
+    for row in conns.values():
+        snap = {c: row[c] for c in SNAP_COLS}
+        match = snap["gwops_match"]
+        if match is None:
+            assert all(v is None for v in snap.values()), row["conn_id"]
+            seen["null"] += 1
+        elif match == "exact":
+            assert all(snap[c] is not None for c in SNAP_COLS if c not in ("gwops_gateway_id", "gwops_app"))
+            assert row["resource_type"] == "WEB_APP"
+            seen["exact"] += 1
+        else:
+            assert match in ("none", "ambiguous")
+            assert all(snap[c] is None for c in SNAP_COLS if c not in ("gwops_match", "gwops_gateway_id"))
+            assert row["resource_type"] == "WEB_APP"
+            seen[match] += 1
+    assert min(seen.values()) > 0, seen  # the fixture exercises every shape
+
+    for req in await _req_rows(db):
+        conn = conns[req["conn_id"]]
+        if req["api_kind"] == "kubectl":
+            assert (req["downstream_tls"], req["upstream_tls"]) == (None, None), req["request_id"]
+        else:
+            assert (req["downstream_tls"], req["upstream_tls"]) == (
+                conn["downstream_tls"], conn["upstream_tls"],
+            ), req["request_id"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_whole_fixture_connections_match_the_expected_columns_for_every_gwops_case(
+    tmp_path: Path,
+) -> None:
+    """One pass over the whole fixture, then every gw_* case checked against WEBAPP_GWOPS_CASES."""
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines())
+    for case in WEBAPP_GWOPS_CASES:
+        cid = WEBAPP_CONNS[case.key].conn_id
+        expected = case.expected if case.outcome in ("accepted", "accepted_app_ignored") else None
+        assert await _snapshot(db, cid) == _columns_for(expected), case.key
+        for tls in (await _request_tls(db, cid)).values():
+            assert tls == _modes_for(expected), case.key
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_no_web_app_manifest_tables_exist_after_ingesting_the_fixture(tmp_path: Path) -> None:
+    asm, db = await _make(tmp_path)
+    await _feed(asm, webapp_lines())
+    cur = await db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    names = {r[0] for r in await cur.fetchall()}
+    await cur.close()
+    assert not {n for n in names if n.startswith("web_app")}
+    await db.close()
+
+
+# --- Session 12 fix loop: first-write-wins type (A), provisional URL form (B), invalid type (E) ---
+
+from gatorcast.models import RESOURCE_TYPE_INVALID  # noqa: E402
+
+KUBE_DELETE_PATH = "/api/v1/namespaces/default/pods/x"
+
+
+async def _kube_rows_with_finding(asm: Assembler, cid: str) -> None:
+    """KUBERNETES start, then a DELETE that trips ``kube-delete`` (with the kubectl headers)."""
+    await asm.handle(_typed_start(cid, "KUBERNETES", K8S_ADDR))
+    await asm.handle(_web_api(cid, "k1", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:01.000Z"))
+
+
+@pytest.mark.asyncio
+async def test_forged_web_start_on_a_kubernetes_connection_changes_nothing(tmp_path: Path) -> None:
+    """A: KUBERNETES start + kubectl rows with a finding, then a forged WEB_APP start for the same
+    conn_id: type, api_kind, kubectl headers and findings are unchanged, and the next request is
+    still kubectl with findings (detection cannot be switched off by a forged line)."""
+    asm, db = await _make(tmp_path)
+    cid = "forged-web"
+    await _kube_rows_with_finding(asm, cid)
+    assert await _finding_rules(db, "k1") == ["kube-delete"]
+
+    await asm.handle(_typed_start(cid, "WEB_APP", WEB_ADDR))
+
+    assert (await _conn(db, cid))["resource_type"] == "KUBERNETES"
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    row = (await _req_rows(db))[0]
+    assert (row["api_kind"], row["kubectl_command"]) == ("kubectl", "kubectl get")
+    assert await _finding_rules(db, "k1") == ["kube-delete"]
+
+    await asm.handle(_web_api(cid, "k2", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:02.000Z"))
+    assert await _kinds(db, cid) == {"k1": "kubectl", "k2": "kubectl"}
+    assert await _finding_rules(db, "k2") == ["kube-delete"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_forged_kubernetes_start_on_a_web_connection_changes_nothing(tmp_path: Path) -> None:
+    """A (reverse): WEB_APP start, then a forged KUBERNETES start: still WEB_APP, still web rows,
+    no rules, snapshot untouched, and the next request is web with the snapshot's modes."""
+    asm, db = await _make(tmp_path)
+    cid = "forged-k8s"
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    await asm.handle(_web_api(cid, "w1", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:01.000Z"))
+    before = await _snapshot(db, cid)
+    assert before["gwops_match"] == "exact"
+
+    await asm.handle(_typed_start(cid, "KUBERNETES", K8S_ADDR))
+
+    assert (await _conn(db, cid))["resource_type"] == "WEB_APP"
+    assert await _snapshot(db, cid) == before
+    await asm.handle(_web_api(cid, "w2", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:02.000Z"))
+    assert await _kinds(db, cid) == {"w1": "web", "w2": "web"}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert set((await _request_tls(db, cid)).values()) == {("tls13", "verify_full")}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_upgrade_processed_start_with_null_type_is_not_retyped_by_a_web_start(tmp_path: Path) -> None:
+    """A: a processed start line with no type (pre-upgrade) keeps NULL (Kubernetes policy). A later
+    WEB_APP start neither types it, nor snapshots, nor backfills; requests stay kubectl with rules."""
+    asm, db = await _make(tmp_path)
+    cid = "legacy-null"
+    await asm.handle(_typed_start(cid, None, K8S_ADDR))
+    await asm.handle(_web_api(cid, "k1", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:01.000Z"))
+
+    await asm.handle(_gw_start(cid, _gw_exact()))
+
+    conn = await _conn(db, cid)
+    assert conn["resource_type"] is None
+    assert await _snapshot(db, cid) == NO_SNAPSHOT
+    assert (await _kinds(db, cid)) == {"k1": "kubectl"}
+    assert await _finding_rules(db, "k1") == ["kube-delete"]  # no backfill: findings stay
+
+    await asm.handle(_web_api(cid, "k2", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:02.000Z"))
+    assert await _kinds(db, cid) == {"k1": "kubectl", "k2": "kubectl"}
+    assert await _finding_rules(db, "k2") == ["kube-delete"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_type", ["KUBERNETES", "WEB_APP", "SSH"])
+async def test_minimal_row_then_typed_start_takes_the_start_type(tmp_path: Path, start_type: str) -> None:
+    """A: a request that beat its start line leaves the minimal row; the first start types it."""
+    asm, db = await _make(tmp_path)
+    cid = f"minimal-{start_type.lower()}"
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path=KUBE_DELETE_PATH))
+    minimal = await _conn(db, cid)
+    assert minimal["started_at"] is None and minimal["resource_type"] is None
+
+    await asm.handle(_typed_start(cid, start_type, K8S_ADDR))
+
+    assert (await _conn(db, cid))["resource_type"] == start_type
+    expected_kind = "kubectl" if start_type == "KUBERNETES" else "web"
+    assert await _kinds(db, cid) == {"r1": expected_kind}
+    assert await _finding_rules(db, "r1") == (["kube-delete"] if start_type == "KUBERNETES" else [])
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_first_then_ssh_start_sets_the_session_resource_type(tmp_path: Path) -> None:
+    """A recording chunk that beat its start line gets ``sessions.resource_type == "SSH"`` from the start."""
+    asm, db = await _make(tmp_path)
+    cid = "chunk-then-ssh"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, username="user@example.com"))
+    assert (await _row(db, cid))["resource_type"] is None  # nothing known yet
+
+    await asm.handle(_typed_start(cid, "SSH", "10.0.0.5"))
+
+    assert (await _row(db, cid))["resource_type"] == "SSH"
+    assert (await _conn(db, cid))["resource_type"] == "SSH"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_resource_type_follows_the_connections_stored_type_not_a_later_start(
+    tmp_path: Path,
+) -> None:
+    """A: with a recording in progress, a forged start with another type changes neither row."""
+    asm, db = await _make(tmp_path)
+    cid = "session-follows"
+    await asm.handle(_typed_start(cid, "SSH", "10.0.0.5"))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, username="user@example.com"))
+    assert (await _row(db, cid))["resource_type"] == "SSH"
+
+    await asm.handle(_typed_start(cid, "KUBERNETES", K8S_ADDR))
+    await asm.handle(_typed_start(cid, "WEB_APP", WEB_ADDR))
+
+    assert (await _row(db, cid))["resource_type"] == "SSH"
+    assert (await _conn(db, cid))["resource_type"] == "SSH"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_resource_type_is_web_policy_with_no_rules_and_is_not_copied_to_sessions(
+    tmp_path: Path,
+) -> None:
+    """E: the ``invalid`` marker is non-Kubernetes (web form, no rules) and never reaches ``sessions``."""
+    asm, db = await _make(tmp_path)
+    cid = "invalid-type"
+    await asm.handle(_typed_start(cid, RESOURCE_TYPE_INVALID, K8S_ADDR))
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path=KUBE_DELETE_PATH, at="2026-10-01T10:00:01.000Z"))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=CHUNK_1, username="user@example.com"))
+
+    assert (await _conn(db, cid))["resource_type"] == "invalid"  # stored on the connection
+    assert await _kinds(db, cid) == {"r1": "web"}
+    row = (await _req_rows(db))[0]
+    assert row["url"] == f"{KUBE_DELETE_PATH}?month=SE…ef(36)"  # url_web
+    assert row["kubectl_command"] is None
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    assert (await _row(db, cid))["resource_type"] is None  # never copied to sessions
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_resource_type_pending_connection_expires_to_an_error_row_without_a_type(
+    tmp_path: Path,
+) -> None:
+    """E: an idle ``invalid`` connection is a visible error (only WEB_APP is hidden), with no type shown."""
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cid = "invalid-idle"
+    await asm.handle(_typed_start(cid, RESOURCE_TYPE_INVALID, K8S_ADDR))
+    await _age_connection(db, cid)
+    await asm.finalize_idle()
+    row = await _row(db, cid)
+    assert row is not None and row["status"] == "error"
+    assert row["resource_type"] is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_web_pending_hidden_debug_log_carries_a_count_and_no_values(
+    tmp_path: Path, asm_log: io.StringIO
+) -> None:
+    """Hidden (``empty``) WEB_APP expiries log one debug line with the count only."""
+    asm, db = await _make(tmp_path, max_idle=1800)
+    cids = ("hidden-conn-aaa", "hidden-conn-bbb")
+    for cid in cids:
+        await asm.handle(_typed_start(cid, "WEB_APP", "sentinel-host.corp.example"))
+        await _age_connection(db, cid)
+
+    await asm.finalize_idle()
+
+    events = [e for e in _log_events(asm_log) if e["event"] == "assembler.web_pending_hidden"]
+    assert events == [{"event": "assembler.web_pending_hidden", "level": "debug", "count": 2}]
+    text = asm_log.getvalue()
+    assert "sentinel-host" not in text
+    assert not any(cid in text for cid in cids)
+    for cid in cids:
+        assert (await _conn(db, cid))["state"] == "empty"
+    await db.close()
+
+
+# --- B: hygiene for requests that beat (or never meet) their start line ---
+
+HYGIENE_CMD = "QJxCMDsentinelValue7f3aKZ"
+HYGIENE_PROXY = "QJxPROXYsentinelPath9c1dKZ"
+HYGIENE_QUERY = "QJxQUERYsentinelValue4b2eKZ"
+HYGIENE_FRAGMENTS = ("QJ", "KZ", "sentinel")
+EXEC_PATH = "/api/v1/namespaces/x/pods/y/exec"
+
+
+def _raw_api_line(conn_id: str, request_id: str, url: str, at: str) -> dict:
+    """A raw ``gateway.audit`` line (as the Gateway emits it) for ``classify``."""
+    return {
+        "logger": "gateway.audit",
+        "message": "API request completed",
+        "ts": at,
+        "requested_at": at,
+        "request_id": request_id,
+        "conn_id": conn_id,
+        "method": "GET",
+        "url": url,
+        "user": {"id": "VXNlcjox", "username": "user@example.com"},
+        "request": {
+            "headers": {
+                "User-Agent": ["kubectl/v1.33.0"],
+                "Kubectl-Command": ["kubectl exec"],
+                "Kubectl-Session": ["5e55e55e-0000-4000-8000-000000000001"],
+            }
+        },
+        "response": {"status_code": 101},
+    }
+
+
+def _hygiene_urls() -> list[str]:
+    """An exec URL carrying ``command=`` and a service-proxy URL carrying a path token and a query."""
+    return [
+        f"{EXEC_PATH}?command={HYGIENE_CMD}&stdin=true",
+        f"/api/v1/namespaces/x/services/s/proxy/{HYGIENE_PROXY}?a={HYGIENE_QUERY}",
+    ]
+
+
+async def _feed_hygiene_requests(asm: Assembler, cid: str) -> None:
+    """Classify and handle the two hygiene URLs on ``cid`` (the start line is not sent)."""
+    for i, url in enumerate(_hygiene_urls()):
+        event = classify(_raw_api_line(cid, f"hy-{cid}-{i}", url, f"2026-10-01T10:00:0{i + 1}.000Z"))
+        assert isinstance(event, ApiRequest)
+        await asm.handle(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_type", [None, "KUBERNETES", "WEB_APP"], ids=["no-start", "late-k8s", "late-web"])
+async def test_requests_before_the_start_line_store_no_command_or_proxy_value(
+    tmp_path: Path, start_type: str | None
+) -> None:
+    """B: exec ``command=`` and proxy path/query values never reach the DB for a provisional row,
+    not whole and not as a prefix/suffix fragment, whether the start line never comes, or comes
+    as KUBERNETES or WEB_APP. The provisional URL is final in every case."""
+    asm, db = await _make(tmp_path)
+    cid = f"hygiene-{start_type or 'none'}".lower()
+    await _feed_hygiene_requests(asm, cid)
+    if start_type is not None:
+        await asm.handle(_typed_start(cid, start_type, WEB_ADDR))
+
+    text = await _db_text(db)
+    for needle in (HYGIENE_CMD, HYGIENE_PROXY, HYGIENE_QUERY, *HYGIENE_FRAGMENTS):
+        assert needle not in text, needle
+    urls = [r["url"] for r in await _req_rows(db)]
+    assert urls == [f"{EXEC_PATH}?stdin=t…(4)", "/api/v1/namespaces/x/services/s/proxy"]
+    expected_kind = "web" if start_type == "WEB_APP" else "kubectl"
+    assert set((await _kinds(db, cid)).values()) == {expected_kind}
+    row = (await _req_rows(db))[0]
+    if expected_kind == "kubectl":
+        assert row["kubectl_command"] == "kubectl exec"  # provisional rows keep the kubectl headers
+    else:
+        assert row["kubectl_command"] is None  # converted: headers cleared
+    await db.close()
+
+
+# --- Session 12 fix loop: gwops app categories are stored as NULL with the start line kept (C) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "app", ["\ud800", "xy", "͸"], ids=["surrogate-Cs", "private-use-Co", "unassigned-Cn"]
+)
+async def test_start_line_with_a_refused_gwops_app_is_stored_with_a_null_app(tmp_path: Path, app: str) -> None:
+    """C: a gwops ``app`` in Cs/Co/Cn is refused, but the start line is accepted and stored."""
+    asm, db = await _make(tmp_path)
+    cid = "c0ffee00-0000-4000-8000-00000000c0c0"
+    line = {
+        "logger": "gateway", "message": "Authenticated connection", "conn_id": cid,
+        "ts": "2026-10-01T10:00:00.100Z", "user": {"id": "uid", "username": "user@example.com"},
+        "resource_address": WEB_ADDR, "resource_type": "WEB_APP",
+        "gwops": {
+            "schema": 1, "gateway_id": GW_ID, "match": "exact", "app": app, "managed": True,
+            "downstream_tls": "tls13", "downstream_port": 443, "upstream_tls": "verify_full",
+            "upstream_port": 8443,
+        },
+    }
+    event = classify(line)
+    assert isinstance(event, SessionStart)
+    await asm.handle(event)
+
+    conn = await _conn(db, cid)
+    assert conn is not None and conn["state"] == "pending"
+    assert conn["resource_address"] == WEB_ADDR
+    snap = await _snapshot(db, cid)
+    assert snap["gwops_match"] == "exact" and snap["gwops_app"] is None
+    assert (snap["downstream_tls"], snap["upstream_tls"]) == ("tls13", "verify_full")
+    await db.close()
+
+
+# --- Known production bug (Session 12 review): parse_asciicast splits on str.splitlines() ---
+
+
+@pytest.mark.parametrize("raw", ["\u0085", " ", " "], ids=["NEL", "LS", "PS"])
+def test_parse_asciicast_counts_an_event_that_holds_a_raw_unicode_line_separator(raw: str) -> None:
+    """An event whose output contains one raw separator is still ONE event (offset 2.0)."""
+    doc = reassemble_asciicast([HEADER + json.dumps([2.0, "o", f"a{raw}b"], ensure_ascii=False) + "\n"])
+    meta = parse_asciicast(doc)
+    assert (meta.event_count, meta.duration_seconds) == (1, 2.0)
+
+
+# --- M: retention keeps a connection that a stored request still references ---
+
+
+@pytest.mark.asyncio
+async def test_purge_keeps_an_old_connection_with_a_recent_request_and_the_next_request_is_still_web(
+    tmp_path: Path,
+) -> None:
+    """M: old created/last-seen clocks do not purge a connection with a recent request, so its type
+    and gwops snapshot survive and the next request is stored as web with the snapshot's modes
+    (not as a provisional kubectl row with rules)."""
+    asm, db = await _make(tmp_path)
+    cid = "purge-keep"
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    await asm.handle(_web_api(cid, "r1", method="DELETE", path="/items/1", at="2026-10-07T10:00:01.000Z"))
+    await db.execute(
+        "UPDATE connections SET created_at = '2000-01-01 00:00:00', last_seen_at = '2000-01-01 00:00:00' "
+        "WHERE conn_id = ?",
+        (cid,),
+    )
+    await db.execute("UPDATE api_requests SET created_at = datetime('now')")
+    await db.commit()
+    snapshot_before = await _snapshot(db, cid)
+
+    purged = await asm._activity.purge_before("2026-10-05T00:00:00Z")
+
+    assert purged == (0, 0)
+    conn = await _conn(db, cid)
+    assert conn is not None and conn["resource_type"] == "WEB_APP"
+    assert await _snapshot(db, cid) == snapshot_before
+    await asm.handle(_web_api(cid, "r2", method="DELETE", path="/items/2", at="2026-10-07T10:00:02.000Z"))
+    assert await _kinds(db, cid) == {"r1": "web", "r2": "web"}
+    assert await _request_tls(db, cid) == {"r1": ("tls13", "verify_full"), "r2": ("tls13", "verify_full")}
+    assert await _count(db, "SELECT COUNT(*) FROM api_findings") == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_removes_the_connection_once_nothing_references_it_and_its_clocks_are_old(
+    tmp_path: Path,
+) -> None:
+    """M: with no request left and both clocks old, the connection (and its snapshot) goes."""
+    asm, db = await _make(tmp_path)
+    cid = "purge-gone"
+    await asm.handle(_gw_start(cid, _gw_exact()))
+    await db.execute(
+        "UPDATE connections SET created_at = '2000-01-01 00:00:00', last_seen_at = '2000-01-01 00:00:00'"
+    )
+    await db.commit()
+    assert await asm._activity.purge_before("2026-10-05T00:00:00Z") == (0, 1)
+    assert await _conn(db, cid) is None
     await db.close()

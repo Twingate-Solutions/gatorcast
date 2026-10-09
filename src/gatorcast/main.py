@@ -284,7 +284,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else None
     )
 
-    app = FastAPI(title="Gatorcast", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="Gatorcast", version="0.5.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.cryptor = cryptor
     app.state.sidecar_cryptor = sidecar_cryptor
