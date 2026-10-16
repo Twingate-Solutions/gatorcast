@@ -372,10 +372,16 @@ def main() -> None:
         },
     )
     with urllib.request.urlopen(req) as resp:
-        print(
-            f"POST /ingest -> {resp.status} ({len(objs)} objects: "
-            f"{len(SESSIONS)} sessions, {len(WEB_APPS)} web apps / {n_web} lines)"
-        )
+        status = resp.status
+        raw = resp.read()
+    print(
+        f"POST /ingest -> {status} ({len(objs)} objects: "
+        f"{len(SESSIONS)} sessions, {len(WEB_APPS)} web apps / {n_web} lines)"
+    )
+    # Gatorcast 0.6.0 and later answer 200 with intake counts; older versions answer
+    # 204 with no body.
+    if raw:
+        print(json.dumps(json.loads(raw), indent=2))
 
 
 if __name__ == "__main__":

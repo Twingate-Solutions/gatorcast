@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     request_id       TEXT,                          -- k8s exec/attach request_id (NULL for SSH)
     sealed_terminal  INTEGER,                       -- 1 terminal seal | 0 reopenable seal | NULL unsealed/legacy
     resource_type    TEXT,                          -- Gateway resource type, copied from connections at promote
+    parent_conn_id   TEXT,                          -- real Gateway conn_id of a per-channel session (NULL for a primary row)
+    stream           INTEGER,                       -- SSH channel id (ssh.channel.id) when known, else NULL
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -243,6 +245,12 @@ SESSION_COLUMNS: tuple[tuple[str, str], ...] = (
     # Session 11 (spec §4.2): the Gateway resource type, copied from ``connections``
     # when a recording promotes the connection to a session.
     ("resource_type", "ALTER TABLE sessions ADD COLUMN resource_type TEXT"),
+    # Gateway 2.0.0 SSH: one connection can carry several channels, each recorded as its
+    # own session. A channel other than 0 gets a derived session id (conn_id is the
+    # primary key) and keeps the real connection id in ``parent_conn_id``. ``stream`` is
+    # the channel id when the chunk carried one. Both NULL on every pre-2.0.0 row.
+    ("parent_conn_id", "ALTER TABLE sessions ADD COLUMN parent_conn_id TEXT"),
+    ("stream", "ALTER TABLE sessions ADD COLUMN stream INTEGER"),
 )
 
 # Columns added to ``connections`` after Session 9 created it (Session 11, spec §4.2,
@@ -423,7 +431,8 @@ async def _ensure_columns(conn: aiosqlite.Connection) -> None:
     before these columns existed needs an explicit, guarded ``ALTER``. Applies each
     per-table list in :data:`TABLE_COLUMNS`: ``sessions`` (Session 8 finding columns,
     Session 9 ``request_id``, Session 10 ``sealed_terminal``, Session 11
-    ``resource_type``), ``connections`` (Session 11 ``resource_type`` and gwops/TLS
+    ``resource_type``; Gateway 2.0.0 ``parent_conn_id`` and ``stream``), ``connections``
+    (Session 11 ``resource_type`` and gwops/TLS
     snapshot) and ``api_requests`` (Session 11 ``api_kind`` and TLS modes). No
     ``user_version`` bump. A column is added only if absent, so a second boot, or a
     fresh install whose ``CREATE TABLE`` already has it, issues no ``ALTER``.

@@ -11,7 +11,9 @@ Framing supported per connection, auto-detected per message:
     octet-count.
 
 Each de-framed message is handed to ``normalize`` (which strips any ``<PRI>``
-syslog header) and, if it reduces to a JSON object, enqueued for the pipeline.
+syslog header) and, if it reduces to a JSON object, classified and the resulting
+event enqueued for the pipeline. There is no response on the wire; outcome counts
+are logged once per connection (``ingest.syslog``).
 There is no per-message auth; rely on network position (bind internal-only).
 """
 
@@ -19,8 +21,10 @@ from __future__ import annotations
 
 import asyncio
 
+from gatorcast.ingest.counts import IntakeCounts
 from gatorcast.ingest.normalize import normalize
 from gatorcast.logging import get_logger
+from gatorcast.pipeline.classify import Event
 
 log = get_logger(__name__)
 
@@ -103,14 +107,14 @@ class SyslogTCPServer:
         self,
         host: str,
         port: int,
-        queue: asyncio.Queue[dict],
+        queue: asyncio.Queue[Event],
     ) -> None:
         """Initialize the server.
 
         Args:
             host: Bind address (use an internal interface in production).
             port: TCP port to listen on.
-            queue: Shared ingest queue accepted objects are put onto.
+            queue: Shared ingest queue classified events are put onto.
         """
         self._host = host
         self._port = port
@@ -166,6 +170,7 @@ class SyslogTCPServer:
                 pass
             return
 
+        counts = IntakeCounts()
         async with self._conn_sem:
             try:
                 while True:
@@ -174,9 +179,15 @@ class SyslogTCPServer:
                     )
                     if message is None:
                         break
+                    if not message.strip():
+                        continue
                     obj = normalize(message)
-                    if obj is not None:
-                        await self._queue.put(obj)
+                    if obj is None:
+                        counts.drop_not_json()
+                        continue
+                    event = counts.triage(obj)
+                    if event is not None:
+                        await self._queue.put(event)
             except FrameError as exc:
                 # Hostile framing — never log content (rule 5), only the reason.
                 log.warning("syslog.frame_rejected", peer=str(peer), reason=str(exc))
@@ -190,4 +201,8 @@ class SyslogTCPServer:
                     await writer.wait_closed()
                 except (ConnectionError, OSError):
                     pass
+                # One summary per connection, counts only (never content). Skipped
+                # when the connection carried nothing countable.
+                if counts.accepted or counts.dropped:
+                    log.info("ingest.syslog", peer=str(peer), **counts.as_dict())
                 log.debug("syslog.disconnect", peer=str(peer))

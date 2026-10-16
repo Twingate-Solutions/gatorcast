@@ -4,7 +4,8 @@ The primary intake. A shipper (rsyslog omhttp, curl, etc.) POSTs Gateway log
 lines here with a bearer token. Bodies may be NDJSON, a single JSON object, a
 JSON array of objects, or newline-delimited text. Parsing is per-line tolerant:
 one bad line never fails the batch. Accepted objects are enqueued onto the
-shared ingest queue; the endpoint returns 204 and never echoes content back.
+shared ingest queue; the endpoint returns 200 with per-batch counts and never echoes
+content back.
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ from __future__ import annotations
 import json
 import secrets
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
+from gatorcast.ingest.counts import IntakeCounts
 from gatorcast.ingest.normalize import normalize, unwrap_collector
 from gatorcast.logging import get_logger
 
@@ -73,16 +76,41 @@ def _parse_json_body(text: str) -> tuple[list[dict], int]:
 async def ingest(
     request: Request,
     authorization: str | None = Header(default=None),
-) -> Response:
-    """Accept a batch of Gateway log lines and enqueue them for the pipeline.
+) -> JSONResponse:
+    """Accept a batch of Gateway log lines, classify them, and enqueue the events.
 
     Auth is a bearer token. The body is decoded and split by content type:
     ``application/json`` is parsed as one document (object or array); anything
     else is treated as newline-delimited and each line is run through
-    ``normalize``. Accepted objects are put on the ingest queue.
+    ``normalize``. Every object is then classified here and the resulting event is
+    put on the ingest queue; the consumer only hands events to the assembler.
 
     Returns:
-        ``204 No Content`` on accept (even if some lines were dropped).
+        ``200`` with ``application/json`` once auth passes, however many lines were
+        dropped. The body carries counts only, never content::
+
+            {
+              "accepted": 3,
+              "dropped": 2,
+              "accepted_by_kind": {"ApiRequest": 1, "RecordingChunk": 2},
+              "dropped_by_reason": {"noise": 1, "not_json": 1},
+              "noise_by_logger": {"other": 1}
+            }
+
+        ``accepted`` is the number of objects classified into an event and queued;
+        ``accepted_by_kind`` is keyed by event type (``RecordingChunk``,
+        ``SessionStart``, ``SessionEnd``, ``ApiRequest``). ``dropped`` is the number
+        of non-blank inputs that produced no event; ``dropped_by_reason`` is keyed
+        ``not_json`` (not a JSON object), ``noise`` (``classify`` returned nothing:
+        an unrecognised line, or a recognised one it rejected as malformed) or
+        ``classify_error``. ``noise_by_logger`` breaks ``noise`` down by the line's
+        ``logger`` value: ``gateway``, ``gateway.audit``, ``system``, ``audit``,
+        ``session_recording``, ``missing`` (absent or not a string) or ``other``.
+        The three maps list non-zero entries only. Blank lines are not counted. A
+        batch whose ``accepted`` is 0 and ``dropped`` is not has delivered nothing.
+        The same counts are logged as one ``ingest.http`` line.
+
+        Auth failures keep their ``401`` response.
     """
     settings = request.app.state.settings
     _require_auth(authorization, settings.ingest_token)
@@ -93,23 +121,23 @@ async def ingest(
     text = body.decode("utf-8", errors="replace")
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
 
-    accepted = 0
-    dropped = 0
+    counts = IntakeCounts()
 
     if content_type == "application/json":
         objs, bad = _parse_json_body(text)
-        dropped += bad
+        counts.drop_not_json(bad)
         # Apply the same collector-unwrap the NDJSON/text path gets via
         # normalize(), so Docker-wrapped {"log": ...} objects are not silently
         # dropped by classify. Per-item tolerant: one bad item never fails the
-        # batch (the 204 response is unconditional below).
+        # batch (the 200 response is unconditional below).
         for obj in objs:
             unwrapped = unwrap_collector(obj)
             if unwrapped is None:
-                dropped += 1
+                counts.drop_not_json()
                 continue
-            await queue.put(unwrapped)
-            accepted += 1
+            event = counts.triage(unwrapped)
+            if event is not None:
+                await queue.put(event)
     else:
         # NDJSON / x-ndjson / text/plain: one candidate per line. Split on "\n"
         # only: str.splitlines() also breaks on U+0085, U+2028,
@@ -122,10 +150,12 @@ async def ingest(
                 continue
             obj = normalize(line)
             if obj is None:
-                dropped += 1
+                counts.drop_not_json()
                 continue
-            await queue.put(obj)
-            accepted += 1
+            event = counts.triage(obj)
+            if event is not None:
+                await queue.put(event)
 
-    log.info("ingest.http", accepted=accepted, dropped=dropped)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    summary = counts.as_dict()
+    log.info("ingest.http", **summary)
+    return JSONResponse(summary, status_code=status.HTTP_200_OK)

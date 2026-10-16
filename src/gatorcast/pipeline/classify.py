@@ -6,13 +6,28 @@ recognized. Both map onto the recording events (``RecordingChunk``,
 
 **Legacy log-line format** (CLAUDE.md rule 2, TECHNICAL_PLAN "Classification"):
 
-  * **RecordingChunk** — ``logger == "gateway.audit"`` *and* a non-null ``asciicast``.
-    The logger check alone is insufficient: ``gateway.audit`` also carries
-    API-request audits with no recording, which are never chunks. Kubernetes
-    exec/attach chunk lines also carry a ``request_id``, which is kept (and
-    nothing else new is read from them) so the recording can be linked to its
-    API audit line.
-  * **ApiRequest** — ``logger == "gateway.audit"`` with *no* ``asciicast`` and
+  Gateway 2.0.0 (GA) renamed the loggers; both generations are accepted
+  (``_RECORDING_LOGGERS``, ``_AUDIT_LOGGERS``, ``_START_LOGGERS``):
+
+  ==================  ====================  =====================
+  Role                Preview (< 2.0.0)     GA (2.0.0)
+  ==================  ====================  =====================
+  Recording chunk     ``gateway.audit``     ``session_recording``
+  API request audit   ``gateway.audit``     ``audit``
+  Connection start    ``gateway``           ``system``
+  ==================  ====================  =====================
+
+  GA SSH audit events (``audit`` logger, ``SSH connection established`` and the
+  like, with an ``ssh`` object) match no event here and are dropped unread.
+
+  * **RecordingChunk** — a recording logger *and* a non-null ``asciicast``.
+    The logger check alone is insufficient: the preview ``gateway.audit`` logger
+    also carries API-request audits with no recording, which are never chunks.
+    Kubernetes exec/attach chunk lines also carry a ``request_id``, which is kept
+    so the recording can be linked to its API audit line. GA SSH chunks carry
+    ``ssh.channel.id``, kept as ``RecordingChunk.stream`` (nothing else under
+    ``ssh`` is read).
+  * **ApiRequest** — an audit logger with *no* ``asciicast`` and
     ``message`` of ``"API request completed"`` or ``"API request failed"``. One
     per HTTP request. Only allowlisted metadata is kept: method, sanitized URL,
     status, user identity, and the ``User-Agent`` / ``Kubectl-Command`` /
@@ -24,7 +39,7 @@ recognized. Both map onto the recording events (``RecordingChunk``,
     raw URL also yields ``url_web`` (web-app policy: normalized path, masked query
     values; ``webmask.store_web_url``); the assembler picks the form by resource
     type. Other ``gateway.audit`` messages are dropped.
-  * **SessionStart** — ``logger == "gateway"`` with ``message == "Authenticated
+  * **SessionStart** — a start logger with ``message == "Authenticated
     connection"``. Carries the target ``resource_address`` and the user identity;
     on a ``WEB_APP`` start also the validated ``gwops`` object (``_classify_gwops``;
     a rejected object leaves the rest of the event unchanged).
@@ -86,17 +101,32 @@ _SAFE_CONN_ID = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 # a dependency. Kept as a single named constant so it is trivial to adjust.
 _FINAL_RECORDING_MESSAGE = "session finished"
 
-# Candidate connection-close messages on the plain "gateway" logger. The recorder's
+# Logger names. Gateway 2.0.0 (GA) renamed them; the preview names stay accepted
+# so older Gateways and existing shippers keep working.
+#   recording chunks:   preview "gateway.audit"  -> GA "session_recording"
+#   API request audits: preview "gateway.audit"  -> GA "audit"
+#   connection start:   preview "gateway"        -> GA "system"
+_RECORDING_LOGGERS = frozenset({"gateway.audit", "session_recording"})
+_AUDIT_LOGGERS = frozenset({"gateway.audit", "audit"})
+_START_LOGGERS = frozenset({"gateway", "system"})
+# Close events share the start loggers (GA 2.0.0 emits none; harmless).
+_CLOSE_LOGGERS = _START_LOGGERS
+
+# Candidate connection-close messages on a start logger. The recorder's
 # "session finished" (above) is the authoritative end signal; these remain wired as
 # a defensive fallback for a close event that carries no asciicast payload.
 _CLOSE_MESSAGES = frozenset({"Connection closed", "Closed connection"})
+
+# GA SSH recording chunks carry ``ssh.channel.id``; it keys one recording per SSH
+# channel on a conn_id. Capped at the signed 32-bit maximum.
+_MAX_STREAM = 2**31 - 1
 
 # Envelope-format record types (fork recording sink). The discriminator is the
 # "type" field on a record that carries no "logger" — legacy log lines always
 # carry "logger", so this can never divert one.
 _ENVELOPE_TYPES = frozenset({"session_start", "recording_chunk", "session_end"})
 
-# Stock Gateway API-request audit messages (logger "gateway.audit", no asciicast).
+# Stock Gateway API-request audit messages (an audit logger, no asciicast).
 _API_COMPLETED_MESSAGE = "API request completed"
 _API_FAILED_MESSAGE = "API request failed"
 _API_MESSAGES = frozenset({_API_COMPLETED_MESSAGE, _API_FAILED_MESSAGE})
@@ -567,6 +597,25 @@ def _classify_gwops(obj: dict, conn_id: str) -> GwopsWebApp | None:
     )
 
 
+def _ssh_channel_id(obj: dict) -> int | None:
+    """Return ``ssh.channel.id`` of a GA SSH recording chunk, else ``None``.
+
+    Only a real int in ``0 .. 2**31 - 1`` is accepted (``bool`` is excluded).
+    Nothing else under ``ssh`` is read, and nothing is logged: ``ssh.username`` is
+    the remote shell account, never identity (CLAUDE.md rule 4).
+    """
+    ssh = obj.get("ssh")
+    if not isinstance(ssh, dict):
+        return None
+    channel = ssh.get("channel")
+    if not isinstance(channel, dict):
+        return None
+    channel_id = channel.get("id")
+    if _is_int(channel_id) and 0 <= channel_id <= _MAX_STREAM:
+        return channel_id
+    return None
+
+
 def _username(obj: dict) -> str | None:
     """Extract the envelope SSO identity (``user.username``) defensively."""
     user = obj.get("user")
@@ -687,8 +736,8 @@ def classify(obj: dict) -> Event | None:
     if logger is None and isinstance(etype, str) and etype in _ENVELOPE_TYPES:
         return _classify_envelope(obj, etype)
 
-    # 1. Recording chunk: gateway.audit AND a non-null asciicast string.
-    if logger == "gateway.audit" and obj.get("asciicast") is not None:
+    # 1. Recording chunk: a recording logger AND a non-null asciicast string.
+    if logger in _RECORDING_LOGGERS and obj.get("asciicast") is not None:
         asciicast = obj.get("asciicast")
         if not isinstance(asciicast, str):
             log.debug("classify.drop", reason="asciicast_not_string")
@@ -711,19 +760,20 @@ def classify(obj: dict) -> Event | None:
             ts=_ts_field(obj),
             is_final=obj.get("message") == _FINAL_RECORDING_MESSAGE,
             request_id=_safe_request_id(obj),
+            stream=_ssh_channel_id(obj),
         )
 
-    # 1b. API request audit: gateway.audit, NO asciicast, completed/failed message.
+    # 1b. API request audit: an audit logger, NO asciicast, completed/failed message.
     # Any line carrying an asciicast string was already handled above as a chunk.
     if (
-        logger == "gateway.audit"
+        logger in _AUDIT_LOGGERS
         and obj.get("asciicast") is None
         and obj.get("message") in _API_MESSAGES
     ):
         return _classify_api_request(obj)
 
-    # 2. Session start: gateway "Authenticated connection".
-    if logger == "gateway" and obj.get("message") == "Authenticated connection":
+    # 2. Session start: "Authenticated connection" on a start logger.
+    if logger in _START_LOGGERS and obj.get("message") == "Authenticated connection":
         conn_id = _safe_conn_id(obj)
         if conn_id is None:
             log.debug("classify.drop", reason="start_bad_conn_id")
@@ -744,11 +794,11 @@ def classify(obj: dict) -> Event | None:
         )
 
     # 3. Session end (close-event hook — see _CLOSE_MESSAGES note).
-    if logger == "gateway" and obj.get("message") in _CLOSE_MESSAGES:
+    if logger in _CLOSE_LOGGERS and obj.get("message") in _CLOSE_MESSAGES:
         conn_id = _safe_conn_id(obj)
         if conn_id is not None:
             return SessionEnd(conn_id=conn_id, ts=_ts_field(obj))
 
-    # Everything else is operational noise (including other gateway.audit
-    # messages) → drop.
+    # Everything else is operational noise (including other audit-logger messages
+    # such as GA SSH connection events, and 2.0.0 service/proxy-error lines) → drop.
     return None

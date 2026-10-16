@@ -671,6 +671,10 @@ def _session_view(session: Session) -> dict[str, object]:
     """
     return {
         "conn_id": session.conn_id,
+        # The Gateway connection id (``conn_id`` is the session id: it differs for a
+        # per-channel SSH session) and the SSH channel id, when known.
+        "connection_id": session.parent_conn_id or session.conn_id,
+        "stream": session.stream,
         "username": session.username,
         "user_url": _user_search_url(session.username),
         "resource_address": session.resource_address,
@@ -1429,6 +1433,8 @@ def _recording_item_view(
         "row_macro": kind.row_macro,
         "at": at,
         "conn_id": s.conn_id,
+        "connection_id": s.parent_conn_id or s.conn_id,
+        "stream": s.stream,
         "session_url": url,
         "action": "details" if is_failed else "replay",
         "system_label": _system_label(s.resource_address),

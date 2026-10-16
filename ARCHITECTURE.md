@@ -14,7 +14,7 @@ see the [README](README.md); for forwarding Gateway logs in, see
 ```text
   Twingate Gateway host (k8s pod OR SSH/VM)
   emits gateway / gateway.audit JSON (asciicast v2 chunks + API-request audits)
-  to stdout/stderr
+  to stdout/stderr (Gateway 2.0.0: system / session_recording / audit)
         │  push (operator's choice of shipper)
         │   • rsyslog omhttp  → HTTP POST /ingest
         │   • Docker syslog driver / rsyslog omfwd → syslog TCP
@@ -22,17 +22,19 @@ see the [README](README.md); for forwarding Gateway logs in, see
         ▼
 ┌──────────────────────── Gatorcast (single FastAPI container) ────────────────────────────┐
 │  Ingest front doors (ingest/)                                                            │
-│    • POST /ingest        (NDJSON / JSON over HTTP, bearer-token auth, returns 204)       │
+│    • POST /ingest        (NDJSON / JSON over HTTP, bearer-token auth, 200 + JSON counts) │
 │    • syslog TCP listener (octet-counted or newline framing; strips <PRI> header)         │
 │        │  raw line → normalize (syslog / Docker {"log":…} unwrap) → JSON object          │
-│        ▼  in-memory asyncio.Queue → one consumer task                                    │
-│  Classify & filter (pipeline/classify.py)                                                │
-│    • logger=="gateway.audit" AND asciicast!=null → recording chunk                       │
-│      (message=="session finished" → final chunk / end signal)                            │
-│    • gateway.audit, no asciicast, "API request completed"/"failed"                       │
-│      → API request (allowlisted metadata; kubectl or web URL form per connection)        │
-│    • logger=="gateway" "Authenticated connection" → pending connection + target,         │
-│        resource_type, and the optional gwops TLS object on WEB_APP lines                 │
+│        │  → classify (below) at the front door; counts kept per batch / connection       │
+│        ▼  events → in-memory asyncio.Queue → one consumer task                           │
+│  Classify & filter (pipeline/classify.py; called by the front doors, not the consumer)   │
+│    • recording logger AND asciicast!=null → recording chunk                              │
+│      (gateway.audit or session_recording; message=="session finished" → end signal)      │
+│    • audit logger, no asciicast, "API request completed"/"failed"                        │
+│      (gateway.audit or audit) → API request (allowlisted metadata; kubectl or web        │
+│      URL form per connection)                                                            │
+│    • start logger "Authenticated connection" (gateway or system) → pending connection +  │
+│        target, resource_type, and the optional gwops TLS object on WEB_APP lines         │
 │    • (close event if present) → finalize signal                                          │
 │    • envelope-format records ("type", no "logger") → same events (legacy, kept)          │
 │        ▼                                                                                 │
@@ -79,19 +81,21 @@ see the [README](README.md); for forwarding Gateway logs in, see
 ### Data flow
 
 1. **Front door.** `POST /ingest` takes a bearer token. An `application/json` body is parsed as one object or an array; any other content type is split into lines on `\n` only (one trailing `\r` is dropped), so a Unicode line separator such as U+2028 inside a JSON string cannot tear a line apart. The syslog TCP listener accepts RFC 6587 octet-counted frames and newline-delimited lines, auto-detected per message. Both paths hand each raw line to `normalize`.
-2. **Normalize** (`ingest/normalize.py`). A syslog `<PRI>` header is stripped by parsing from the first `{`. A collector wrapper such as Docker's `{"log": "...", "stream": "stdout"}` is unwrapped. A line that does not reduce to a JSON object is dropped with a `normalize.drop` warning that logs the length only; the rest of its batch is unaffected. This is how non-JSON lines in a batch (a Go `http: proxy error: …` message, for example) are tolerated. A length near 49152 means journald's `LineMax` split a large chunk; see the [README troubleshooting](README.md#troubleshooting).
-3. **Queue.** Accepted objects go onto one in-memory, unbounded `asyncio.Queue`. `/ingest` returns `204` whether or not lines were dropped. Objects still queued when the process dies are lost.
-4. **Classify** (`pipeline/classify.py`). One consumer task drains the queue and turns each object into an event or drops it:
+2. **Normalize** (`ingest/normalize.py`). A syslog `<PRI>` header is stripped by parsing from the first `{`. A collector wrapper such as Docker's `{"log": "...", "stream": "stdout"}` is unwrapped. A line that does not reduce to a JSON object is dropped with a `normalize.drop` warning that logs the length only, and is counted as `not_json`; the rest of its batch is unaffected. This is how non-JSON lines in a batch (a Go `http: proxy error: …` message, for example) are tolerated. A length near 49152 means journald's `LineMax` split a large chunk; see the [README troubleshooting](README.md#troubleshooting).
+3. **Classify and count** (`pipeline/classify.py`, `ingest/counts.py`). Each front door classifies every object itself, before queueing, and turns it into an event or drops it. Every non-blank input ends in exactly one outcome, and the outcome is counted: accepted (by event type) or dropped (`not_json`, `noise`, or `classify_error`; noise is also split by `logger`). A `classify` exception is isolated to its line, so one bad line never fails a batch or a syslog connection. `/ingest` answers `200` with those counts as JSON whether or not lines were dropped, and logs the same counts as one `ingest.http` line; the syslog listener has no response and logs one `ingest.syslog` line per connection when it closes. No count key or log field carries line content: an unknown `logger` value is reported as `other`.
 
    | Input | Event |
    | --- | --- |
-   | `gateway.audit` with a string `asciicast` and an integer `asciicast_sequence_num` | `RecordingChunk` (`is_final` when `message == "session finished"`; carries `request_id` on k8s exec/attach lines) |
-   | `gateway.audit`, no `asciicast`, `message` of `API request completed` or `API request failed` | `ApiRequest` (allowlisted fields only; carries both the Kubernetes and the web URL form) |
-   | `gateway`, `Authenticated connection` | `SessionStart` (user, target `resource_address`, normalized `resource_type`, and for `WEB_APP` the validated `gwops` object) |
-   | `gateway`, `Connection closed` or `Closed connection` | `SessionEnd` |
-   | Anything else | Dropped |
+   | Recording logger (`gateway.audit` or `session_recording`) with a string `asciicast` and an integer `asciicast_sequence_num` | `RecordingChunk` (`is_final` when `message == "session finished"`; carries `request_id` on k8s exec/attach lines; on 2.0.0 SSH lines carries `ssh.channel.id`) |
+   | Audit logger (`gateway.audit` or `audit`), no `asciicast`, `message` of `API request completed` or `API request failed` | `ApiRequest` (allowlisted fields only; carries both the Kubernetes and the web URL form) |
+   | Start logger (`gateway` or `system`), `Authenticated connection` | `SessionStart` (user, target `resource_address`, normalized `resource_type`, and for `WEB_APP` the validated `gwops` object) |
+   | Start logger (`gateway` or `system`), `Connection closed` or `Closed connection` | `SessionEnd` (the stock Gateway logs none) |
+   | Anything else, including 2.0.0 SSH audit events and Gateway service lines | Dropped (`noise`) |
 
-   `conn_id` names the `.cast` file, so it must `fullmatch` `[A-Za-z0-9_.-]{1,128}`; anything else is dropped here. Lone surrogate code points in any free-text string are replaced with U+FFFD, since SQLite and the `.cast` files cannot encode them. An exception in the consumer is logged by type only and never stops it.
+   The preview names (`gateway.audit`, `gateway`) and the Gateway 2.0.0 names (`session_recording`, `audit`, `system`) are both accepted, so a fleet that mixes Gateway versions needs no configuration. A Gatorcast older than 0.6.0 knows only the preview names and drops every 2.0.0 line while still returning success; upgrade Gatorcast before the Gateway.
+
+   `conn_id` names the `.cast` file, so it must `fullmatch` `[A-Za-z0-9_.-]{1,128}`; anything else is dropped here and counted as `noise`. Lone surrogate code points in any free-text string are replaced with U+FFFD, since SQLite and the `.cast` files cannot encode them.
+4. **Queue.** Events go onto one in-memory, unbounded `asyncio.Queue`; one consumer task hands each to the assembler. An exception in the consumer is logged by type only and never stops it. Events still queued when the process dies are lost.
 5. **Assemble** (`pipeline/assembler.py`). The assembler demuxes by `conn_id` under one lock, so every state transition is serialized with chunk handling. See the lifecycle below.
 6. **Store.** Metadata goes to SQLite through `SessionRepository`, `ActivityStore` and `SearchStore`; the UI reads it back through those and the `store/timeline.py` query engine. Recording bytes go to the volume through `CastStore`. Recording content is never written to SQLite or to application logs.
 
@@ -109,6 +113,8 @@ The recording is **sealed** to **complete** in one of two ways. Sealing writes t
 On restart, Gatorcast re-adopts each provisional row from its on-disk plaintext `.cast` as an in-progress session (so continuation chunks keep appending and it seals normally) with a fresh idle clock; a provisional row with no `.cast` older than the idle timeout is an abandoned start and is swept away. A clean shutdown does not seal in-progress sessions. They stay provisional and are re-adopted the same way on the next start.
 
 **Encryption note:** because recordings are written plaintext while in progress and only encrypted at seal, an in-progress recording is plaintext at rest until it seals (see [Encryption at Rest](#encryption-at-rest)).
+
+**One recording per SSH channel (planned for 0.6.0; not yet implemented).** A Gateway 2.0.0 SSH chunk line carries the id of the SSH channel it belongs to. Two shell channels on one SSH connection will be stored as two recordings instead of overwriting each other. The first channel keeps the connection id as its session id, and each further channel gets a stable id derived from it. A chunk repeated byte for byte is ignored as a redelivery. A chunk with the same sequence number but different content keeps the first and logs `assembler.seq_conflict`.
 
 #### Connection and session states
 

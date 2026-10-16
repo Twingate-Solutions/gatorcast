@@ -3,7 +3,8 @@
 This is the single process that hosts ingestion, assembly, storage, the
 scheduler, and (later) the web UI. The lifespan opens the database, starts the
 ingest consumer (classify → assembler), schedules the idle-finalize job, and
-starts the syslog listener.
+starts the syslog listener. Front doors classify; the consumer only hands events to
+the assembler.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from gatorcast.ingest.syslog_tcp import SyslogTCPServer
 from gatorcast.logging import configure_logging, get_logger
 from gatorcast.pipeline.assembler import Assembler
 from gatorcast.pipeline.backfill import run_backfill
-from gatorcast.pipeline.classify import classify
+from gatorcast.pipeline.classify import Event
 from gatorcast.pipeline.retention import RetentionPurger
 from gatorcast.store.activity import ActivityStore
 from gatorcast.store.casts import CastStore
@@ -43,26 +44,25 @@ log = get_logger(__name__)
 
 
 async def _consume_queue(app: FastAPI) -> None:
-    """Drain the ingest queue through the pipeline: classify → assembler.
+    """Drain the ingest queue into the assembler.
 
-    One bad object must never kill the consumer, so processing is wrapped and
-    failures are logged as a counter only (never the object's content — it may
-    carry recording payloads, CLAUDE.md rule 5).
+    Both front doors classify before enqueueing (``ingest.counts.IntakeCounts.triage``),
+    so the queue carries events, not raw objects. One bad event must never kill the
+    consumer, so handling is wrapped and failures are logged as a counter only (never
+    the event's content — it may carry recording payloads, CLAUDE.md rule 5).
     """
-    queue: asyncio.Queue[dict] = app.state.ingest_queue
+    queue: asyncio.Queue[Event] = app.state.ingest_queue
     assembler: Assembler = app.state.assembler
     while True:
-        obj = await queue.get()
+        event = await queue.get()
         try:
-            event = classify(obj)
-            if event is not None:
-                await assembler.handle(event)
+            await assembler.handle(event)
         except Exception as exc:
-            # Log only the exception type, never the object/content (it may carry
+            # Log only the exception type, never the event/content (it may carry
             # recording payloads, CLAUDE.md rule 5). asyncio.CancelledError is a
             # BaseException in 3.12, so it is NOT caught here and still propagates
             # to cancel the consumer on shutdown.
-            log.warning("pipeline.error", error=type(exc).__name__)
+            log.warning("pipeline.error", stage="assembler", error=type(exc).__name__)
         finally:
             queue.task_done()
 
@@ -177,7 +177,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         backfill_task = asyncio.create_task(run_backfill(repo, casts, search))
     app.state.backfill_task = backfill_task
 
-    # Decouple intake from processing: front doors put objects on this queue,
+    # Decouple intake from processing: front doors put classified events on this queue,
     # the consumer drains it. Never let ingestion block the pipeline.
     app.state.ingest_queue = asyncio.Queue()
     consumer = asyncio.create_task(_consume_queue(app))
@@ -284,7 +284,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else None
     )
 
-    app = FastAPI(title="Gatorcast", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="Gatorcast", version="0.6.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.cryptor = cryptor
     app.state.sidecar_cryptor = sidecar_cryptor

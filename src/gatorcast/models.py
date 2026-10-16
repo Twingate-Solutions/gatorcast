@@ -111,6 +111,19 @@ class Session(BaseModel):
     (for example ``SSH``, ``KUBERNETES``), or ``None`` when unknown. Display and CSV
     export detail only (WEBAPP_SPEC §8.7 column 16); never identity (CLAUDE.md rule 4).
     """
+    parent_conn_id: str | None = None
+    """The real Gateway ``conn_id`` when this row is a per-channel session.
+
+    A Gateway 2.0.0 SSH connection can carry several channels, each recorded on its
+    own. Channel 0 (and any chunk with no channel id) keeps ``conn_id`` equal to the
+    Gateway connection id and has ``parent_conn_id = None``. Any other channel gets a
+    derived ``conn_id`` (see ``pipeline.assembler.session_id_for``) and stores the
+    real connection id here. ``parent_conn_id or conn_id`` is always the Gateway
+    connection id.
+    """
+    stream: int | None = None
+    """SSH channel id (``ssh.channel.id``) of this recording, or ``None`` when unknown
+    (Kubernetes, pre-2.0.0 lines, rows from before the column existed). Display detail."""
 
 
 class RecordingChunk(BaseModel):
@@ -141,6 +154,17 @@ class RecordingChunk(BaseModel):
 
     Matches the ``request_id`` of the exec's status-101 API audit line, which is
     how an activity command links to its recording. SSH chunks carry none.
+    """
+    stream: int | None = None
+    """SSH channel id (``ssh.channel.id``) from a Gateway 2.0.0 SSH recording chunk.
+
+    One SSH connection (``conn_id``) can carry several channels, each recorded as
+    its own asciicast with its own ``asciicast_sequence_num`` series. The assembler
+    uses this key to keep a separate recording per channel on one ``conn_id``
+    instead of interleaving them. ``None`` for Kubernetes chunks, preview-format
+    lines and any chunk whose channel id is absent or not a non-negative integer
+    (at most 2**31 - 1). No other ``ssh`` field is read: ``ssh.username`` is the
+    remote shell account, never identity (CLAUDE.md rule 4).
     """
 
 

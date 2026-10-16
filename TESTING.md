@@ -149,14 +149,27 @@ docker compose up -d
 
 # 2. Seed it.
 python scripts/seed_demo.py
-# -> POST /ingest -> 204 (115 objects: 8 sessions, 7 web apps / 91 lines)
+# -> POST /ingest -> 200 (115 objects: 8 sessions, 7 web apps / 91 lines)
+#    followed by the intake counts (JSON): accepted 115, dropped 0
 
 # 3. Browse http://127.0.0.1:8080/dashboard?window=all — you should see 8 sessions,
 #    6 of them flagged, severity/category breakdowns, and the two clean sessions with no
 #    findings, plus a Web requests tile (70 requests).
 ```
 
-`/ingest` returns `204 No Content`, which is what the script prints. The 24 recording objects
+`/ingest` returns `200` with a JSON body of intake counts (Gatorcast 0.6.0 and later; older versions returned `204 No Content`), and the script prints the status and then that body. Every object is accepted:
+
+```json
+{
+  "accepted": 115,
+  "dropped": 0,
+  "accepted_by_kind": {"ApiRequest": 70, "RecordingChunk": 8, "SessionEnd": 8, "SessionStart": 29},
+  "dropped_by_reason": {},
+  "noise_by_logger": {}
+}
+```
+
+A non-zero `dropped` means lines were rejected; see [The `/ingest` response](README.md#the-ingest-response). The 24 recording objects
 are 8 sessions times 3 lines; the count did not change when start lines started creating pending
 connections, because every seeded connection also delivers a chunk and so becomes a session. The
 91 web lines are 7 apps times 3 connections, each a start line plus 3 or 4 requests.

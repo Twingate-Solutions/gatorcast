@@ -1,9 +1,19 @@
 """Per-connection reassembly of asciicast fragments into a stored recording.
 
-The assembler holds an in-memory map ``conn_id -> SessionBuffer``. Events flow in
+The assembler holds an in-memory map ``session id -> InProgress``. Events flow in
 from the classifier; on a finalize signal (close event or idle timeout) the buffer
-is reassembled into one asciicast v2 document and written to ``<conn_id>.cast`` on
-the volume, with metadata recorded in SQLite.
+is reassembled into one asciicast v2 document and written to ``<session id>.cast``
+on the volume, with metadata recorded in SQLite.
+
+Session id vs. connection id. A recording is keyed by its *session id*, which is the
+Gateway ``conn_id`` for every Kubernetes recording, every pre-2.0.0 SSH recording and
+SSH channel 0. A Gateway 2.0.0 SSH connection can open several shell channels, each
+recorded on its own with its own ``asciicast_sequence_num`` series starting at 1, so
+chunks carry a ``stream`` (``ssh.channel.id``). Any other channel gets the derived id
+:func:`session_id_for` (a UUIDv5 of ``conn_id`` and the channel), stored with the real
+connection id in ``sessions.parent_conn_id``. Everything below that says ``conn_id``
+on a buffer, a cast file, a finding or a sidecar means the session id; the
+``connections`` table, the start line and API audits always use the real connection id.
 
 Reassembly contract (confirmed against the Gateway's ``internal/sessionrecorder``):
   * Each flushed chunk is a SELF-CONTAINED mini-document: the Gateway prepends the
@@ -14,7 +24,12 @@ Reassembly contract (confirmed against the Gateway's ``internal/sessionrecorder`
     once and concatenate every event line across chunks in ``seq`` order. See
     ``reassemble_asciicast``. (This supersedes the old "concat then parse / may
     split mid-tuple" assumption.)
-  * Keying fragments by ``seq`` makes redelivery harmless (last write wins).
+  * Chunks are keyed by ``seq`` within one session. A repeated ``seq`` with identical
+    text is a redelivery (no-op); with different text it is a conflict the per-stream
+    keying could not resolve: the first text is kept, the later one dropped, and
+    ``assembler.seq_conflict`` is logged. After a restart or reopen the per-seq map
+    is empty, so a redelivered chunk is recognised by its event lines already being
+    present in the on-disk document instead (see ``InProgress.covered_by_baseline``).
   * The Gateway's final flush (``message == "session finished"``) is a reliable
     end-of-session signal; finalize triggers on it. The idle sweep is only a
     backstop for sessions whose Gateway died without that final flush.
@@ -54,6 +69,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +104,43 @@ _FINALIZED_MAX = 10_000
 
 # What a chunk with no in-memory buffer may do, decided from the session row.
 UnbufferedAction = Literal["promote", "reopen", "ignore", "adopt"]
+
+# Namespace for derived per-channel session ids. FIXED FOR EVER: changing it would
+# re-key every stored per-channel recording (cast file name, findings, sidecar, and the
+# AAD of an encrypted cast), and a redelivered chunk would start a second session.
+_STREAM_NAMESPACE = uuid.UUID("c3f1a7e2-5b0d-4e6a-9a48-7d2e1f8b6c35")
+
+
+def session_id_for(conn_id: str, stream: int | None) -> str:
+    """Return the session id for a recording chunk's ``(conn_id, stream)``.
+
+    ``None`` and channel ``0`` map to ``conn_id`` itself, so Kubernetes, every
+    pre-2.0.0 SSH deployment and the first SSH channel keep their existing ids, cast
+    files and URLs. Any other channel maps to ``uuid5(namespace, "<conn_id>/ssh-channel/
+    <stream>")``: deterministic (stable across restarts and redelivery), a plain UUID
+    (it passes every conn_id check, cast filename rule and ``/sessions/{id}`` route),
+    and never equal to a Gateway connection id in practice.
+
+    Args:
+        conn_id: The Gateway connection id (already validated in ``classify``).
+        stream: ``RecordingChunk.stream`` (``ssh.channel.id``), or ``None``.
+
+    Returns:
+        The session id.
+    """
+    if stream is None or stream == 0:
+        return conn_id
+    return str(uuid.uuid5(_STREAM_NAMESPACE, f"{conn_id}/ssh-channel/{stream}"))
+
+
+def _event_lines(text: str) -> list[str]:
+    """Return the stripped event (JSON array) lines of an asciicast document or chunk.
+
+    A cheap shape test (a line starting with ``[``), not a JSON parse: it only feeds
+    the redelivery comparison, where a non-event line simply never matches.
+    """
+    lines = (raw.strip() for raw in text.split("\n"))
+    return [line for line in lines if line.startswith("[")]
 
 
 @dataclass(slots=True)
@@ -253,16 +306,22 @@ def parse_asciicast(text: str) -> AsciicastMeta:
 
 @dataclass(slots=True)
 class InProgress:
-    """In-memory state for one connection whose recording is being assembled.
+    """In-memory state for one recording (one session id) being assembled.
 
     File-first model: the plaintext ``.cast`` on disk is the durable copy, rewritten
     on every append. This structure holds the per-``seq`` chunks so reassembly stays
     correctly ordered regardless of arrival order, plus a ``baseline`` — the prior
     document text — set when a session is reopened from a sealed file or re-adopted
     after a restart.
+
+    ``conn_id`` is the *session id* (see :func:`session_id_for`). ``parent_conn_id`` is
+    the real Gateway connection id for a derived per-channel session and ``None`` for
+    a primary one; ``stream`` is the SSH channel id when known.
     """
 
     conn_id: str
+    parent_conn_id: str | None = None
+    stream: int | None = None
     username: str | None = None
     resource_address: str | None = None
     shell_user: str | None = None  # envelope session_start only; header wins
@@ -272,6 +331,32 @@ class InProgress:
     chunks: dict[int, str] = field(default_factory=dict)
     baseline: str | None = None
     last_activity: float = 0.0  # monotonic seconds; drives the idle sweep
+    # Event lines of ``baseline``, built on first use (a redelivery check only).
+    baseline_events: frozenset[str] | None = field(default=None, repr=False)
+
+    @property
+    def connection_id(self) -> str:
+        """The real Gateway connection id this recording belongs to."""
+        return self.parent_conn_id or self.conn_id
+
+    def covered_by_baseline(self, chunk_text: str) -> bool:
+        """True if every event line of ``chunk_text`` is already in the baseline.
+
+        The redelivery test for a buffer whose per-``seq`` map does not exist (after
+        a restart's re-adoption, or a reopen). Event offsets are absolute and
+        increasing, so a chunk whose events are all already in the document is a
+        redelivery, not new data. A chunk with no event lines is never "covered": it
+        adds nothing either way, so it takes the normal path. Compared by exact line
+        text, never logged.
+        """
+        if not self.baseline:
+            return False
+        events = _event_lines(chunk_text)
+        if not events:
+            return False
+        if self.baseline_events is None:
+            self.baseline_events = frozenset(_event_lines(self.baseline))
+        return all(line in self.baseline_events for line in events)
 
     def documents(self) -> list[str]:
         """Texts to reassemble: any baseline first, then chunks in ascending seq."""
@@ -429,6 +514,10 @@ class Assembler:
         # Debug counter: late chunks/starts ignored because their conn_id is sealed
         # terminally (or, for a legacy row, with an unknown seal mode).
         self._ignored_finalized = 0
+        # Debug counters: chunks dropped because the same ``seq`` was already stored
+        # (identical text = redelivery; different text = ``assembler.seq_conflict``).
+        self._seq_redelivered = 0
+        self._seq_conflicts = 0
         # Envelope-format start lines carry the OS account (``shell_user``), which the
         # ``connections`` table has no column for. Held here between the start line
         # and the promoting chunk so envelope recordings keep it (secondary detail;
@@ -439,6 +528,16 @@ class Assembler:
     def active_count(self) -> int:
         """Number of sessions currently in progress (provisional, buffering)."""
         return len(self._buffers)
+
+    @property
+    def seq_redelivered_count(self) -> int:
+        """Chunks dropped as redeliveries (same ``seq``, same text, or already in the baseline)."""
+        return self._seq_redelivered
+
+    @property
+    def seq_conflict_count(self) -> int:
+        """Chunks dropped because their ``seq`` was already stored with different text."""
+        return self._seq_conflicts
 
     async def handle(
         self, event: RecordingChunk | SessionStart | SessionEnd | ApiRequest
@@ -451,10 +550,12 @@ class Assembler:
                 await self._on_chunk(event)
                 # The Gateway's final flush is both the last chunk and a reliable end
                 # signal: it was persisted+scanned above, now seal terminally.
+                # Only this chunk's own channel: another channel of the same
+                # connection keeps recording.
                 if event.is_final:
-                    await self.finalize(event.conn_id)
+                    await self.finalize(session_id_for(event.conn_id, event.stream))
             case SessionEnd():
-                await self.finalize(event.conn_id)
+                await self.finalize_connection(event.conn_id)
             case ApiRequest():
                 await self._on_api(event)
 
@@ -490,8 +591,10 @@ class Assembler:
             # this event (a repeated or forged line cannot retype a connection).
             stored = await self._activity.get_connection(event.conn_id)
             stored_type = stored.resource_type if stored is not None else event.resource_type
-            buf = self._buffers.get(event.conn_id)
-            if buf is None:
+            # Every recording of this connection: the primary session and any
+            # per-channel sessions (a chunk can beat its start line on any channel).
+            bufs = [b for b in self._buffers.values() if b.connection_id == event.conn_id]
+            if not bufs:
                 # Pending connection only. A chunk promotes it; an audit line marks
                 # it ``api``; neither within the backstop expires it to ``error``.
                 if event.shell_user is not None:
@@ -501,27 +604,34 @@ class Assembler:
             # recording. Keep its state there (the upsert above never changes state,
             # but a row inserted just now would be ``pending``).
             await self._activity.set_state(event.conn_id, "recording")
-            if event.resource_address is not None:
-                buf.resource_address = event.resource_address
-            if event.username is not None:
-                buf.username = event.username
-            if event.shell_user is not None:
-                buf.shell_user = event.shell_user
-            if buf.first_ts is None:
-                buf.first_ts = event.ts
-            if event.ts is not None:
-                buf.last_ts = event.ts
-            buf.last_activity = self._clock()
-            await self._repo.upsert_start(
-                conn_id=buf.conn_id,
-                username=buf.username,
-                resource_address=buf.resource_address,
-                started_at=buf.first_ts,
-                resource_type=_session_resource_type(stored_type),
-            )
+            for buf in bufs:
+                if event.resource_address is not None:
+                    buf.resource_address = event.resource_address
+                if event.username is not None:
+                    buf.username = event.username
+                if event.shell_user is not None:
+                    buf.shell_user = event.shell_user
+                if buf.first_ts is None:
+                    buf.first_ts = event.ts
+                if event.ts is not None:
+                    buf.last_ts = event.ts
+                buf.last_activity = self._clock()
+                await self._repo.upsert_start(
+                    conn_id=buf.conn_id,
+                    username=buf.username,
+                    resource_address=buf.resource_address,
+                    started_at=buf.first_ts,
+                    resource_type=_session_resource_type(stored_type),
+                    parent_conn_id=buf.parent_conn_id,
+                    stream=buf.stream,
+                )
 
     async def _on_chunk(self, event: RecordingChunk) -> None:
         """Store a chunk, persist the growing plaintext ``.cast``, and scan live.
+
+        The chunk is routed to its *session* (:func:`session_id_for`): the Gateway
+        ``conn_id`` for channel 0 / no channel id, a derived id for any other SSH
+        channel, so channels of one connection never overwrite each other's ``seq``.
 
         A chunk with no in-memory buffer is resolved first. The ``_sealed`` cache
         answers when it has an entry (terminal → ignore, reopenable → reopen);
@@ -536,7 +646,9 @@ class Assembler:
         baseline. Chunk content is never logged.
         """
         async with self._lock:
-            conn_id = event.conn_id
+            conn_id = session_id_for(event.conn_id, event.stream)
+            # Real connection id of a derived per-channel session; None for a primary.
+            parent = event.conn_id if conn_id != event.conn_id else None
             buf = self._buffers.get(conn_id)
             if buf is None:
                 sealed_reopenable = self._sealed.get(conn_id)
@@ -547,21 +659,35 @@ class Assembler:
                     log.debug("assembler.ignore_sealed", phase="chunk", source="cache")
                     return
                 if sealed_reopenable is True:
-                    buf = await self._reopen_sealed(conn_id, source="cache")
+                    buf = await self._reopen_sealed(
+                        conn_id, source="cache", parent_conn_id=parent, stream=event.stream
+                    )
                 else:
                     action = await self._resolve_unbuffered(conn_id)
                     if action == "ignore":
                         return
                     if action == "reopen":
-                        buf = await self._reopen_sealed(conn_id, source="db")
+                        buf = await self._reopen_sealed(
+                            conn_id, source="db", parent_conn_id=parent, stream=event.stream
+                        )
                     elif action == "adopt":
-                        buf = await self._adopt_provisional(conn_id, self._clock())
+                        buf = await self._adopt_provisional(
+                            conn_id,
+                            self._clock(),
+                            parent_conn_id=parent,
+                            stream=event.stream,
+                        )
                         log.info("assembler.adopt", conn_id=conn_id)
                     else:
-                        buf = await self._promote(conn_id)
+                        buf = await self._promote(event.conn_id, event.stream)
+                # A freshly resolved buffer counts as active now, so a redelivered
+                # chunk that is dropped below cannot leave it idle since the epoch.
+                buf.last_activity = self._clock()
                 self._buffers[conn_id] = buf
 
-            buf.chunks[event.seq] = event.asciicast  # last write wins → dup-safe
+            if self._drop_repeated_chunk(buf, event):
+                return
+            buf.chunks[event.seq] = event.asciicast
             if event.request_id is not None and buf.request_id is None:
                 buf.request_id = event.request_id
             if event.username is not None and buf.username is None:
@@ -575,8 +701,61 @@ class Assembler:
             cast_text = await self._persist(buf)
             await self._maybe_scan(buf.conn_id, cast_text, write_sidecar=False)
 
-    async def _promote(self, conn_id: str) -> InProgress:
+    def _drop_repeated_chunk(self, buf: InProgress, event: RecordingChunk) -> bool:
+        """Return True (and count it) if ``event`` must not be stored again.
+
+        Within one session a ``seq`` is stored once, first text wins:
+
+          * same ``seq``, identical text: a redelivery, counted, debug-logged, a no-op;
+          * same ``seq``, different text: a conflict that per-stream keying cannot
+            resolve (preview/Kubernetes lines carry no stream id, or a broken sender).
+            The first text is kept, never overwritten; ``assembler.seq_conflict`` is
+            logged at warning with the session id, ``seq`` and the two lengths only;
+          * ``seq`` not stored but the buffer has a baseline (re-adopted after a
+            restart, or reopened) and every event line of the chunk is already in it:
+            a redelivery of a chunk persisted before the restart. The per-seq map is
+            not persisted, so this is a comparison by event content, not by ``seq``.
+
+        Content is never logged (rule 5). Caller holds the lock.
+        """
+        existing = buf.chunks.get(event.seq)
+        if existing is not None:
+            if existing == event.asciicast:
+                self._seq_redelivered += 1
+                log.debug("assembler.seq_redelivered", conn_id=buf.conn_id, seq=event.seq)
+            else:
+                self._seq_conflicts += 1
+                log.warning(
+                    "assembler.seq_conflict",
+                    conn_id=buf.conn_id,
+                    seq=event.seq,
+                    kept_length=len(existing),
+                    dropped_length=len(event.asciicast),
+                )
+            return True
+        if buf.covered_by_baseline(event.asciicast):
+            self._seq_redelivered += 1
+            log.debug(
+                "assembler.seq_redelivered",
+                conn_id=buf.conn_id,
+                seq=event.seq,
+                source="baseline",
+            )
+            return True
+        return False
+
+    async def _promote(self, conn_id: str, stream: int | None = None) -> InProgress:
         """Promote a connection to ``recording`` on its first chunk; return its buffer.
+
+        ``conn_id`` is the real Gateway connection id and ``stream`` the chunk's SSH
+        channel id. For channel ``None``/``0`` the session id is ``conn_id`` (the
+        behaviour described below). For another channel the session id is
+        :func:`session_id_for`: the buffer and the new ``provisional`` row take their
+        identity and cluster from the *parent* connection, the row records
+        ``parent_conn_id``/``stream``, and the connection moves to ``recording``. A
+        start-only ``error`` row the backstop had made for the parent connection is
+        deleted instead of reverted (it was a recording connection after all; the
+        recording lives on the derived row).
 
         Seeds the new buffer (identity, cluster, start time) from the connection's
         start line, recovers a backstop ``error`` row if there is one (a late chunk
@@ -593,28 +772,48 @@ class Assembler:
         the next :meth:`_persist` would replace the sealed file with the new chunks
         alone.
         """
+        session_id = session_id_for(conn_id, stream)
+        derived = session_id != conn_id
         conn = await self._activity.get_connection(conn_id)
-        buf = InProgress(conn_id=conn_id)
+        buf = InProgress(
+            conn_id=session_id,
+            parent_conn_id=conn_id if derived else None,
+            stream=stream,
+        )
         if conn is not None:
             buf.username = conn.username
             buf.resource_address = conn.resource_address
             buf.first_ts = conn.started_at
-        buf.shell_user = self._pending_shell_user.pop(conn_id, None)
+        # The held envelope shell_user belongs to the connection, and envelope lines
+        # have no channel, so only a primary promotion consumes it.
+        buf.shell_user = (
+            self._pending_shell_user.get(conn_id)
+            if derived
+            else self._pending_shell_user.pop(conn_id, None)
+        )
         # A connection the backstop had expired (started but never recorded) has a
         # visible 'error' row; revert it first so the upsert below can refresh it.
         # No-op for a fresh connection.
-        await self._repo.revert_error_to_provisional(conn_id)
+        await self._repo.revert_error_to_provisional(session_id)
+        if derived:
+            # The parent's own start-only 'error' row is a phantom now that one of its
+            # channels recorded. Guarded: a row with chunks or a cast is never deleted.
+            await self._repo.delete_start_only_error(conn_id)
         await self._repo.upsert_start(
-            conn_id=conn_id,
+            conn_id=session_id,
             username=buf.username,
             resource_address=buf.resource_address,
             started_at=buf.first_ts,
             resource_type=_session_resource_type(conn.resource_type if conn is not None else None),
+            parent_conn_id=buf.parent_conn_id,
+            stream=stream,
         )
         await self._activity.set_state(conn_id, "recording")
         log.info(
             "assembler.promote",
-            conn_id=conn_id,
+            conn_id=session_id,
+            parent_conn_id=buf.parent_conn_id,
+            stream=stream,
             from_state=conn.state if conn is not None else None,
         )
         return buf
@@ -674,7 +873,14 @@ class Assembler:
         log.warning("assembler.unknown_status_skip", conn_id=conn_id)
         return "ignore"
 
-    async def _reopen_sealed(self, conn_id: str, *, source: str) -> InProgress:
+    async def _reopen_sealed(
+        self,
+        conn_id: str,
+        *,
+        source: str,
+        parent_conn_id: str | None = None,
+        stream: int | None = None,
+    ) -> InProgress:
         """Reopen a reopenably-sealed session and return its buffer.
 
         Decrypts the sealed file back to plaintext (``CastStore.reopen``), reverts
@@ -683,9 +889,11 @@ class Assembler:
         baseline so appends extend it. Caller holds the lock.
 
         Args:
-            conn_id: The connection id to reopen.
+            conn_id: The session id to reopen.
             source: ``"cache"`` (from ``_sealed``) or ``"db"`` (from the session
                 row); logged for diagnostics.
+            parent_conn_id: Real connection id of a derived per-channel session.
+            stream: The chunk's SSH channel id, if any.
 
         Returns:
             The new in-progress buffer.
@@ -694,9 +902,18 @@ class Assembler:
         await self._repo.reopen(conn_id)
         self._sealed.pop(conn_id, None)
         log.info("assembler.reopen", conn_id=conn_id, source=source)
-        return InProgress(conn_id=conn_id, baseline=baseline)
+        return InProgress(
+            conn_id=conn_id, parent_conn_id=parent_conn_id, stream=stream, baseline=baseline
+        )
 
-    async def _adopt_provisional(self, conn_id: str, now: float) -> InProgress:
+    async def _adopt_provisional(
+        self,
+        conn_id: str,
+        now: float,
+        *,
+        parent_conn_id: str | None = None,
+        stream: int | None = None,
+    ) -> InProgress:
         """Build a buffer for a ``provisional`` row from its on-disk plaintext ``.cast``.
 
         In-progress files are plaintext (only sealed rows are encrypted), so the file
@@ -705,14 +922,22 @@ class Assembler:
         Caller holds the lock and has checked the file is non-empty.
 
         Args:
-            conn_id: The connection id to adopt.
+            conn_id: The session id to adopt.
             now: Monotonic time to stamp as the buffer's last activity.
+            parent_conn_id: Real connection id of a derived per-channel session.
+            stream: SSH channel id, if known.
 
         Returns:
             The adopted in-progress buffer (not yet registered in ``_buffers``).
         """
         baseline = await self._casts.read_plaintext(self._casts.path_for(conn_id))
-        return InProgress(conn_id=conn_id, baseline=baseline, last_activity=now)
+        return InProgress(
+            conn_id=conn_id,
+            parent_conn_id=parent_conn_id,
+            stream=stream,
+            baseline=baseline,
+            last_activity=now,
+        )
 
     async def _on_api(self, event: ApiRequest) -> None:
         """Store one API audit line and advance its connection's state.
@@ -804,12 +1029,29 @@ class Assembler:
             )
 
     async def finalize(self, conn_id: str) -> None:
-        """Seal a connection terminally (end signal / close). Idempotent no-op if unknown."""
+        """Seal one session terminally (its end signal). Idempotent no-op if unknown.
+
+        ``conn_id`` is the *session id* (:func:`session_id_for`), so the ``"session
+        finished"`` flush of one SSH channel seals only that channel's recording.
+        """
         async with self._lock:
             buf = self._buffers.pop(conn_id, None)
             if buf is None:
                 return
             await self._seal(buf, reopenable=False)
+
+    async def finalize_connection(self, conn_id: str) -> None:
+        """Seal every in-progress session of a connection terminally (close event).
+
+        ``conn_id`` is the real Gateway connection id: the primary session and all
+        per-channel sessions of it. A no-op when none is buffered.
+        """
+        async with self._lock:
+            ids = [
+                sid for sid, buf in self._buffers.items() if buf.connection_id == conn_id
+            ]
+            for sid in ids:
+                await self._seal(self._buffers.pop(sid), reopenable=False)
 
     async def finalize_idle(self) -> None:
         """Idle backstop sweep. Intended to run on an APScheduler interval.
@@ -915,7 +1157,14 @@ class Assembler:
         async with self._lock:
             for conn_id, created_at in rows:
                 if self._has_nonempty_file(self._casts.path_for(conn_id)):
-                    self._buffers[conn_id] = await self._adopt_provisional(conn_id, now)
+                    # The link to the real connection is on the row, not on disk.
+                    row = await self._repo.get(conn_id)
+                    self._buffers[conn_id] = await self._adopt_provisional(
+                        conn_id,
+                        now,
+                        parent_conn_id=row.parent_conn_id if row is not None else None,
+                        stream=row.stream if row is not None else None,
+                    )
                     readopted += 1
                 elif self._older_than(created_at, cutoff):
                     await self._repo.delete_provisional(conn_id)
@@ -941,6 +1190,8 @@ class Assembler:
             username=buf.username,
             started_at=buf.first_ts,
             request_id=buf.request_id,
+            parent_conn_id=buf.parent_conn_id,
+            stream=buf.stream,
         )
         await self._repo.update_progress(
             buf.conn_id,

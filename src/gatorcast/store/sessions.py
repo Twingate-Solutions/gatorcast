@@ -182,20 +182,23 @@ class PurgedSession(BaseModel):
 _SESSION_COLUMNS = (
     "conn_id, username, resource_address, shell_user, started_at, ended_at, "
     "duration_seconds, width, height, chunk_count, size_bytes, cast_path, status, "
-    "finding_count, max_severity, request_id, sealed_terminal, resource_type"
+    "finding_count, max_severity, request_id, sealed_terminal, resource_type, "
+    "parent_conn_id, stream"
 )
 
 
 def _row_to_session(row: aiosqlite.Row) -> Session:
     """Map a ``sessions`` table row to the ``Session`` model.
 
-    ``sealed_terminal`` and ``resource_type`` are read only when the row carries
-    that column, so a caller selecting its own narrower column list still maps
-    cleanly (it gets ``None``).
+    ``sealed_terminal``, ``resource_type``, ``parent_conn_id`` and ``stream`` are read
+    only when the row carries that column, so a caller selecting its own narrower
+    column list still maps cleanly (it gets ``None``).
     """
     keys = row.keys()
     sealed = row["sealed_terminal"] if "sealed_terminal" in keys else None
     resource_type = row["resource_type"] if "resource_type" in keys else None
+    parent_conn_id = row["parent_conn_id"] if "parent_conn_id" in keys else None
+    stream = row["stream"] if "stream" in keys else None
     return Session(
         conn_id=row["conn_id"],
         username=row["username"],
@@ -215,6 +218,8 @@ def _row_to_session(row: aiosqlite.Row) -> Session:
         request_id=row["request_id"],
         sealed_terminal=None if sealed is None else bool(sealed),
         resource_type=resource_type,
+        parent_conn_id=parent_conn_id,
+        stream=stream,
     )
 
 
@@ -239,6 +244,8 @@ class SessionRepository:
         started_at: str | None,
         *,
         resource_type: str | None = None,
+        parent_conn_id: str | None = None,
+        stream: int | None = None,
     ) -> None:
         """Insert or refresh a provisional row for a buffering session.
 
@@ -255,6 +262,10 @@ class SessionRepository:
             resource_type: Normalized Gateway resource type from the connection's
                 start line, if known. A non-null value wins over the stored one;
                 ``None`` never clears it.
+            parent_conn_id: The real Gateway connection id when ``conn_id`` is a
+                derived per-channel session id; ``None`` for a primary row. First
+                non-null value wins.
+            stream: SSH channel id when known. First non-null value wins.
         """
         await self._upsert_provisional(
             conn_id,
@@ -263,6 +274,8 @@ class SessionRepository:
             started_at,
             request_id=None,
             resource_type=resource_type,
+            parent_conn_id=parent_conn_id,
+            stream=stream,
         )
 
     async def _upsert_provisional(
@@ -274,31 +287,45 @@ class SessionRepository:
         *,
         request_id: str | None,
         resource_type: str | None = None,
+        parent_conn_id: str | None = None,
+        stream: int | None = None,
     ) -> None:
         """Shared INSERT-or-refresh of a provisional row (see :meth:`upsert_start`).
 
         ``request_id`` is first-wins (``COALESCE(sessions.request_id, ?)``): once a
         k8s exec/attach chunk has set it, later chunks never overwrite it.
         ``resource_type`` is ``COALESCE(excluded, existing)``: a non-null value wins,
-        ``None`` never clears.
+        ``None`` never clears. ``parent_conn_id`` and ``stream`` are first-wins like
+        ``request_id`` (a session's channel never changes).
         """
         await self._db.execute(
             """
             INSERT INTO sessions (
                 conn_id, username, resource_address, started_at, request_id,
-                resource_type, status, created_at, updated_at
+                resource_type, parent_conn_id, stream, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'provisional', datetime('now'), datetime('now'))
             ON CONFLICT(conn_id) DO UPDATE SET
                 username         = COALESCE(excluded.username, sessions.username),
                 resource_address = COALESCE(excluded.resource_address, sessions.resource_address),
                 started_at       = COALESCE(sessions.started_at, excluded.started_at),
                 request_id       = COALESCE(sessions.request_id, excluded.request_id),
                 resource_type    = COALESCE(excluded.resource_type, sessions.resource_type),
+                parent_conn_id   = COALESCE(sessions.parent_conn_id, excluded.parent_conn_id),
+                stream           = COALESCE(sessions.stream, excluded.stream),
                 updated_at       = datetime('now')
             WHERE sessions.status = 'provisional'
             """,
-            (conn_id, username, resource_address, started_at, request_id, resource_type),
+            (
+                conn_id,
+                username,
+                resource_address,
+                started_at,
+                request_id,
+                resource_type,
+                parent_conn_id,
+                stream,
+            ),
         )
         await self._db.commit()
 
@@ -311,6 +338,9 @@ class SessionRepository:
         username: str | None,
         started_at: str | None,
         request_id: str | None = None,
+        *,
+        parent_conn_id: str | None = None,
+        stream: int | None = None,
     ) -> None:
         """Refresh the provisional row when a recording chunk arrives.
 
@@ -324,9 +354,18 @@ class SessionRepository:
             started_at: First-seen timestamp for the session, if known.
             request_id: Gateway request UUID from a k8s exec/attach chunk; ``None``
                 for SSH. Written with ``COALESCE`` so the first value wins.
+            parent_conn_id: Real Gateway connection id of a derived per-channel
+                session; ``None`` for a primary row.
+            stream: SSH channel id when the chunk carried one.
         """
         await self._upsert_provisional(
-            conn_id, username, None, started_at, request_id=request_id
+            conn_id,
+            username,
+            None,
+            started_at,
+            request_id=request_id,
+            parent_conn_id=parent_conn_id,
+            stream=stream,
         )
 
     async def update_progress(

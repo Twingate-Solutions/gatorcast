@@ -37,6 +37,34 @@ plus the session-start line that carries the target system:
 The Gateway's last chunk for a connection has `"message":"session finished"`. Gatorcast
 treats it as the end of the recording and seals it immediately.
 
+**Gateway 2.0.0 renamed the loggers.** The lines above are what a preview Gateway (before
+2.0.0) emits. Gateway 2.0.0 emits the same lines under new `logger` values, and Gatorcast
+0.6.0 and later accepts both sets, so a fleet that mixes Gateway versions needs no extra
+configuration:
+
+| Line | Preview Gateway | Gateway 2.0.0 |
+| --- | --- | --- |
+| Recording chunk | `gateway.audit` | `session_recording` |
+| HTTP request audit (Kubernetes and web app) | `gateway.audit` | `audit` |
+| Connection start (`Authenticated connection`) | `gateway` | `system` |
+
+A 2.0.0 recording chunk looks like this:
+
+```json
+{"logger":"session_recording","ts":"…Z","user":{"username":"alice@corp"},"conn_id":"<uuid>","asciicast":"<v2 chunk>","asciicast_sequence_num":1}
+```
+
+A 2.0.0 Gateway sends an SSH recording in segments: a chunk about every 256 KB or 5 minutes,
+then a final chunk with `"message":"session finished"`. Gatorcast reassembles them like
+Kubernetes recordings. SSH chunk lines carry an `ssh` object, and Gatorcast reads only
+`ssh.channel.id` from it. 2.0.0 SSH audit events (logger `audit`, with an `ssh` object) and
+the Gateway's service and proxy-error lines are dropped.
+
+> **Upgrade order.** Upgrade Gatorcast to 0.6.0 **before** you move gwops to
+> `twingate/gateway:2.0.0` (gwops commit `b33cf59`) or upgrade any Gateway. A Gatorcast older
+> than 0.6.0 silently drops every 2.0.0 line yet still answers `2xx`, and gwops treats any
+> `2xx` as delivered, so those lines are lost with no error on either side.
+
 For Kubernetes access, the Gateway also emits one `gateway.audit` line per API
 request (`"message":"API request completed"` or `"API request failed"`, with no
 `asciicast`). Gatorcast stores these as allowlisted kubectl activity metadata (see
@@ -63,10 +91,10 @@ What Gatorcast does with each line, as decided by `classify`:
 
 | Line | Match | Result |
 | --- | --- | --- |
-| Recording chunk | `logger` is `gateway.audit` **and** `asciicast` is a non-null string, with an integer `asciicast_sequence_num` | Chunk for that `conn_id`; `message` of `session finished` also seals the recording. A chunk with a missing or non-integer sequence number is dropped. |
-| Start line | `logger` is `gateway`, `message` is `Authenticated connection` | Hidden pending connection, with the normalized `resource_type` (and, for `WEB_APP`, the optional `gwops` object). Needs a recording chunk (becomes a session) or an API audit line (becomes kubectl or web activity) within `SESSION_MAX_IDLE_SECONDS`, or it becomes a visible `error` session. A `WEB_APP` connection with neither expires hidden instead and never becomes an `error` session. |
-| API audit line | `logger` is `gateway.audit`, no `asciicast`, `message` is `API request completed` or `API request failed` | Allowlisted metadata, deduplicated by `request_id`: kubectl activity or web activity, chosen from the connection's `resource_type`. |
-| Close line | `logger` is `gateway`, `message` is `Connection closed` or `Closed connection` | Seals the recording. A defensive fallback; the stock Gateway does not log a close event. |
+| Recording chunk | `logger` is `gateway.audit` or `session_recording` **and** `asciicast` is a non-null string, with an integer `asciicast_sequence_num` | Chunk for that `conn_id`; `message` of `session finished` also seals the recording. A chunk with a missing or non-integer sequence number is dropped. |
+| Start line | `logger` is `gateway` or `system`, `message` is `Authenticated connection` | Hidden pending connection, with the normalized `resource_type` (and, for `WEB_APP`, the optional `gwops` object). Needs a recording chunk (becomes a session) or an API audit line (becomes kubectl or web activity) within `SESSION_MAX_IDLE_SECONDS`, or it becomes a visible `error` session. A `WEB_APP` connection with neither expires hidden instead and never becomes an `error` session. |
+| API audit line | `logger` is `gateway.audit` or `audit`, no `asciicast`, `message` is `API request completed` or `API request failed` | Allowlisted metadata, deduplicated by `request_id`: kubectl activity or web activity, chosen from the connection's `resource_type`. |
+| Close line | `logger` is `gateway` or `system`, `message` is `Connection closed` or `Closed connection` | Seals the recording. A defensive fallback; the stock Gateway does not log a close event. |
 | Envelope record | No `logger`; `type` is `session_start`, `recording_chunk` or `session_end` | Same events as above, from the Gateway fork's recording sink. Additive; the recipes below do not need it. |
 | Anything else | | Dropped as noise. |
 
@@ -90,8 +118,10 @@ journalctl -t gateway -n 1 -o cat
 
 Key behaviors that make the recipes simple:
 
-- **The HTTP door is tolerant.** One malformed line never fails the batch. A successful
-  request returns `204 No Content` even if some lines were dropped. The body is split by
+- **The HTTP door is tolerant.** One malformed line never fails the batch. A request with a
+  valid token returns `200` with a JSON body of counts, even if some or all lines were dropped
+  (see [The `/ingest` response](#the-ingest-response)). **A shipper must accept any `2xx`**; an
+  older Gatorcast returned `204 No Content`. The body is split by
   `Content-Type`: `application/json` is parsed as **one** JSON document (an object or an
   array of objects); any other type (`application/x-ndjson`, `text/plain`, none) is read
   line by line. Do not send multi-line NDJSON as `application/json` — it is not one valid
@@ -120,10 +150,49 @@ Key behaviors that make the recipes simple:
 - **Non-JSON lines in a batch are dropped without failing it.** A line such as Go's
   `http: proxy error: tls: failed to verify certificate: …` (emitted just before the audit line
   for the 502 it caused) is dropped with a `normalize.drop` warning. The batch still returns
-  `204` and its other lines are kept.
+  `200` and its other lines are kept; the dropped line shows up as `not_json` in the counts.
 - **An unparseable line is logged, not stored.** Gatorcast logs `normalize.drop` with the
   line length (never the content) and drops the line. A length at or near `49152` is the
   tell for journald splitting (see the warning in §2.1).
+
+#### The `/ingest` response
+
+A request with a valid token returns `200` and `application/json`. The body holds counts only,
+never line content:
+
+```json
+{
+  "accepted": 3,
+  "dropped": 2,
+  "accepted_by_kind": {"ApiRequest": 1, "RecordingChunk": 2},
+  "dropped_by_reason": {"noise": 1, "not_json": 1},
+  "noise_by_logger": {"other": 1}
+}
+```
+
+- `accepted`: lines classified into an event and queued. `accepted_by_kind` splits it by event
+  type: `RecordingChunk`, `SessionStart`, `SessionEnd`, `ApiRequest`.
+- `dropped`: non-blank lines that produced no event. `dropped_by_reason` splits it:
+  - `not_json`: not a JSON object (a Go `http: proxy error`, a klog line, a collector wrapper
+    with no JSON inside).
+  - `noise`: valid JSON that is not a line Gatorcast keeps (service lines, SSH audit events),
+    or a line of a kept type that was malformed (a bad `conn_id` or sequence number).
+  - `classify_error`: an internal error on that one line. The batch is unaffected.
+- `noise_by_logger` splits `noise` by the line's `logger`: `gateway`, `gateway.audit`,
+  `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown
+  logger name is never echoed back.
+- The three maps list only non-zero entries. Blank lines are not counted. A bad or missing
+  token still returns `401`.
+
+The same counts are logged as one `ingest.http` line per batch. The syslog listener has no
+response, so it logs one `ingest.syslog` line with the same counts when each connection
+closes.
+
+**Reading the counts.** Some noise is normal: an unfiltered Gateway stream includes service
+lines under `gateway` or `system`, and 2.0.0 SSH audit events under `audit`. A batch with high
+`noise` under a logger you did not expect (`other` or `missing`, or `session_recording` when
+recordings should be arriving) is the signal of a Gateway log-format change. A batch where
+`accepted` is `0` and `dropped` is not has delivered nothing.
 
 ### 1.3 Reachability — a caveat that bites everyone
 
@@ -167,6 +236,13 @@ so `/ingest` receives only audit and session data. A line is shipped only if it 
 | HTTP audit | `logger == "gateway.audit"`, no `asciicast`, `message` is `API request completed` or `API request failed` | Kubernetes requests and web-app requests |
 | Connection start | `logger == "gateway"` and `message == "Authenticated connection"` | Every resource type. Gatorcast's only source of `resource_type` and `resource_address`. |
 
+The logger names in this table are the preview Gateway's. Gateway 2.0.0 uses `session_recording`,
+`audit` and `system` for the same three lines (see [§1.1](#11-what-the-gateway-emits)).
+gwops commit `b33cf59` moves gwops to `twingate/gateway:2.0.0`. Before you deploy a gwops build
+that targets 2.0.0, **upgrade Gatorcast to 0.6.0 first**: an older Gatorcast drops every 2.0.0
+line while still answering `2xx`, which gwops counts as delivered. Check that your gwops build's
+allowlist covers the logger names your Gateway version emits.
+
 Everything else is dropped and counted by gwops without logging its content: non-JSON lines
 (Go `http: proxy error`, klog, panics), token and listener errors, every other `gateway`
 service line, the operational error lines the SSH backend logs under the `gateway.audit` name,
@@ -174,8 +250,9 @@ and SSH audit events (which log `env` values and full `exec` commands). A line o
 dropped whole, and that recording is lost. gwops reports the counts in its `/status` under
 `shipper.dropped_lines`. Gatorcast still drops the same lines itself, as defence in depth and
 for shippers that do not filter, so an unfiltered stream is safe to send. If a gwops build does
-not filter yet, expect those extra lines in `/ingest` batches and `normalize.drop` warnings in
-Gatorcast's log.
+not filter yet, expect those extra lines in `/ingest` batches, as `noise` and `not_json` in the
+response counts (see [The `/ingest` response](#the-ingest-response)), and `normalize.drop`
+warnings in Gatorcast's log.
 
 **What a kept line contains.** Kept lines are forwarded byte for byte; nothing is redacted. A
 web-app request line therefore holds the client's `Authorization`, `Cookie` and `X-Api-Key`
@@ -834,9 +911,32 @@ curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
   --data-binary $'{"logger":"gateway","message":"Authenticated connection","conn_id":"test-001","resource_address":"demo-host","user":{"username":"you@corp"}}\n{"logger":"gateway.audit","conn_id":"test-001","asciicast_sequence_num":0,"asciicast":"{\\"version\\":2,\\"width\\":80,\\"height\\":24,\\"timestamp\\":1718700000}\\n[0.5,\\"o\\",\\"hello from gatorcast\\\\r\\\\n\\"]\\n","user":{"username":"you@corp"}}\n{"logger":"gateway","message":"Connection closed","conn_id":"test-001"}'
 ```
 
-A `204 No Content` means the request was accepted; it does not mean every line was
-kept. A `401` means the bearer token is missing or wrong. If the session does not
-appear, check Gatorcast's logs for `normalize.drop` (a line that is not a JSON object).
+A `200` with a JSON body means the request was authenticated and read; it does not mean
+every line was kept. Read the body. For the request above it should look like this, with all
+three lines accepted:
+
+```json
+{"accepted":3,"dropped":0,"accepted_by_kind":{"RecordingChunk":1,"SessionEnd":1,"SessionStart":1},"dropped_by_reason":{},"noise_by_logger":{}}
+```
+
+A non-zero `dropped` says why (`dropped_by_reason`) and, for `noise`, under which logger
+(`noise_by_logger`). A `401` means the bearer token is missing or wrong. If the session does
+not appear, check the counts first, then Gatorcast's logs for `normalize.drop` (a line that
+is not a JSON object) and the `ingest.http` line for the batch.
+
+The same test with Gateway 2.0.0 logger names (`system` for the start line,
+`session_recording` for the chunk) is accepted the same way. Use it to confirm a Gatorcast
+upgrade before you move a Gateway to 2.0.0:
+
+```bash
+curl -sS -X POST "https://gatorcast.internal.example.com:8080/ingest" \
+  -H "Authorization: Bearer <your INGEST_TOKEN>" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary $'{"logger":"system","message":"Authenticated connection","conn_id":"test-002","resource_address":"demo-host-2","user":{"username":"you@corp"}}\n{"logger":"session_recording","conn_id":"test-002","asciicast_sequence_num":0,"asciicast":"{\\"version\\":2,\\"width\\":80,\\"height\\":24,\\"timestamp\\":1718700000}\\n[0.5,\\"o\\",\\"hello from gateway 2.0.0\\\\r\\\\n\\"]\\n","user":{"username":"you@corp"}}'
+```
+
+Expect `"accepted":2` and `"RecordingChunk":1,"SessionStart":1`. On a Gatorcast older than
+0.6.0 the same request returns success with nothing stored.
 
 The start line creates a hidden pending connection, and the chunk promotes it to a
 session. The recording is written to disk and playable as soon as its chunk is

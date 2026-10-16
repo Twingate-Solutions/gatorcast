@@ -6,6 +6,93 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-16
+
+Twingate Gateway 2.0.0 support. Gateway 2.0.0 renamed its loggers, and Gatorcast 0.5.0 and
+earlier drop every 2.0.0 line without reporting an error. 0.6.0 accepts both the preview names
+and the 2.0.0 names, so a fleet that mixes Gateway versions works, and `POST /ingest` now reports
+what it kept and dropped.
+
+**Upgrade Gatorcast to 0.6.0 before you move any Gateway or gwops to 2.0.0.** See
+[Upgrading to 0.6.0](README.md#upgrading-to-060-gateway-200) in the README.
+
+### Added
+
+- **Gateway 2.0.0 loggers are accepted.** Each line kind has a preview name and a 2.0.0 name, and
+  Gatorcast takes either:
+
+  | Line | Preview Gateway | Gateway 2.0.0 |
+  | --- | --- | --- |
+  | Recording chunk | `gateway.audit` | `session_recording` |
+  | HTTP request audit | `gateway.audit` | `audit` |
+  | Connection start (`Authenticated connection`) | `gateway` | `system` |
+
+  The rules for each kind are unchanged: a recording chunk still needs a non-null `asciicast` and
+  an integer `asciicast_sequence_num`, and an HTTP audit still needs a message of
+  `API request completed` or `API request failed`.
+- **2.0.0 SSH recordings are reassembled.** A 2.0.0 Gateway sends an SSH recording in segments (a
+  chunk about every 256 KB or 5 minutes, then a final `session finished` chunk). Gatorcast
+  reassembles them like Kubernetes recordings. From the `ssh` object on these lines it reads only
+  `ssh.channel.id`.
+- **2.0.0 lines Gatorcast does not keep.** SSH audit events (which carry `env` values and full
+  `exec` commands) and the Gateway's service lines match no event, so they are dropped unread and
+  counted as `noise`. Non-JSON proxy-error lines are dropped and counted as `not_json`.
+- **Intake counts in the logs.** `POST /ingest` writes one `ingest.http` log line per batch with
+  the same counts as the response. The syslog listener writes one `ingest.syslog` line per
+  connection, when the connection closes, with the same counts. Counts only: no line content, no
+  header or URL value.
+
+### Changed
+
+- **`POST /ingest` returns `200` with a JSON body, not `204 No Content`.** The body is:
+
+  ```json
+  {
+    "accepted": 3,
+    "dropped": 2,
+    "accepted_by_kind": {"ApiRequest": 1, "RecordingChunk": 2},
+    "dropped_by_reason": {"noise": 1, "not_json": 1},
+    "noise_by_logger": {"other": 1}
+  }
+  ```
+
+  `accepted` counts lines classified into an event. `dropped_by_reason` uses `not_json` (the
+  line is not a JSON object), `noise` (not a line Gatorcast keeps, or a line of a kept type that
+  was malformed, such as a bad `conn_id` or sequence number) and `classify_error`.
+  `noise_by_logger` splits `noise` by the line's `logger` value: `gateway`, `gateway.audit`,
+  `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown
+  logger name is never echoed back. Blank lines are not counted. A bad or missing token still
+  returns `401`.
+
+  **Shippers that test for `204` specifically must accept any `2xx`.**
+- **Classification happens at the front door.** `POST /ingest` and the syslog listener classify
+  each line before it is queued, which is what makes the per-batch counts possible.
+
+### Fixed
+
+- **Two shell channels on one SSH connection no longer overwrite each other.** *(Planned for
+  this release; the implementation is not finished. Update this entry when it lands.)* Each
+  channel is stored as its own recording. The first channel keeps the connection id as its
+  session id; each further channel gets a stable id derived from it. A chunk repeated byte for
+  byte is ignored as a redelivery. A chunk with the same sequence number but different content
+  keeps the first and logs `assembler.seq_conflict`.
+
+### Upgrade notes
+
+- **Upgrade Gatorcast first.** Gatorcast 0.5.0 and earlier drop every Gateway 2.0.0 line and
+  still return success, and gwops treats any `2xx` as delivered, so the lines are lost with no
+  error on either side. gwops commit `b33cf59` moves gwops to `twingate/gateway:2.0.0`. Move
+  Gatorcast to 0.6.0 first, then gwops and the Gateways.
+- **Mixed fleets work.** A 0.6.0 Gatorcast accepts preview and 2.0.0 lines side by side, so there
+  is no need to upgrade every Gateway at once.
+- **Check for a `204` test in your shipper.** A health check or script that requires exactly
+  `204` from `/ingest` fails against 0.6.0. Accept any `2xx`.
+- **No migration step.** There is no schema change, no `PRAGMA user_version` change and no new
+  setting.
+- **Spotting a log-format change.** In the `/ingest` response or the `ingest.http` log line, a
+  batch with a high `noise` count under a logger you did not expect is the sign that the Gateway
+  changed its log format again. See the README troubleshooting entry.
+
 ## [0.5.0] - 2026-10-08
 
 Web-app support (Sessions 11 and 12). Gatorcast now stores and shows Twingate Gateway **web-app**
@@ -673,7 +760,8 @@ This release also ships the kubectl activity work that was previously listed und
 - **GitHub Actions CI** (`publish.yml`): `pytest` gate must pass before the image is
   built and pushed; installs the package with `[dev]` extras.
 
-[Unreleased]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Twingate-Solutions/gatorcast/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Twingate-Solutions/gatorcast/releases/tag/v0.3.0
