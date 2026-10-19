@@ -121,9 +121,10 @@ class Session(BaseModel):
     real connection id here. ``parent_conn_id or conn_id`` is always the Gateway
     connection id.
     """
-    stream: int | None = None
-    """SSH channel id (``ssh.channel.id``) of this recording, or ``None`` when unknown
-    (Kubernetes, pre-2.0.0 lines, rows from before the column existed). Display detail."""
+    stream: str | None = None
+    """SSH channel id (``ssh.channel.id``, a UUID string in Gateway 2.0.0) of this
+    recording, or ``None`` when unknown (Kubernetes, pre-2.0.0 lines, rows from before
+    the column existed). Display detail."""
 
 
 class RecordingChunk(BaseModel):
@@ -155,15 +156,15 @@ class RecordingChunk(BaseModel):
     Matches the ``request_id`` of the exec's status-101 API audit line, which is
     how an activity command links to its recording. SSH chunks carry none.
     """
-    stream: int | None = None
+    stream: str | None = None
     """SSH channel id (``ssh.channel.id``) from a Gateway 2.0.0 SSH recording chunk.
 
     One SSH connection (``conn_id``) can carry several channels, each recorded as
     its own asciicast with its own ``asciicast_sequence_num`` series. The assembler
     uses this key to keep a separate recording per channel on one ``conn_id``
-    instead of interleaving them. ``None`` for Kubernetes chunks, preview-format
-    lines and any chunk whose channel id is absent or not a non-negative integer
-    (at most 2**31 - 1). No other ``ssh`` field is read: ``ssh.username`` is the
+    instead of interleaving them. A string (the Gateway's channel UUID); ``None`` for
+    Kubernetes chunks, preview-format lines and any chunk whose channel id is absent
+    or not a usable string. No other ``ssh`` field is read: ``ssh.username`` is the
     remote shell account, never identity (CLAUDE.md rule 4).
     """
 

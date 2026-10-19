@@ -8,6 +8,7 @@ import pytest
 from tests.samples import sample_lines
 
 from gatorcast.ingest.syslog_tcp import SyslogTCPServer, read_frame
+from gatorcast.models import SessionStart
 
 
 async def _reader_for(data: bytes) -> asyncio.StreamReader:
@@ -65,9 +66,10 @@ async def test_server_enqueues_octet_framed_message() -> None:
         writer.write(f"{len(raw)} ".encode() + raw)
         await writer.drain()
 
-        obj = await asyncio.wait_for(queue.get(), timeout=2.0)
-        assert obj["logger"] == "gateway"
-        assert obj["resource_address"] == "kubernetes.default.svc.cluster.local"
+        # Both front doors classify now: the queue carries Event objects.
+        event = await asyncio.wait_for(queue.get(), timeout=2.0)
+        assert isinstance(event, SessionStart)
+        assert event.resource_address == "kubernetes.default.svc.cluster.local"
 
         writer.close()
         await writer.wait_closed()

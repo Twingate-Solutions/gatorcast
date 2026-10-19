@@ -69,7 +69,16 @@
     </dd>
 
     <dt>Connection id</dt>
-    <dd class="mono dim">{{ session.conn_id }}</dd>
+    <dd class="mono dim">{{ session.connection_id }}</dd>
+
+    {% if session.stream is not none %}
+      <dt>SSH channel</dt>
+      <dd class="mono dim">{{ session.stream }}</dd>
+    {% endif %}
+    {% if session.connection_id != session.conn_id %}
+      <dt>Recording id</dt>
+      <dd class="mono dim">{{ session.conn_id }}</dd>
+    {% endif %}
   </dl>
 
   {% if has_cast %}

@@ -47,7 +47,7 @@ elsewhere.
 
 ### Test inventory
 
-The suite currently collects **3017 tests** across 27 test modules, and all 3017 pass
+The suite currently collects **3212 tests** across 33 test modules, and all 3212 pass
 (`pytest -q`, about 157 seconds, with one third-party Starlette deprecation warning about `httpx`). Counts are from `pytest --collect-only`;
 parametrized cases count individually, so they drift as tests are added.
 

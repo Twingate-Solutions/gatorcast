@@ -160,7 +160,7 @@ def test_e2e_ingest_to_search(tmp_path: Path) -> None:
                 "Content-Type": "application/x-ndjson",
             },
         )
-        assert resp.status_code == 204, f"ingest returned {resp.status_code}: {resp.text}"
+        assert resp.status_code == 200, f"ingest returned {resp.status_code}: {resp.text}"
 
         # ------------------------------------------------------------------ #
         # Step 2: Poll until the async consumer has created the provisional   #
@@ -390,7 +390,7 @@ def _post(client: TestClient, app, lines: list[str]) -> None:
         "/ingest", content="\n".join(lines) + "\n",
         headers={**_ingest_header(), "Content-Type": "application/x-ndjson"},
     )
-    assert resp.status_code == 204, resp.text
+    assert resp.status_code == 200, resp.text
     client.portal.call(app.state.ingest_queue.join)
 
 

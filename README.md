@@ -173,12 +173,17 @@ A request with a valid token returns `200` and a JSON body of counts. The body n
 | `accepted` | Lines classified into an event and queued. |
 | `dropped` | Non-blank lines that produced no event. |
 | `accepted_by_kind` | `accepted`, by event type: `RecordingChunk`, `SessionStart`, `SessionEnd`, `ApiRequest`. |
-| `dropped_by_reason` | `dropped`, by reason: `not_json` (not a JSON object), `noise` (not a line Gatorcast keeps, or a line of a kept type that was malformed, such as a bad `conn_id` or sequence number), `classify_error` (an internal error on that line). |
-| `noise_by_logger` | `noise`, by the line's `logger`: `gateway`, `gateway.audit`, `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown logger name is never echoed. |
+| `dropped_by_reason` | `dropped`, by reason: `not_json` (not a JSON object), `noise` (valid JSON that is not a kind of line Gatorcast keeps), `rejected` (a recognised recording, audit or start line that was malformed, such as a bad `conn_id` or sequence number; likely a lost recording or request), `classify_error` (an internal error classifying that line), `normalize_error` (an internal error reading that line). |
+| `noise_by_logger` | `noise` only, by the line's `logger`: `gateway`, `gateway.audit`, `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown logger name is never echoed. `rejected` lines are not broken down here. |
 
-The three maps list only non-zero entries. Blank lines are not counted. A batch with `accepted` of `0` and `dropped` above `0` delivered nothing. The same counts are logged as one `ingest.http` line per batch. The syslog listener has no response, so it logs one `ingest.syslog` line with the same counts when each connection closes.
+The three maps list only non-zero entries. Blank lines are not counted. A batch with `accepted` of `0` and `dropped` above `0` delivered nothing. A line whose `logger` or `message` is not a string is counted as `noise` (`missing` when it is the `logger`). One bad line never fails a batch, and a large batch does not stall the web UI or the syslog listener while it is processed. The same counts are logged as one `ingest.http` line per batch. The syslog listener has no response, so it logs an `ingest.syslog` line with the same counts every 1000 messages or 60 seconds, whichever comes first (checked as a message arrives), and again when the connection closes. A long-lived shipper connection is therefore visible while it is open.
 
-Some noise is normal. An unfiltered Gateway stream carries service lines under `gateway` or `system`, and 2.0.0 SSH audit events under `audit`. A batch with high `noise` under `other` or `missing`, or noise that suddenly appears under `session_recording` or `gateway.audit` when it did not before, can mean the Gateway changed its log format. See [Recordings missing after a Gateway upgrade](#recordings-missing-after-a-gateway-upgrade).
+Some noise is normal. An unfiltered Gateway stream carries service lines under `gateway` or `system`, and 2.0.0 SSH audit events under `audit`. Two signals are not normal:
+
+- **`rejected` above `0`.** The Gateway sent a recognised line that Gatorcast could not parse, so a recording chunk, request or connection start was probably lost.
+- **High `noise` under a logger you did not expect.** A batch with high `noise` under `other` or `missing`, or noise that suddenly appears under `session_recording` or `gateway.audit` when it did not before, can mean the Gateway changed its log format.
+
+See [Recordings missing after a Gateway upgrade](#recordings-missing-after-a-gateway-upgrade).
 
 For a copy-paste test and shipper recipes (journald, rsyslog, Vector, Docker, Kubernetes), see [INGESTION_RECIPES.md](INGESTION_RECIPES.md); the curl test is in §8.
 
@@ -296,7 +301,7 @@ There are 22 columns. The first 15 are unchanged from 0.4.0.
 
 | # | Columns | Meaning |
 | --- | --- | --- |
-| 1–10 | `conn_id`, `username`, `resource_address`, `status`, `started_at`, `ended_at`, `duration_seconds`, `finding_count`, `max_severity`, `findings` | Unchanged for recordings. |
+| 1–10 | `conn_id`, `username`, `resource_address`, `status`, `started_at`, `ended_at`, `duration_seconds`, `finding_count`, `max_severity`, `findings` | Unchanged for recordings. For a recording, `conn_id` is the recording id, which for every SSH channel after the first on a connection is a derived id, not the Gateway connection id. |
 | 11–15 | `kind`, `command`, `method`, `path`, `request_count` | `kind` is `ssh`, `exec`, `failed`, `kubectl` or `web`. kubectl rows fill the last four; `path` has no query string and `command` is the kubectl command label, never the full `User-Agent`. Web rows fill `method`, `path` and `request_count` and leave `command` empty. |
 | 16 | `resource_type` | `KUBERNETES` for kubectl rows, `WEB_APP` for web rows, and the session's stored type (or empty) for recordings and failed connections. |
 | 17 | `configured_scheme` | Web rows: `https`, `http` or `unknown`. Otherwise empty. |
@@ -591,7 +596,7 @@ What to expect afterwards:
 
 ### Upgrading to 0.6.0 (Gateway 2.0.0)
 
-There is no manual step, no schema change and no new setting. Back up the `/data` volume first, as for any upgrade.
+There is no manual step and no new setting. Two columns are added to `sessions` automatically on first start (see below). Back up the `/data` volume first, as for any upgrade.
 
 **Order matters.** Upgrade Gatorcast to 0.6.0 **before** you move any Gateway, or gwops, to `twingate/gateway:2.0.0` (gwops commit `b33cf59` is the one that moves gwops to 2.0.0):
 
@@ -605,7 +610,10 @@ What to expect afterwards:
 
 - **`/ingest` returns `200` with a JSON body, not `204`.** Update any shipper health check, script or monitor that requires exactly `204` to accept any `2xx`. See [The `/ingest` response](#the-ingest-response).
 - **Both logger-name sets are accepted.** See [Supported Gateway versions](#supported-gateway-versions).
-- **Separate recording per SSH channel (planned for this release).** Two shell channels on one SSH connection are stored as two recordings instead of one overwriting the other. The first channel keeps the connection id as its session id and each further channel gets a stable derived id. A chunk repeated byte for byte is ignored as a redelivery. A chunk with the same sequence number but different content keeps the first and logs `assembler.seq_conflict`.
+- **Each SSH shell channel is its own recording.** Two shell channels on one SSH connection are stored as two recordings instead of one overwriting the other. The Gateway identifies a channel by a UUID string (`ssh.channel.id`). The first channel to record on a connection, and every Kubernetes and pre-2.0.0 SSH recording, keeps the Gateway connection id as the recording id (the `/sessions/<id>` URL and the `<id>.cast` file name). Each later channel gets a stable recording id derived from the connection id and the channel id. The session page shows **Connection id** (the real Gateway connection id), **SSH channel** (the Gateway's channel id string), and **Recording id** when it differs from the connection id.
+- **CSV users:** column 1 `conn_id` holds the recording id. For every SSH channel after the first on a connection, that is the derived id, not the Gateway connection id.
+- **Redeliveries and conflicts.** A repeated chunk with identical content is ignored as a redelivery, also after a restart and also after the idle backstop has sealed the recording. A redelivery of a sealed recording leaves it sealed: the file is not rewritten, so with encryption on it is not left as plaintext. A repeated sequence number with different content keeps the first chunk and logs `assembler.seq_conflict` (recording id, sequence number and lengths only, never content). A conflicting final chunk does not seal the recording, and never seals another channel's recording.
+- **Two new `sessions` columns, `parent_conn_id` and `stream`, are added automatically on first start.** There is no manual step. Existing rows keep both empty.
 
 To pin to a specific version, change the image tag in `docker-compose.yml`:
 
@@ -659,7 +667,8 @@ If SSH or Kubernetes recordings, or requests, stopped appearing after you upgrad
 
 1. **Check the Gatorcast version.** Anything older than 0.6.0 drops every 2.0.0 line and still returns success. Upgrade Gatorcast first (see [Upgrading to 0.6.0](#upgrading-to-060-gateway-200)). Lines sent in the meantime were not kept. Resend them from the shipper's own buffer if it still holds them.
 2. **Read the intake counts.** Look at `noise_by_logger` in the `/ingest` response (the curl test in [INGESTION_RECIPES.md](INGESTION_RECIPES.md) §8 shows it), or in the `ingest.http` log lines (`docker compose logs gatorcast | grep ingest.http`). For syslog, read the `ingest.syslog` lines.
-   - `accepted` is `0` and `noise` is high under `session_recording`, `audit` or `system`: Gatorcast sees the lines but rejects them as malformed or not a kind it keeps. Check `dropped_by_reason` and confirm the lines carry the fields in [Supported Gateway versions](#supported-gateway-versions).
+   - `rejected` above `0`: the Gateway sent a recognised recording, audit or start line that Gatorcast could not parse (a bad `conn_id` or sequence number, for example). Those recordings or requests are likely lost. The reason is logged only at debug level (`classify.drop`), so set `LOG_LEVEL=debug` and resend a sample to see it.
+   - `accepted` is `0` and `noise` is high under `session_recording`, `audit` or `system`: Gatorcast sees the lines but they are not a kind it keeps. Confirm the lines carry the fields in [Supported Gateway versions](#supported-gateway-versions).
    - High `noise` under `other` or `missing`: the Gateway is using a logger name Gatorcast does not know, which usually means another log-format change. The count tells you the lines are arriving. It does not name the logger.
    - `not_json` is high: the shipper is splitting or wrapping lines. See [Big or "chatty" sessions](#big-or-chatty-sessions-not-recording-btop-top-watch-verbose-output).
 3. **Check the shipper.** gwops reports what it dropped in its `/status` under `shipper.dropped_lines`. Make sure its allowlist covers the logger names your Gateway version emits.
@@ -677,8 +686,10 @@ Gatorcast supports both RFC 6587 octet-counting (`<length> <msg>`) and newline-d
 All data lives in the `gatorcast-data` named Docker volume, mounted at `/data` inside the container:
 
 - SQLite database: `/data/gatorcast.db` (sessions, connections, findings, and kubectl and web request metadata)
-- Recording files: `/data/casts/<conn_id>.cast`
-- Search sidecars: `/data/casts/<conn_id>.txt.enc`
+- Recording files: `/data/casts/<recording id>.cast`
+- Search sidecars: `/data/casts/<recording id>.txt.enc`
+
+The recording id is the Gateway `conn_id`, except for every SSH channel after the first on a connection, which gets a derived id (see [Upgrading to 0.6.0](#upgrading-to-060-gateway-200)).
 
 Back up the whole volume, not just one file: the database and the `.cast` files belong together, and the database runs in WAL mode. Stop the container first (`docker compose stop`) for a consistent copy. Back up before every upgrade.
 

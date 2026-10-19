@@ -953,3 +953,70 @@ def check_webapp_fixture_index() -> None:
         assert all(d[0] == name for d in WEBAPP_INTERIM_DOCS[start:stop]), name
         cursor = stop
     assert cursor == len(interim)
+
+
+# --------------------------------------------------------------- Gateway 2.0.0 (GA) fixtures
+#
+# Session 13. Two NDJSON files copied verbatim (read-only source) from the gwops repo
+# (``twingate-gateway-custom-container-image/tests/fixtures/``), so they are the lines a GA
+# Gateway emits, not Gatorcast inventions:
+#
+# * ``fixtures/ga_recording_lines.ndjson`` (``ga_recording_lines()``; gwops name
+#   ``ga_recording_lines.ndjson``): 11 lines, all version 2.0.0.
+#
+#     idx  logger             message                         notes
+#     0    system             Starting SSH proxy              no conn_id: noise
+#     1    system             Authenticated connection        SSH, conn ...0001, ssh-target.example.test:22
+#     2    audit              SSH connection established      ``ssh`` object: dropped
+#     3-5  session_recording  session recording x2, session finished   seq 1, 2, 3; ``ssh.channel.id`` present
+#     6    audit              SSH connection closed           dropped, NOT a close signal
+#     7    system             Authenticated connection        KUBERNETES, conn ...0002
+#     8-9  session_recording  k8s exec chunks seq 1, 2 (2 = session finished), ``request_id`` ...0ae7, no ``ssh``
+#     10   audit              API request completed           the exec's 101 line, same ``request_id``
+#
+#   **The fixture's ``ssh.channel.id`` is a UUID string** (``GA_CHANNEL_ID``), not an int. ``classify``
+#   keeps it as the chunk's ``stream`` (a safe-token string; ints are normalized to their decimal
+#   string). The first stream to record on a connection keeps ``conn_id`` as its session id, so these
+#   SSH chunks form one session keyed by ``GA_SSH_CONN`` whose ``sessions.stream`` is ``GA_CHANNEL_ID``.
+#
+# * ``fixtures/ga_webapp_lines.ndjson`` (``ga_webapp_lines()``; gwops name
+#   ``webapp_gateway_lines.ndjson``): a GA web-app run. 58 ``system`` ``Authenticated connection``
+#   lines (all ``WEB_APP``, no ``gwops`` object, 58 distinct conn ids), 55 ``audit``
+#   ``API request completed`` lines (55 distinct request ids and conn ids, each joined to a start),
+#   38 other ``system`` lines (service and proxy-error: noise) and 6 non-JSON shutdown/panic lines.
+#   Kept as captured, including that non-JSON text.
+GA_RECORDING_FILE = FIXTURES / "ga_recording_lines.ndjson"
+GA_WEBAPP_FILE = FIXTURES / "ga_webapp_lines.ndjson"
+
+GA_SSH_CONN = "5d7c1f0e-8a3b-4c2d-9e41-000000000001"
+GA_K8S_CONN = "5d7c1f0e-8a3b-4c2d-9e41-000000000002"
+GA_EXEC_REQUEST_ID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+GA_CHANNEL_ID = "00000000-0000-4000-8000-000000000001"  # ssh.channel.id on every fixture SSH chunk
+
+
+def ga_recording_lines() -> list[str]:
+    """The 11 lines of ``ga_recording_lines.ndjson`` in file order."""
+    return _read_lines(GA_RECORDING_FILE)
+
+
+def ga_recording_objects() -> list[dict]:
+    """The parsed objects of :func:`ga_recording_lines` (fresh copies)."""
+    return [json.loads(line) for line in ga_recording_lines()]
+
+
+def ga_webapp_lines() -> list[str]:
+    """All non-empty lines of ``ga_webapp_lines.ndjson`` (6 are not JSON, as captured)."""
+    return _read_lines(GA_WEBAPP_FILE)
+
+
+def ga_webapp_json_objects() -> list[dict]:
+    """The parseable objects of :func:`ga_webapp_lines`."""
+    objs: list[dict] = []
+    for line in ga_webapp_lines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            objs.append(obj)
+    return objs

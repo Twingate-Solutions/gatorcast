@@ -2418,7 +2418,7 @@ def _ingest_q19(client: TestClient, app, gwops: object, *, null_key: bool = Fals
         "/ingest", content="\n".join([*absent, *rejected]) + "\n",
         headers={"Authorization": "Bearer ingest-token-q19", "Content-Type": "application/x-ndjson"},
     )
-    assert resp.status_code == 204
+    assert resp.status_code == 200
     client.portal.call(app.state.ingest_queue.join)
 
 

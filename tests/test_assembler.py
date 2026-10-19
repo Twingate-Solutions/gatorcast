@@ -288,17 +288,56 @@ async def test_out_of_order_seq_reassembles_correctly(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_seq_last_write_wins(tmp_path: Path) -> None:
+async def test_duplicate_seq_with_different_text_keeps_first_and_counts_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Session 13: a repeated seq keeps the FIRST text (was last-write-wins), warns, counts."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        assembler_module,
+        "log",
+        structlog.wrap_logger(
+            structlog.PrintLogger(file=buffer),
+            processors=[structlog.processors.add_log_level, structlog.processors.JSONRenderer()],
+            wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        ),
+    )
     asm, db = await _make(tmp_path)
     cid = "conn-dup"
     await asm.handle(RecordingChunk(conn_id=cid, seq=0, asciicast=HEADER))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast='[0.0,"o","WRONG"]\n'))
-    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast='[0.0,"o","right"]\n'))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast='[0.0,"o","FIRSTTEXT"]\n'))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast='[0.0,"o","SECONDTEXT"]\n'))
     await asm.finalize(cid)
     cast = (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8")
-    assert "right" in cast and "WRONG" not in cast
+    assert "FIRSTTEXT" in cast and "SECONDTEXT" not in cast
     row = await _row(db, cid)
     assert row["chunk_count"] == 2  # two distinct seqs
+    assert asm.seq_conflict_count == 1
+    assert asm.seq_redelivered_count == 0
+    events = [json.loads(ln) for ln in buffer.getvalue().splitlines() if ln.strip()]
+    conflicts = [e for e in events if e["event"] == "assembler.seq_conflict"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["level"] == "warning"
+    assert set(conflicts[0]) == {
+        "event", "level", "conn_id", "seq", "kept_length", "dropped_length"
+    }
+    assert conflicts[0]["seq"] == 1
+    assert "FIRSTTEXT" not in buffer.getvalue() and "SECONDTEXT" not in buffer.getvalue()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_seq_with_identical_text_is_a_counted_noop(tmp_path: Path) -> None:
+    """Same seq, same text: nothing changes, counted as a redelivery, no conflict."""
+    asm, db = await _make(tmp_path)
+    cid = "conn-redeliver"
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_1))
+    await asm.handle(RecordingChunk(conn_id=cid, seq=1, asciicast=CHUNK_1))
+    await asm.finalize(cid)
+    cast = (tmp_path / "casts" / f"{cid}.cast").read_text(encoding="utf-8")
+    assert cast.count('"version"') == 1 and cast.count('"b"') == 1
+    assert asm.seq_redelivered_count == 1
+    assert asm.seq_conflict_count == 0
     await db.close()
 
 

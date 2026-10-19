@@ -57,8 +57,10 @@ A 2.0.0 recording chunk looks like this:
 A 2.0.0 Gateway sends an SSH recording in segments: a chunk about every 256 KB or 5 minutes,
 then a final chunk with `"message":"session finished"`. Gatorcast reassembles them like
 Kubernetes recordings. SSH chunk lines carry an `ssh` object, and Gatorcast reads only
-`ssh.channel.id` from it. 2.0.0 SSH audit events (logger `audit`, with an `ssh` object) and
-the Gateway's service and proxy-error lines are dropped.
+`ssh.channel.id` (a UUID string) from it: each SSH shell channel on a connection is stored as
+its own recording (see the README's [Upgrading to 0.6.0](README.md#upgrading-to-060-gateway-200)).
+2.0.0 SSH audit events (logger `audit`, with an `ssh` object) and the Gateway's service and
+proxy-error lines are dropped.
 
 > **Upgrade order.** Upgrade Gatorcast to 0.6.0 **before** you move gwops to
 > `twingate/gateway:2.0.0` (gwops commit `b33cf59`) or upgrade any Gateway. A Gatorcast older
@@ -175,24 +177,35 @@ never line content:
 - `dropped`: non-blank lines that produced no event. `dropped_by_reason` splits it:
   - `not_json`: not a JSON object (a Go `http: proxy error`, a klog line, a collector wrapper
     with no JSON inside).
-  - `noise`: valid JSON that is not a line Gatorcast keeps (service lines, SSH audit events),
-    or a line of a kept type that was malformed (a bad `conn_id` or sequence number).
-  - `classify_error`: an internal error on that one line. The batch is unaffected.
-- `noise_by_logger` splits `noise` by the line's `logger`: `gateway`, `gateway.audit`,
+  - `noise`: valid JSON that is not a kind of line Gatorcast keeps (service lines, SSH audit
+    events). A line whose `logger` or `message` is not a string is also `noise`.
+  - `rejected`: a recognised recording, audit or start line that was malformed (a bad
+    `conn_id` or sequence number). A likely lost recording or request.
+  - `classify_error`: an internal error classifying that one line. The batch is unaffected.
+  - `normalize_error`: an internal error reading that one line. The batch is unaffected.
+- `noise_by_logger` splits `noise` (only) by the line's `logger`: `gateway`, `gateway.audit`,
   `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown
-  logger name is never echoed back.
+  logger name is never echoed back. `rejected` lines are not split here.
 - The three maps list only non-zero entries. Blank lines are not counted. A bad or missing
   token still returns `401`.
 
-The same counts are logged as one `ingest.http` line per batch. The syslog listener has no
-response, so it logs one `ingest.syslog` line with the same counts when each connection
-closes.
+The same counts are logged as one `ingest.http` line per batch. A large batch is processed
+without stalling the UI or the syslog listener. The syslog listener has no response, so it
+logs an `ingest.syslog` line with the same counts every 1000 messages or 60 seconds (whichever
+comes first, checked as a message arrives) and again when the connection closes. A shipper
+that holds one connection open for days is therefore visible in the logs while it runs.
 
 **Reading the counts.** Some noise is normal: an unfiltered Gateway stream includes service
-lines under `gateway` or `system`, and 2.0.0 SSH audit events under `audit`. A batch with high
-`noise` under a logger you did not expect (`other` or `missing`, or `session_recording` when
-recordings should be arriving) is the signal of a Gateway log-format change. A batch where
-`accepted` is `0` and `dropped` is not has delivered nothing.
+lines under `gateway` or `system`, and 2.0.0 SSH audit events under `audit`. Two signals are
+not normal:
+
+- `rejected` above `0`: the Gateway sent a line Gatorcast recognised but could not parse, so
+  a recording chunk, request or connection start was probably lost. The specific reason is
+  logged at debug level only (`classify.drop`).
+- High `noise` under a logger you did not expect (`other` or `missing`, or
+  `session_recording` when recordings should be arriving): a Gateway log-format change.
+
+A batch where `accepted` is `0` and `dropped` is not has delivered nothing.
 
 ### 1.3 Reachability — a caveat that bites everyone
 

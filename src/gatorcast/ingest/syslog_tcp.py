@@ -13,13 +13,16 @@ Framing supported per connection, auto-detected per message:
 Each de-framed message is handed to ``normalize`` (which strips any ``<PRI>``
 syslog header) and, if it reduces to a JSON object, classified and the resulting
 event enqueued for the pipeline. There is no response on the wire; outcome counts
-are logged once per connection (``ingest.syslog``).
+are logged as ``ingest.syslog`` every 1000 messages or 60 seconds (whichever comes
+first, checked as messages arrive), then reset, and once more at disconnect if any
+remain.
 There is no per-message auth; rely on network position (bind internal-only).
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 
 from gatorcast.ingest.counts import IntakeCounts
 from gatorcast.ingest.normalize import normalize
@@ -35,6 +38,8 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB cap on a single octet-counted frame
 MAX_LENGTH_DIGITS = 10  # A frame-length prefix longer than this is hostile.
 MAX_CONNECTIONS = 128  # Bound on concurrent syslog connections.
 IDLE_READ_TIMEOUT_SECONDS = 300  # Reap a connection idle this long mid-read.
+SUMMARY_EVERY_MESSAGES = 1000  # Log and reset intake counts after this many messages...
+SUMMARY_EVERY_SECONDS = 60  # ...or once this long has passed, whichever comes first.
 
 
 class FrameError(Exception):
@@ -171,6 +176,7 @@ class SyslogTCPServer:
             return
 
         counts = IntakeCounts()
+        last_flush = time.monotonic()
         async with self._conn_sem:
             try:
                 while True:
@@ -181,13 +187,26 @@ class SyslogTCPServer:
                         break
                     if not message.strip():
                         continue
-                    obj = normalize(message)
-                    if obj is None:
-                        counts.drop_not_json()
-                        continue
-                    event = counts.triage(obj)
-                    if event is not None:
-                        await self._queue.put(event)
+                    try:
+                        obj = normalize(message)
+                    except Exception as exc:
+                        counts.drop_normalize_error(exc)
+                    else:
+                        if obj is None:
+                            counts.drop_not_json()
+                        else:
+                            event = counts.triage(obj)
+                            if event is not None:
+                                await self._queue.put(event)
+                    # A long-lived shipper connection would otherwise report nothing
+                    # until it closes: flush every N messages or T seconds, whichever
+                    # comes first (checked as messages arrive).
+                    if (
+                        counts.accepted + counts.dropped >= SUMMARY_EVERY_MESSAGES
+                        or time.monotonic() - last_flush >= SUMMARY_EVERY_SECONDS
+                    ):
+                        counts = self._flush_counts(peer, counts)
+                        last_flush = time.monotonic()
             except FrameError as exc:
                 # Hostile framing — never log content (rule 5), only the reason.
                 log.warning("syslog.frame_rejected", peer=str(peer), reason=str(exc))
@@ -201,8 +220,24 @@ class SyslogTCPServer:
                     await writer.wait_closed()
                 except (ConnectionError, OSError):
                     pass
-                # One summary per connection, counts only (never content). Skipped
-                # when the connection carried nothing countable.
-                if counts.accepted or counts.dropped:
-                    log.info("ingest.syslog", peer=str(peer), **counts.as_dict())
+                # Final summary for the remainder since the last flush (skipped when
+                # empty).
+                self._flush_counts(peer, counts)
                 log.debug("syslog.disconnect", peer=str(peer))
+
+    @staticmethod
+    def _flush_counts(peer: object, counts: IntakeCounts) -> IntakeCounts:
+        """Log one ``ingest.syslog`` summary and return a fresh counter.
+
+        Counts only, never content. Nothing is logged when ``counts`` is empty.
+
+        Args:
+            peer: The connection's peer address (``peername``).
+            counts: The counts accumulated since the last flush.
+
+        Returns:
+            A new, empty ``IntakeCounts`` for the caller to continue with.
+        """
+        if counts.accepted or counts.dropped:
+            log.info("ingest.syslog", peer=str(peer), **counts.as_dict())
+        return IntakeCounts()

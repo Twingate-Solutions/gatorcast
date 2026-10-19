@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     sealed_terminal  INTEGER,                       -- 1 terminal seal | 0 reopenable seal | NULL unsealed/legacy
     resource_type    TEXT,                          -- Gateway resource type, copied from connections at promote
     parent_conn_id   TEXT,                          -- real Gateway conn_id of a per-channel session (NULL for a primary row)
-    stream           INTEGER,                       -- SSH channel id (ssh.channel.id) when known, else NULL
+    stream           TEXT,                          -- SSH channel id (ssh.channel.id, UUID string) when known, else NULL
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -250,7 +250,7 @@ SESSION_COLUMNS: tuple[tuple[str, str], ...] = (
     # primary key) and keeps the real connection id in ``parent_conn_id``. ``stream`` is
     # the channel id when the chunk carried one. Both NULL on every pre-2.0.0 row.
     ("parent_conn_id", "ALTER TABLE sessions ADD COLUMN parent_conn_id TEXT"),
-    ("stream", "ALTER TABLE sessions ADD COLUMN stream INTEGER"),
+    ("stream", "ALTER TABLE sessions ADD COLUMN stream TEXT"),
 )
 
 # Columns added to ``connections`` after Session 9 created it (Session 11, spec §4.2,

@@ -1482,3 +1482,77 @@ async def test_second_boot_does_not_alter_the_session11_connection_or_request_co
         assert [tuple(r) for r in await cur.fetchall()] == [("none", "tls13")]
     finally:
         await db.close()
+
+
+# --- Session 13 T3: sessions.parent_conn_id and sessions.stream (per-SSH-channel recordings) ---------
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_has_session13_channel_columns_nullable_with_no_default(tmp_path):
+    db = await init_db(tmp_path / "gatorcast.db")
+    try:
+        cur = await db.execute(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('sessions') "
+            "WHERE name IN ('parent_conn_id', 'stream')"
+        )
+        cols = {r["name"]: (r["type"], r["notnull"], r["dflt_value"]) for r in await cur.fetchall()}
+        # ``stream``'s declared type is deliberately not pinned: it is changing (INTEGER -> TEXT).
+        assert set(cols) == {"parent_conn_id", "stream"}
+        assert cols["parent_conn_id"] == ("TEXT", 0, None)
+        assert cols["stream"][1:] == (0, None)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_adds_channel_columns_and_legacy_rows_read_null(tmp_path):
+    """A pre-Session-13 sessions table gains both columns; its rows keep NULL for both."""
+    path = tmp_path / "old13.db"
+    conn = await aiosqlite.connect(path)
+    await conn.execute("CREATE TABLE sessions (conn_id TEXT PRIMARY KEY, status TEXT)")
+    await conn.execute("INSERT INTO sessions (conn_id, status) VALUES ('legacy-1', 'complete')")
+    await conn.commit()
+    await conn.close()
+    db = await init_db(path)
+    try:
+        cur = await db.execute("SELECT name FROM pragma_table_info('sessions')")
+        assert {"parent_conn_id", "stream"} <= {r[0] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT parent_conn_id, stream FROM sessions WHERE conn_id = 'legacy-1'")
+        assert tuple(await cur.fetchone()) == (None, None)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_column_migration_is_idempotent_across_boots(tmp_path):
+    path = tmp_path / "twice.db"
+    first = await init_db(path)
+    await first.execute(
+        "INSERT INTO sessions (conn_id, status, parent_conn_id, stream) "
+        "VALUES ('derived', 'provisional', 'parent', '4')"
+    )
+    await first.commit()
+    await first.close()
+    second = await init_db(path)  # the guarded ALTER must not re-run or raise
+    try:
+        cur = await second.execute("SELECT parent_conn_id, stream FROM sessions WHERE conn_id = 'derived'")
+        row = tuple(await cur.fetchone())
+        assert row[0] == "parent" and str(row[1]) == "4"  # INTEGER or TEXT affinity both round-trip
+        cur = await second.execute(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('parent_conn_id', 'stream')"
+        )
+        assert (await cur.fetchone())[0] == 2
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_from_pre_session11_db_also_gets_channel_columns(tmp_path):
+    path = tmp_path / "s10-for-13.db"
+    await _make_pre_s11_db(path)
+    db = await init_db(path)
+    try:
+        cur = await db.execute("SELECT name FROM pragma_table_info('sessions')")
+        assert {"parent_conn_id", "stream"} <= {r[0] for r in await cur.fetchall()}
+    finally:
+        await db.close()

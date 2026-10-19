@@ -330,7 +330,7 @@ There are 22 columns. The first 15 keep their names, order and values from 0.4.0
 
 | # | Column | Recording | kubectl command |
 | --- | --- | --- | --- |
-| 1 | `conn_id` | the session's `conn_id` | the start row's `conn_id` |
+| 1 | `conn_id` | the recording id (the session's `conn_id`; for every SSH channel after the first on a connection, a derived id, not the Gateway connection id) | the start row's `conn_id` |
 | 2 | `username` | `username` | `username` |
 | 3 | `resource_address` | `resource_address` | `resource_address` |
 | 4 | `status` | `status` | empty |

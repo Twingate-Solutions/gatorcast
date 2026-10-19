@@ -11,12 +11,20 @@ resulting events. Every object ends in exactly one outcome, and the outcome is c
       ``normalize`` could not reduce the line to a JSON object, a JSON body or array
       item was not an object, or a collector wrapper held no JSON object.
   ``noise``
-      ``classify`` returned ``None``. This covers operational lines Gatorcast does not
-      store as well as recognised event types ``classify`` rejected as malformed
-      (bad ``conn_id``, bad sequence number, and similar); ``classify`` reports those
-      only in its debug ``classify.drop`` log, not to the caller.
+      ``classify`` returned ``None`` for a line whose logger and message do not identify
+      a known event type: operational lines Gatorcast does not store.
+  ``rejected``
+      ``classify`` returned ``None`` for a line whose logger and message do identify a
+      known event type (a recording logger with a string ``asciicast``, an audit logger
+      with an API-request message, a start logger with ``Authenticated connection``),
+      so the line was malformed (bad ``conn_id``, bad sequence number, and similar).
+      ``classify`` gives the specific reason only in its debug ``classify.drop`` log.
+      Rejected lines are not broken down in ``noise_by_logger``.
   ``classify_error``
       ``classify`` raised. The exception type is logged, never the object.
+  ``normalize_error``
+      ``normalize`` or ``unwrap_collector`` raised on one input (front doors catch it
+      per object). The exception type is logged, never the input.
 
 Blank lines are skipped and not counted.
 
@@ -33,21 +41,31 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gatorcast.logging import get_logger
-from gatorcast.pipeline.classify import Event, classify
+from gatorcast.pipeline.classify import (
+    AUDIT_LOGGERS,
+    RECORDING_LOGGERS,
+    START_LOGGERS,
+    Event,
+    classify,
+    is_recognized_event_line,
+)
 
 log = get_logger(__name__)
 
-# Logger names that may appear as keys in ``noise_by_logger``. Extend this set when the
-# Gateway introduces a new logger name; anything not listed is bucketed as ``other``.
+# Logger names that may appear as keys in ``noise_by_logger``: every logger ``classify``
+# acts on. A new Gateway logger name is picked up by adding it in ``classify``; anything
+# not listed is bucketed as ``other``.
 KNOWN_LOGGERS: frozenset[str] = frozenset(
-    {"gateway", "gateway.audit", "system", "audit", "session_recording"}
+    RECORDING_LOGGERS | AUDIT_LOGGERS | START_LOGGERS
 )
 LOGGER_MISSING = "missing"
 LOGGER_OTHER = "other"
 
 DROP_NOT_JSON = "not_json"
 DROP_NOISE = "noise"
+DROP_REJECTED = "rejected"
 DROP_CLASSIFY_ERROR = "classify_error"
+DROP_NORMALIZE_ERROR = "normalize_error"
 
 
 def logger_bucket(obj: dict) -> str:
@@ -90,6 +108,14 @@ class IntakeCounts:
         if count > 0:
             self.dropped_by_reason[DROP_NOT_JSON] += count
 
+    def drop_normalize_error(self, exc: Exception) -> None:
+        """Record one input on which ``normalize``/``unwrap_collector`` raised.
+
+        Logs ``pipeline.error`` with the exception type only, never the input.
+        """
+        log.warning("pipeline.error", stage="normalize", error=type(exc).__name__)
+        self.dropped_by_reason[DROP_NORMALIZE_ERROR] += 1
+
     def triage(self, obj: dict) -> Event | None:
         """Classify one normalized object and count the outcome.
 
@@ -110,6 +136,9 @@ class IntakeCounts:
             self.dropped_by_reason[DROP_CLASSIFY_ERROR] += 1
             return None
         if event is None:
+            if is_recognized_event_line(obj):
+                self.dropped_by_reason[DROP_REJECTED] += 1
+                return None
             self.dropped_by_reason[DROP_NOISE] += 1
             self.noise_by_logger[logger_bucket(obj)] += 1
             return None

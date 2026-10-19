@@ -33,14 +33,15 @@ what it kept and dropped.
 - **2.0.0 SSH recordings are reassembled.** A 2.0.0 Gateway sends an SSH recording in segments (a
   chunk about every 256 KB or 5 minutes, then a final `session finished` chunk). Gatorcast
   reassembles them like Kubernetes recordings. From the `ssh` object on these lines it reads only
-  `ssh.channel.id`.
+  `ssh.channel.id`, which the Gateway sends as a UUID string.
 - **2.0.0 lines Gatorcast does not keep.** SSH audit events (which carry `env` values and full
   `exec` commands) and the Gateway's service lines match no event, so they are dropped unread and
   counted as `noise`. Non-JSON proxy-error lines are dropped and counted as `not_json`.
 - **Intake counts in the logs.** `POST /ingest` writes one `ingest.http` log line per batch with
-  the same counts as the response. The syslog listener writes one `ingest.syslog` line per
-  connection, when the connection closes, with the same counts. Counts only: no line content, no
-  header or URL value.
+  the same counts as the response. The syslog listener writes an `ingest.syslog` line with the
+  same counts every 1000 messages or 60 seconds, whichever comes first (checked when a message
+  arrives), and again when the connection closes, so a long-lived shipper connection is visible
+  while it is open. Counts only: no line content, no header or URL value.
 
 ### Changed
 
@@ -56,26 +57,55 @@ what it kept and dropped.
   }
   ```
 
-  `accepted` counts lines classified into an event. `dropped_by_reason` uses `not_json` (the
-  line is not a JSON object), `noise` (not a line Gatorcast keeps, or a line of a kept type that
-  was malformed, such as a bad `conn_id` or sequence number) and `classify_error`.
-  `noise_by_logger` splits `noise` by the line's `logger` value: `gateway`, `gateway.audit`,
-  `system`, `audit`, `session_recording`, `missing` (no string `logger`) or `other`. An unknown
-  logger name is never echoed back. Blank lines are not counted. A bad or missing token still
-  returns `401`.
+  `accepted` counts lines classified into an event. `dropped_by_reason` uses:
+  - `not_json`: the line is not a JSON object.
+  - `noise`: valid JSON that is not a kind of line Gatorcast keeps. A line whose `logger` or
+    `message` is not a string is counted here too.
+  - `rejected`: a recognised recording, audit or start line that was malformed (a bad `conn_id`
+    or sequence number). A likely lost recording or request. The specific reason is logged at
+    debug level only.
+  - `classify_error` and `normalize_error`: an internal error on that one line.
+
+  `noise_by_logger` splits `noise` (only) by the line's `logger` value: `gateway`,
+  `gateway.audit`, `system`, `audit`, `session_recording`, `missing` (no string `logger`) or
+  `other`. An unknown logger name is never echoed back. `rejected` lines are not split by logger.
+  Blank lines are not counted. A bad or missing token still returns `401`.
 
   **Shippers that test for `204` specifically must accept any `2xx`.**
+- **Large `/ingest` batches no longer stall other work.** The handler yields to the event loop
+  every 256 lines, so the UI, the syslog listener and the queue consumer keep running while a
+  big batch is read. One bad line never fails a batch.
 - **Classification happens at the front door.** `POST /ingest` and the syslog listener classify
   each line before it is queued, which is what makes the per-batch counts possible.
 
 ### Fixed
 
-- **Two shell channels on one SSH connection no longer overwrite each other.** *(Planned for
-  this release; the implementation is not finished. Update this entry when it lands.)* Each
-  channel is stored as its own recording. The first channel keeps the connection id as its
-  session id; each further channel gets a stable id derived from it. A chunk repeated byte for
-  byte is ignored as a redelivery. A chunk with the same sequence number but different content
-  keeps the first and logs `assembler.seq_conflict`.
+- **Two shell channels on one SSH connection no longer overwrite each other.** A Gateway 2.0.0
+  SSH connection can open several shell channels, each recorded with its own sequence numbers.
+  Before, they shared one recording and the later channel's chunks overwrote the earlier ones.
+  Each channel is now its own recording.
+  - **Recording id.** The Gateway identifies a channel by a UUID string. The first channel to
+    record on a connection, and every Kubernetes and pre-2.0.0 SSH recording, keeps the Gateway
+    connection id as the recording id (the `/sessions/<id>` URL and the `<id>.cast` file name).
+    Each later channel gets a stable recording id derived from the connection id and the
+    channel id, the same after a restart or a redelivery.
+  - **Session page.** It shows **Connection id** (always the real Gateway connection id),
+    **SSH channel** (the Gateway's channel id string), and **Recording id** when it differs from
+    the connection id.
+  - **CSV users:** column 1 `conn_id` holds the recording id. For every SSH channel after the
+    first on a connection it is the derived id, not the Gateway connection id.
+  - **Redeliveries.** A repeated chunk with identical content is ignored, also after a restart.
+    A repeated sequence number with different content keeps the first chunk and logs
+    `assembler.seq_conflict` with the recording id, sequence number and two lengths, never
+    content.
+- **A conflicting final chunk no longer seals another channel's recording.** A
+  `session finished` chunk now seals only the recording it was stored in (or is an identical
+  redelivery of). One dropped as a sequence conflict seals nothing, and never seals another
+  channel's recording on the same connection.
+- **A redelivery after the idle backstop seal no longer reopens the recording.** A chunk that
+  repeats what a sealed recording already holds leaves it sealed: the file is not rewritten and
+  the row is unchanged, so with encryption at rest on, the recording is not left as plaintext on
+  disk by a redelivery.
 
 ### Upgrade notes
 
@@ -87,11 +117,14 @@ what it kept and dropped.
   is no need to upgrade every Gateway at once.
 - **Check for a `204` test in your shipper.** A health check or script that requires exactly
   `204` from `/ingest` fails against 0.6.0. Accept any `2xx`.
-- **No migration step.** There is no schema change, no `PRAGMA user_version` change and no new
-  setting.
-- **Spotting a log-format change.** In the `/ingest` response or the `ingest.http` log line, a
-  batch with a high `noise` count under a logger you did not expect is the sign that the Gateway
-  changed its log format again. See the README troubleshooting entry.
+- **No manual step.** Two columns, `parent_conn_id` and `stream`, are added to `sessions`
+  automatically on first start, and existing rows keep both empty. There is no
+  `PRAGMA user_version` change and no new setting. Back up the `/data` volume first, as for any
+  upgrade.
+- **Spotting a log-format change or a lost line.** In the `/ingest` response or the `ingest.http`
+  log line, a batch with a high `noise` count under a logger you did not expect is the sign that
+  the Gateway changed its log format again, and `rejected` above `0` means it sent a recognised
+  line Gatorcast could not parse. See the README troubleshooting entry.
 
 ## [0.5.0] - 2026-10-08
 

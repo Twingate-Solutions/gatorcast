@@ -113,7 +113,7 @@ def _assert_sample_batch_processed(db_path: Path) -> None:
 
 
 def test_ndjson_accepted_and_processed(tmp_path: Path) -> None:
-    """A valid NDJSON batch returns 204 and every line reaches the pipeline.
+    """A valid NDJSON batch returns 200 with counts and every line reaches the pipeline.
 
     The sample has a recording chunk (conn A), a session-start (conn B), and one
     API-audit line (conn A). Only the chunk creates a session row: the start is a
@@ -128,7 +128,15 @@ def test_ndjson_accepted_and_processed(tmp_path: Path) -> None:
             content="\n".join(lines),
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json() == {
+            "accepted": 3,
+            "dropped": 0,
+            "accepted_by_kind": {"ApiRequest": 1, "RecordingChunk": 1, "SessionStart": 1},
+            "dropped_by_reason": {},
+            "noise_by_logger": {},
+        }
         _assert_sample_batch_processed(settings.db_path)
 
 
@@ -143,7 +151,9 @@ def test_json_array_accepted(tmp_path: Path) -> None:
             content=json.dumps(objs),
             headers={**_auth(), "Content-Type": "application/json"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        assert resp.json()["accepted"] == 3
+        assert resp.json()["dropped"] == 0
         _assert_sample_batch_processed(settings.db_path)
 
 
@@ -157,7 +167,7 @@ def test_single_json_object_accepted(tmp_path: Path) -> None:
             content=sample_lines()[0],
             headers={**_auth(), "Content-Type": "application/json"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         assert _wait_for_sessions(settings.db_path, 1) == 1
 
 
@@ -172,7 +182,12 @@ def test_bad_line_does_not_fail_batch(tmp_path: Path) -> None:
             content=body,
             headers={**_auth(), "Content-Type": "text/plain"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["accepted"] == 1
+        assert body["dropped"] == 2
+        assert body["dropped_by_reason"] == {"not_json": 2}
+        assert body["noise_by_logger"] == {}
         assert _wait_for_sessions(settings.db_path, 1) == 1
 
 
@@ -196,7 +211,7 @@ def test_json_collector_wrapped_object_unwrapped(tmp_path: Path) -> None:
             content=wrapper,
             headers={**_auth(), "Content-Type": "application/json"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         assert _wait_for_sessions(settings.db_path, 1) == 1
 
 
@@ -215,7 +230,7 @@ def test_json_collector_wrapped_array_unwrapped(tmp_path: Path) -> None:
             content=json.dumps(wrappers),
             headers={**_auth(), "Content-Type": "application/json"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         # Both reach the pipeline: the session-start becomes a pending connection
         # (no session row) and the recording chunk the only session row.
         _wait_for_pending_b(settings.db_path)
@@ -237,7 +252,7 @@ def test_json_plain_object_still_works_alongside_collector(tmp_path: Path) -> No
             content=json.dumps(objs),
             headers={**_auth(), "Content-Type": "application/json"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         # Plain chunk → session row; wrapped start → pending connection.
         _wait_for_pending_b(settings.db_path)
         assert _wait_for_sessions(settings.db_path, 1) == 1
@@ -298,7 +313,7 @@ def test_chunk_with_raw_nel_ls_and_ps_survives_ingest_intact(tmp_path: Path) -> 
             content=line.encode("utf-8"),
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         assert _wait_for_sessions(settings.db_path, 1) == 1
         cast = _read_cast(settings, SPLIT_CONN)
     for ch in ("\u0085", " ", " "):
@@ -317,7 +332,7 @@ def test_text_plain_body_with_raw_separators_is_not_torn_either(tmp_path: Path) 
             content=_split_chunk_line().encode("utf-8"),
             headers={**_auth(), "Content-Type": "text/plain; charset=utf-8"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         assert _wait_for_sessions(settings.db_path, 1) == 1
         cast = _read_cast(settings, SPLIT_CONN)
     assert all(ch in cast for ch in ("\u0085", " ", " "))
@@ -334,7 +349,9 @@ def test_crlf_body_parses_every_line(tmp_path: Path) -> None:
             content=body.encode("utf-8"),
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        assert resp.json()["accepted"] == 3  # CRLF bodies lose no line
+        assert resp.json()["dropped"] == 0
         _assert_sample_batch_processed(settings.db_path)
 
 
@@ -349,7 +366,10 @@ def test_non_json_line_in_a_batch_is_dropped_without_failing_the_batch(tmp_path:
             content=body.encode("utf-8"),
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["accepted"], body["dropped"]) == (2, 2)
+        assert body["dropped_by_reason"] == {"not_json": 2}
         assert _wait_for_sessions(settings.db_path, 2) == 2
         assert " " in _read_cast(settings, SPLIT_CONN)
 
@@ -391,7 +411,7 @@ def test_lone_surrogate_escapes_are_replaced_and_the_lines_are_stored(tmp_path: 
             "/ingest", content=body.encode("utf-8"),
             headers={**_auth(), "Content-Type": "application/x-ndjson"},
         )
-        assert resp.status_code == 204
+        assert resp.status_code == 200
         assert _wait_for(settings.db_path, "SELECT COUNT(*) FROM api_requests", 1) == 1
         assert _wait_for_sessions(settings.db_path, 1) == 1
         cast = _read_cast(settings, chunk_conn)

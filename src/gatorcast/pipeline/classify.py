@@ -92,6 +92,8 @@ Event = RecordingChunk | SessionStart | SessionEnd | ApiRequest
 # Always applied with ``fullmatch`` (never ``match`` + ``$``, which accepts a
 # trailing newline).
 _SAFE_CONN_ID = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+# An ssh.channel.id must also contain a letter or digit, so "." and ".." are refused.
+_HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
 
 # The Gateway's session recorder emits its final flush with this message (from
 # recorder.Stop()). The line still carries the last asciicast chunk, so it is
@@ -112,13 +114,22 @@ _START_LOGGERS = frozenset({"gateway", "system"})
 # Close events share the start loggers (GA 2.0.0 emits none; harmless).
 _CLOSE_LOGGERS = _START_LOGGERS
 
+# Public aliases for intake counting (``ingest/counts.py``).
+RECORDING_LOGGERS = _RECORDING_LOGGERS
+AUDIT_LOGGERS = _AUDIT_LOGGERS
+START_LOGGERS = _START_LOGGERS
+
+# Message on a start logger that opens a connection.
+_START_MESSAGE = "Authenticated connection"
+
 # Candidate connection-close messages on a start logger. The recorder's
 # "session finished" (above) is the authoritative end signal; these remain wired as
 # a defensive fallback for a close event that carries no asciicast payload.
 _CLOSE_MESSAGES = frozenset({"Connection closed", "Closed connection"})
 
-# GA SSH recording chunks carry ``ssh.channel.id``; it keys one recording per SSH
-# channel on a conn_id. Capped at the signed 32-bit maximum.
+# GA SSH recording chunks carry ``ssh.channel.id`` (a UUID string in 2.0.0); it keys
+# one recording per SSH channel on a conn_id. An int id is also accepted, capped at
+# the signed 32-bit maximum, and normalized to a string.
 _MAX_STREAM = 2**31 - 1
 
 # Envelope-format record types (fork recording sink). The discriminator is the
@@ -597,12 +608,16 @@ def _classify_gwops(obj: dict, conn_id: str) -> GwopsWebApp | None:
     )
 
 
-def _ssh_channel_id(obj: dict) -> int | None:
-    """Return ``ssh.channel.id`` of a GA SSH recording chunk, else ``None``.
+def _ssh_channel_id(obj: dict) -> str | None:
+    """Return ``ssh.channel.id`` of a GA SSH recording chunk as a string, else ``None``.
 
-    Only a real int in ``0 .. 2**31 - 1`` is accepted (``bool`` is excluded).
-    Nothing else under ``ssh`` is read, and nothing is logged: ``ssh.username`` is
-    the remote shell account, never identity (CLAUDE.md rule 4).
+    Gateway 2.0.0 emits a UUID string. Accepted: a string that fullmatches
+    ``[A-Za-z0-9_.-]{1,128}`` (the ``conn_id`` token pattern) and contains at least
+    one letter or digit (so ``.`` and ``..`` are refused), or a real int in
+    ``0 .. 2**31 - 1`` (``bool`` is excluded), normalized to its decimal string.
+    Anything else yields ``None`` and the value is never logged. Nothing else under
+    ``ssh`` is read: ``ssh.username`` is the remote shell account, never identity
+    (CLAUDE.md rule 4).
     """
     ssh = obj.get("ssh")
     if not isinstance(ssh, dict):
@@ -611,8 +626,12 @@ def _ssh_channel_id(obj: dict) -> int | None:
     if not isinstance(channel, dict):
         return None
     channel_id = channel.get("id")
+    if isinstance(channel_id, str):
+        if _SAFE_CONN_ID.fullmatch(channel_id) and _HAS_ALNUM.search(channel_id):
+            return channel_id
+        return None
     if _is_int(channel_id) and 0 <= channel_id <= _MAX_STREAM:
-        return channel_id
+        return str(channel_id)
     return None
 
 
@@ -715,6 +734,37 @@ def _classify_envelope(obj: dict, etype: str) -> Event | None:
     return SessionEnd(conn_id=conn_id)
 
 
+def _logger_and_message(obj: dict) -> tuple[str | None, str | None]:
+    """Read ``logger`` and ``message`` as strings; any other JSON type reads as ``None``.
+
+    A list or object there would be unhashable in the set-membership checks below
+    and raise; treating it as absent makes such a line plain noise.
+    """
+    logger = obj.get("logger")
+    message = obj.get("message")
+    return (
+        logger if isinstance(logger, str) else None,
+        message if isinstance(message, str) else None,
+    )
+
+
+def is_recognized_event_line(obj: dict) -> bool:
+    """True when logger and message identify a known event type, well-formed or not.
+
+    Used by intake counting to tell a malformed known event (``rejected``) from
+    operational noise. It mirrors the entry conditions of the legacy-format branches
+    of :func:`classify` and nothing more: a recording logger with a string
+    ``asciicast``; an audit logger with an API-request message; a start logger with
+    ``Authenticated connection``. It does not validate any field.
+    """
+    logger, message = _logger_and_message(obj)
+    if logger in RECORDING_LOGGERS and isinstance(obj.get("asciicast"), str):
+        return True
+    if logger in AUDIT_LOGGERS and message in _API_MESSAGES:
+        return True
+    return logger in START_LOGGERS and message == _START_MESSAGE
+
+
 def classify(obj: dict) -> Event | None:
     """Classify one normalized log object into a pipeline event.
 
@@ -726,7 +776,7 @@ def classify(obj: dict) -> Event | None:
         event, or ``None`` if the object is operational noise or cannot be safely
         keyed.
     """
-    logger = obj.get("logger")
+    logger, message = _logger_and_message(obj)
 
     # 0. Envelope wire format (fork recording sink): a "type" discriminator and
     # no "logger". Checked first, but can never divert a legacy line — every
@@ -758,7 +808,7 @@ def classify(obj: dict) -> Event | None:
             asciicast=_clean(asciicast),
             username=_username(obj),
             ts=_ts_field(obj),
-            is_final=obj.get("message") == _FINAL_RECORDING_MESSAGE,
+            is_final=message == _FINAL_RECORDING_MESSAGE,
             request_id=_safe_request_id(obj),
             stream=_ssh_channel_id(obj),
         )
@@ -768,12 +818,12 @@ def classify(obj: dict) -> Event | None:
     if (
         logger in _AUDIT_LOGGERS
         and obj.get("asciicast") is None
-        and obj.get("message") in _API_MESSAGES
+        and message in _API_MESSAGES
     ):
         return _classify_api_request(obj)
 
     # 2. Session start: "Authenticated connection" on a start logger.
-    if logger in _START_LOGGERS and obj.get("message") == "Authenticated connection":
+    if logger in _START_LOGGERS and message == _START_MESSAGE:
         conn_id = _safe_conn_id(obj)
         if conn_id is None:
             log.debug("classify.drop", reason="start_bad_conn_id")
@@ -794,7 +844,7 @@ def classify(obj: dict) -> Event | None:
         )
 
     # 3. Session end (close-event hook — see _CLOSE_MESSAGES note).
-    if logger in _CLOSE_LOGGERS and obj.get("message") in _CLOSE_MESSAGES:
+    if logger in _CLOSE_LOGGERS and message in _CLOSE_MESSAGES:
         conn_id = _safe_conn_id(obj)
         if conn_id is not None:
             return SessionEnd(conn_id=conn_id, ts=_ts_field(obj))

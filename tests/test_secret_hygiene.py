@@ -107,6 +107,7 @@ EXPECTED_API_ROWS = 8  # 3 on A, the exec 101 line on B, 4 on C (502, 200, faile
 _LOG_MODULES = (
     "gatorcast.db",
     "gatorcast.main",
+    "gatorcast.ingest.counts",
     "gatorcast.ingest.http",
     "gatorcast.ingest.normalize",
     "gatorcast.ingest.syslog_tcp",
@@ -746,7 +747,7 @@ def test_log_capture_is_live_and_sees_planted_values(run: HygieneRun) -> None:
 
 def test_pipeline_processed_the_fixture(run: HygieneRun) -> None:
     """Ingest accepted the fixture and every table the scan relies on has data."""
-    assert run.ingest_status == 204
+    assert run.ingest_status == 200
     db = run.db_path
     assert _scalar(db, "SELECT COUNT(*) FROM api_requests") == EXPECTED_API_ROWS
     assert _scalar(db, "SELECT COUNT(*) FROM sessions") == 1
@@ -1372,12 +1373,19 @@ def test_volume_scanner_finds_a_planted_value_in_a_nested_file(tmp_path: Path) -
 
 
 def test_web_batch_was_accepted_and_every_line_processed(web_run: BatchRun) -> None:
-    """204, every line queued, no pipeline error, and the control events are live."""
-    assert web_run.ingest_status == 204
+    """200, every line counted, no pipeline error, and the control events are live."""
+    assert web_run.ingest_status == 200
     events = web_run.logs.structlog_events()
     ingest = next(e for e in events if e["event"] == "ingest.http")
-    assert ingest["accepted"] == len(web_run.lines)
-    assert ingest["dropped"] == 0
+    # Session 13: counts are per classified event. The four method-gate rejections are the only
+    # lines the classifier drops; they are recognised ``gateway.audit`` request lines it rejected
+    # as malformed, so they count as ``rejected`` (not ``noise``, and not in ``noise_by_logger``).
+    assert ingest["accepted"] + ingest["dropped"] == len(web_run.lines)
+    assert ingest["dropped"] == len(WEBAPP_DROPPED_REQUEST_KEYS)
+    assert ingest["dropped_by_reason"] == {"rejected": len(WEBAPP_DROPPED_REQUEST_KEYS)}
+    assert ingest["noise_by_logger"] == {}
+    assert set(ingest["accepted_by_kind"]) == {"ApiRequest", "SessionStart"}
+    assert sum(ingest["accepted_by_kind"].values()) == ingest["accepted"]
     assert [e for e in events if e["event"] == "pipeline.error"] == []
 
     # Control: DEBUG-level classify events are captured (the method gate drops four lines).
@@ -1660,17 +1668,23 @@ def test_interim_fixture_is_not_vacuous() -> None:
     assert 0 < first_interim < len(webapp_lines())
 
 
-def test_mixed_batch_returns_204_and_drops_the_non_json_lines_with_a_reason_only(
+def test_mixed_batch_returns_200_and_drops_the_non_json_lines_with_a_reason_only(
     mixed_run: BatchRun,
 ) -> None:
-    """204; non-JSON lines are dropped, each logged as ``reason`` and ``length`` only."""
-    assert mixed_run.ingest_status == 204
+    """200; non-JSON lines are dropped, each logged as ``reason`` and ``length`` only."""
+    assert mixed_run.ingest_status == 200
     events = mixed_run.logs.structlog_events()
     ingest = next(e for e in events if e["event"] == "ingest.http")
     assert ingest["accepted"] + ingest["dropped"] == len(mixed_run.lines)
-    assert ingest["dropped"] >= 7  # the capture's seven non-JSON lines at least
+    # Session 13: ``dropped`` now includes classifier noise (service lines, SSH audit events,
+    # the method-gate rejections); only the ``not_json`` share has a ``normalize.drop`` event.
+    not_json = ingest["dropped_by_reason"]["not_json"]
+    assert not_json >= 7  # the capture's seven non-JSON lines at least
+    assert ingest["dropped"] > not_json  # the interim service / SSH lines are classified noise
+    assert ingest["dropped"] == sum(ingest["dropped_by_reason"].values())
+    assert sum(ingest["noise_by_logger"].values()) == ingest["dropped_by_reason"]["noise"]
     drops = [e for e in events if e["event"] == "normalize.drop"]
-    assert len(drops) == ingest["dropped"]
+    assert len(drops) == not_json
     for drop in drops:
         assert set(drop) == {"event", "level", "reason", "length"}, drop
         assert drop["level"] == "warning"
@@ -1716,11 +1730,11 @@ def test_no_interim_sentinel_in_db_volume_or_logs_of_the_mixed_batch(mixed_run: 
 def test_interim_section_alone_creates_no_row_and_leaks_nothing(
     tmp_path: Path, section: str
 ) -> None:
-    """Each interim section posted by itself: 204, zero rows anywhere, no sentinel anywhere."""
+    """Each interim section posted by itself: 200, zero rows anywhere, no sentinel anywhere."""
     lines = webapp_interim_section(section)
     assert lines
     batch = _run_batch(tmp_path, lines, encryption=False)
-    assert batch.ingest_status == 204
+    assert batch.ingest_status == 200
     for table in _DATA_TABLES:
         count = _scalar(batch.db_path, f"SELECT COUNT(*) FROM {table}")  # noqa: S608
         assert count == 0, f"{section}: {count} row(s) in {table}"
@@ -1928,7 +1942,7 @@ def _all_text(pages: dict[str, Page]) -> str:
 
 def test_web_ui_sweep_reached_every_web_surface(web_ui_run: BatchRun) -> None:
     """Positive controls: the sweep fetched real web pages, so the scans below are not vacuous."""
-    assert web_ui_run.ingest_status == 204
+    assert web_ui_run.ingest_status == 200
     pages = web_ui_run.pages
     explicit = web_ui_run.explicit_paths
     assert len(explicit) > 60
@@ -2207,7 +2221,7 @@ def test_provisional_hygiene_positive_controls(provisional_run: BatchRun) -> Non
     assert _sentinels_in(provisional_run.lines, (_PROV_CMD, _PROV_PROXY, _PROV_QUERY)) == (
         _PROV_CMD, _PROV_PROXY, _PROV_QUERY,
     )
-    assert provisional_run.ingest_status == 204
+    assert provisional_run.ingest_status == 200
     assert _scalar(provisional_run.db_path, "SELECT COUNT(*) FROM api_requests") == 6
     urls = sorted(u for (u,) in _rows(provisional_run.db_path, "SELECT url FROM api_requests"))
     assert urls == sorted(

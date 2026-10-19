@@ -10,6 +10,7 @@ content back.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 
@@ -23,6 +24,10 @@ from gatorcast.logging import get_logger
 log = get_logger(__name__)
 
 router = APIRouter()
+
+# A large batch is processed in one request task; yield to the event loop this often
+# so the UI, the syslog listener and the consumer are not starved while it runs.
+_YIELD_EVERY = 256
 
 
 def _require_auth(authorization: str | None, expected_token: str) -> None:
@@ -101,9 +106,11 @@ async def ingest(
         ``accepted_by_kind`` is keyed by event type (``RecordingChunk``,
         ``SessionStart``, ``SessionEnd``, ``ApiRequest``). ``dropped`` is the number
         of non-blank inputs that produced no event; ``dropped_by_reason`` is keyed
-        ``not_json`` (not a JSON object), ``noise`` (``classify`` returned nothing:
-        an unrecognised line, or a recognised one it rejected as malformed) or
-        ``classify_error``. ``noise_by_logger`` breaks ``noise`` down by the line's
+        ``not_json`` (not a JSON object), ``noise`` (``classify`` returned nothing
+        for a line that is not a known event type), ``rejected`` (``classify``
+        returned nothing for a known event type, so the line was malformed),
+        ``classify_error`` or ``normalize_error`` (``normalize`` raised on that one
+        input). ``noise_by_logger`` breaks ``noise`` down by the line's
         ``logger`` value: ``gateway``, ``gateway.audit``, ``system``, ``audit``,
         ``session_recording``, ``missing`` (absent or not a string) or ``other``.
         The three maps list non-zero entries only. Blank lines are not counted. A
@@ -130,8 +137,14 @@ async def ingest(
         # normalize(), so Docker-wrapped {"log": ...} objects are not silently
         # dropped by classify. Per-item tolerant: one bad item never fails the
         # batch (the 200 response is unconditional below).
-        for obj in objs:
-            unwrapped = unwrap_collector(obj)
+        for index, obj in enumerate(objs, 1):
+            if index % _YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+            try:
+                unwrapped = unwrap_collector(obj)
+            except Exception as exc:
+                counts.drop_normalize_error(exc)
+                continue
             if unwrapped is None:
                 counts.drop_not_json()
                 continue
@@ -144,11 +157,17 @@ async def ingest(
         # U+2029, \v, \f and \x1c-\x1e, which can appear raw inside a JSON string
         # (terminal output in an asciicast chunk) and would tear the line into
         # unparseable fragments. One trailing "\r" is dropped so CRLF bodies work.
-        for line in text.split("\n"):
+        for index, line in enumerate(text.split("\n"), 1):
+            if index % _YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             line = line.removesuffix("\r")
             if not line.strip():
                 continue
-            obj = normalize(line)
+            try:
+                obj = normalize(line)
+            except Exception as exc:
+                counts.drop_normalize_error(exc)
+                continue
             if obj is None:
                 counts.drop_not_json()
                 continue

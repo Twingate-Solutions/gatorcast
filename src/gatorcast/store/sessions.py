@@ -198,7 +198,9 @@ def _row_to_session(row: aiosqlite.Row) -> Session:
     sealed = row["sealed_terminal"] if "sealed_terminal" in keys else None
     resource_type = row["resource_type"] if "resource_type" in keys else None
     parent_conn_id = row["parent_conn_id"] if "parent_conn_id" in keys else None
-    stream = row["stream"] if "stream" in keys else None
+    raw_stream = row["stream"] if "stream" in keys else None
+    # TEXT since 0.6.0; a dev DB that briefly had INTEGER still reads back as str.
+    stream = str(raw_stream) if raw_stream is not None else None
     return Session(
         conn_id=row["conn_id"],
         username=row["username"],
@@ -245,7 +247,7 @@ class SessionRepository:
         *,
         resource_type: str | None = None,
         parent_conn_id: str | None = None,
-        stream: int | None = None,
+        stream: str | None = None,
     ) -> None:
         """Insert or refresh a provisional row for a buffering session.
 
@@ -288,7 +290,7 @@ class SessionRepository:
         request_id: str | None,
         resource_type: str | None = None,
         parent_conn_id: str | None = None,
-        stream: int | None = None,
+        stream: str | None = None,
     ) -> None:
         """Shared INSERT-or-refresh of a provisional row (see :meth:`upsert_start`).
 
@@ -340,7 +342,7 @@ class SessionRepository:
         request_id: str | None = None,
         *,
         parent_conn_id: str | None = None,
-        stream: int | None = None,
+        stream: str | None = None,
     ) -> None:
         """Refresh the provisional row when a recording chunk arrives.
 
