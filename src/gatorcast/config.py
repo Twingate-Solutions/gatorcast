@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     After this much silence: a recording that has data is sealed (reopenably — a
     later chunk still extends it), and a session that started but never recorded a
     valid chunk is marked ``error`` (a failed recording — commonly the transport
-    dropped its chunks; see the journald note in INGESTION_RECIPES §2.1). **Must
+    dropped its chunks; see the journald note in the wiki's Ingestion-systemd-VM §2.1). **Must
     exceed the Gateway's flush interval** — a quiet-but-active session is chunkless
     until its first flush, so too low a value would wrongly error live sessions.
     Under encryption it also bounds how long a recording stays plaintext at rest.

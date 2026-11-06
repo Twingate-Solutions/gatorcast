@@ -14,7 +14,7 @@ and the 2.0.0 names, so a fleet that mixes Gateway versions works, and `POST /in
 what it kept and dropped.
 
 **Upgrade Gatorcast to 0.6.0 before you move any Gateway or gwops to 2.0.0.** See
-[Upgrading to 0.6.0](README.md#upgrading-to-060-gateway-200) in the README.
+[Upgrading to 0.6.0](https://github.com/Twingate-Solutions/gatorcast/wiki/Upgrading#upgrading-to-060-gateway-200) in the wiki.
 
 ### Added
 
@@ -136,7 +136,7 @@ TLS posture when the shipper supplies it. Web traffic is not evaluated by detect
 The TLS badges depend on gwops (backlog item B-20) with Gatorcast delivery configured. Without
 that, or from any other shipper, every web connection shows **TLS unknown**. TLS values are
 configured state, not proof of the negotiated mode. Upgrading needs no migration step; see
-[Upgrading to 0.5.0](README.md#upgrading-to-050-web-apps) in the README.
+[Upgrading to 0.5.0](https://github.com/Twingate-Solutions/gatorcast/wiki/Upgrading#upgrading-to-050-web-apps) in the wiki.
 
 ### Added
 

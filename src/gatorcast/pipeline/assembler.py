@@ -1276,7 +1276,7 @@ class Assembler:
             session row is created for it. The connection never delivered a single
             valid recording chunk within the window — a failed recording (most often
             the transport mangled/dropped every chunk; see the journald ``LineMax``
-            note in INGESTION_RECIPES §2.1). A genuinely-late chunk still recovers it
+            note in the wiki's Ingestion-systemd-VM §2.1). A genuinely-late chunk still recovers it
             (``_promote`` reverts ``error`` → ``provisional``); a late API audit
             deletes the row instead (``_on_api``). Aged on SQLite wall-clock
             ``last_seen_at``, so it is correct across restarts. A pending

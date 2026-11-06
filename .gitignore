@@ -27,3 +27,5 @@ CLAUDE.local.md
 docs/
 # Retired Claude planning docs, specs, and raw Gateway captures (secret-grade)
 /claudearchive/
+# Local clone of the GitHub wiki (its own git repo)
+/wiki/
